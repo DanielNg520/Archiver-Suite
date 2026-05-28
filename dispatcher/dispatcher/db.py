@@ -40,7 +40,7 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -152,7 +152,6 @@ class QueueDB:
                 "ALTER TABLE upload_queue "
                 "ADD COLUMN seen_by_archiver INTEGER NOT NULL DEFAULT 0"
             )
-        return self._path
 
     def close(self) -> None:
         self._conn.close()
@@ -332,12 +331,16 @@ class QueueDB:
         was never actually attempted-to-completion, so it deserves its
         retry budget back.
 
-        Uses SQLite's own datetime('now', ...) for the cutoff rather than
-        a Python-side ISO string. Two reasons: (a) one source of clock
-        truth, (b) avoids a subtle bug where Python's strftime omits
-        microseconds but SQLite's stored value includes them, causing
-        boundary rows to mis-sort.
+        Cutoff is computed in Python using the SAME format now_iso()
+        writes ("...THH:MM:SSZ"). claimed_at is compared as a string, so
+        both operands MUST share one format — lexical order only equals
+        chronological order when the encoding is identical. SQLite's
+        datetime('now', ...) yields "YYYY-MM-DD HH:MM:SS" (space, no Z),
+        which sorts WRONG against our stored "T...Z" values.
         """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=older_than_minutes)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._immediate_txn() as cur:
             cur.execute(
                 """
@@ -347,9 +350,9 @@ class QueueDB:
                        attempts=MAX(0, attempts-1),
                        last_error='startup watchdog: reset stuck claim'
                  WHERE status='claimed'
-                   AND claimed_at < datetime('now', ?)
+                   AND claimed_at < ?
                 """,
-                (f"-{older_than_minutes} minutes",),
+                (cutoff,),
             )
             n = cur.rowcount
             if n > 0:
