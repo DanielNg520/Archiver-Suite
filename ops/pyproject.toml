@@ -1,0 +1,16 @@
+[project]
+name = "ops"
+version = "0.1.0"
+description = "Health checks and launchd management for the archiver/recorder/dispatcher system. Reads on-disk artifacts only; imports no service package."
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+ops = "ops.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ops"]

@@ -1,0 +1,23 @@
+[project]
+name = "dispatcher"
+version = "0.1.0"
+description = "Telegram upload dispatcher: drains a shared SQLite queue and sends to Telegram. One owner of the Telegram session, many producers."
+requires-python = ">=3.13"
+dependencies = [
+    # Telegram MTProto (NOT Bot API — 2GB upload limit, native albums)
+    "telethon>=1.36.0,<2.0",
+    # Config / env
+    "python-dotenv>=1.0.0",
+    # TOML writer for PolicyStore (tomllib is stdlib for reading)
+    "tomli-w>=1.0.0",
+]
+
+[project.scripts]
+dispatcher = "dispatcher.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["dispatcher"]

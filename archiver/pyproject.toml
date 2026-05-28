@@ -1,0 +1,32 @@
+[project]
+name = "media-archiver"
+version = "1.1.0"
+description = "Multi-platform media archiver: download X/TikTok/Instagram media, upload to Telegram (per-platform channels) via MTProto."
+requires-python = ">=3.11"
+dependencies = [
+    # Platform extractors
+    "yt-dlp[default]>=2024.11.18",   # TikTok videos; [default] pulls curl_cffi for TLS impersonation
+    "gallery-dl>=1.27.0",            # X media + TikTok photo carousels
+    # Telegram MTProto (NOT Bot API — gives 2GB upload limit, native albums)
+    "telethon>=1.36.0",
+    # Config / env
+    "python-dotenv>=1.0.0",
+    "tomli-w>=1.0.0",                # TOML writer (stdlib tomllib only reads)
+    "curl-cffi>=0.10,<0.15",
+]
+
+[tool.uv]
+prerelease = "allow"
+
+[project.scripts]
+archiver = "archiver.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["archiver"]
+
+[tool.uv.sources]
+media-archiver = { path = ".", editable = false }

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.duy.dispatcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/duynguyen/.local/bin/dispatcher</string>
+        <string>start</string>
+    </array>
+
+    <!-- Start at login and keep alive. KeepAlive=true means "always
+         restart on exit", which is what we want for a queue drainer. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Minimum 30s between respawns. If the dispatcher crashes on
+         startup (bad .env, missing session), this prevents a tight
+         respawn loop from filling the disk with crash logs before you
+         can intervene. -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- launchd does NOT source your shell rc files, so PATH is minimal.
+         The dispatcher shells out to nothing critical, but we set a sane
+         PATH anyway so any subprocess (e.g. ffmpeg if added later) is
+         found. Homebrew on Apple Silicon lives in /opt/homebrew/bin. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/duynguyen/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- launchd captures stdout/stderr here. These are SEPARATE from the
+         app's own RotatingFileHandler log (~/.local/log/dispatcher.log);
+         these catch crashes/tracebacks that happen before logging is set
+         up. They do NOT rotate — keep an eye on them, or add a
+         size-capped newsyslog rule if they grow. -->
+    <key>StandardOutPath</key>
+    <string>/Users/duynguyen/.local/log/dispatcher.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/duynguyen/.local/log/dispatcher.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/duynguyen</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

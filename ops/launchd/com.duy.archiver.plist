@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.duy.archiver</string>
+
+    <!-- `archiver loop` runs a cycle, then sleeps a random 2-4h, forever.
+         So this is a single long-lived process, not a cron-style re-run. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/duynguyen/.local/bin/archiver</string>
+        <string>loop</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Dict form, not bare true: restart only on a CRASH (non-zero /
+         signal exit), NOT on a clean exit. This lets you `launchctl stop`
+         or Ctrl-C the loop deliberately without launchd immediately
+         relaunching it. A crash still gets auto-restarted. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- archiver shells out to gallery-dl, yt-dlp, ffmpeg — all need a
+         real PATH. Homebrew (/opt/homebrew/bin) is essential here. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/duynguyen/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/duynguyen/.local/log/archiver.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/duynguyen/.local/log/archiver.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/duynguyen</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

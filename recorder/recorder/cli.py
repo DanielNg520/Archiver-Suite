@@ -1,0 +1,296 @@
+"""
+recorder.cli
+────────────
+  recorder start                         foreground
+  recorder start --daemon                fork; pid file at state_dir/pid
+  recorder stop                          terminate via pid file
+  recorder status                        state + queue depth + lock
+  recorder config add --user <u>
+  recorder config remove --user <u>
+  recorder config list
+  recorder config priority --user <u> --rank N
+
+config writes go to ~/.config/recorder/config.toml (the priority-ordered
+user list). The ordering of the `users` array IS the priority.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import signal
+import sys
+import tomllib
+from pathlib import Path
+
+import tomli_w
+
+from .config import CONFIG_TOML, RecorderConfig
+
+log = logging.getLogger(__name__)
+
+
+def _setup_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+
+def _pid_path(config: RecorderConfig) -> Path:
+    return Path(config.state_dir).expanduser() / "pid"
+
+
+# ── start ─────────────────────────────────────────────────────────────────
+
+def cmd_start(args: argparse.Namespace) -> int:
+    config = RecorderConfig.load()
+    if not config.tiktok_users:
+        log.error("no tiktok users configured. Add some: "
+                  "recorder config add --user <username>")
+        return 1
+
+    # Lazy imports: only needed to actually run, and they pull in
+    # TikTokLive / subprocess machinery.
+    from .capture import StreamCapture
+    from .enqueue import EnqueueClient
+    from .lock import TikTokLock
+    from .platforms.tiktok import TikTokLivePlatform
+    from .state import StateMachine
+
+    if args.daemon:
+        _daemonize(config)
+
+    pid_path = _pid_path(config)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(os.getpid()))
+
+    platform = TikTokLivePlatform(config.tiktok_cookies_file, config.state_dir)
+    capture  = StreamCapture(config.output_dir, config.tiktok_cookies_file)
+    enqueue_client = EnqueueClient(config.dispatcher_db_path)
+    lock = TikTokLock(config.lock_path, os.getpid())
+
+    def _enqueue(platform_name, username, file_path, caption):
+        enqueue_client.enqueue(
+            platform=platform_name, username=username,
+            file_path=file_path, caption=caption,
+        )
+
+    machine = StateMachine(config, platform, capture, _enqueue, lock)
+
+    def _on_signal(signum, _frame):
+        log.info("cli: signal %s — requesting stop", signum)
+        machine.request_stop()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        machine.run_forever()
+    finally:
+        pid_path.unlink(missing_ok=True)
+    return 0
+
+
+def _daemonize(config: RecorderConfig) -> None:
+    """Minimal double-fork daemonization. launchd (Slice 5) is the real
+    backgrounding mechanism; this --daemon flag is for manual use."""
+    if os.fork() > 0:
+        sys.exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        sys.exit(0)
+    log_dir = Path(config.state_dir).expanduser()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out = open(log_dir / "recorder.out.log", "a")
+    os.dup2(out.fileno(), sys.stdout.fileno())
+    os.dup2(out.fileno(), sys.stderr.fileno())
+
+
+# ── stop ──────────────────────────────────────────────────────────────────
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    config = RecorderConfig.load()
+    pid_path = _pid_path(config)
+    if not pid_path.exists():
+        log.error("no pid file at %s — recorder not running?", pid_path)
+        return 1
+    try:
+        pid = int(pid_path.read_text().strip())
+    except (OSError, ValueError):
+        log.error("pid file unreadable: %s", pid_path)
+        return 1
+    try:
+        os.kill(pid, signal.SIGTERM)
+        log.info("sent SIGTERM to recorder pid=%d", pid)
+    except ProcessLookupError:
+        log.warning("pid %d not running — clearing stale pid file", pid)
+        pid_path.unlink(missing_ok=True)
+        return 1
+    return 0
+
+
+# ── status ────────────────────────────────────────────────────────────────
+
+def cmd_status(args: argparse.Namespace) -> int:
+    config = RecorderConfig.load()
+    pid_path = _pid_path(config)
+    running = False
+    if pid_path.exists():
+        try:
+            pid = int(pid_path.read_text().strip())
+            os.kill(pid, 0)
+            running = True
+            print(f"recorder: running (pid {pid})")
+        except (OSError, ValueError, ProcessLookupError):
+            print("recorder: not running (stale pid file)")
+    else:
+        print("recorder: not running")
+
+    lock_path = Path(config.lock_path).expanduser()
+    print(f"tiktok.lock: {'held' if lock_path.exists() else 'not held'}")
+    print(f"users (priority order): {', '.join(config.tiktok_users) or '(none)'}")
+    print(f"output dir: {config.output_dir}")
+    print(f"dispatcher db: {config.dispatcher_db_path}")
+    return 0 if running or not pid_path.exists() else 0
+
+
+# ── config ────────────────────────────────────────────────────────────────
+
+def _load_toml() -> dict:
+    if CONFIG_TOML.exists():
+        with CONFIG_TOML.open("rb") as f:
+            return tomllib.load(f)
+    return {}
+
+
+def _save_toml(data: dict) -> None:
+    CONFIG_TOML.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_TOML.with_suffix(".toml.tmp")
+    with tmp.open("wb") as f:
+        f.write(tomli_w.dumps(data).encode("utf-8"))
+    os.replace(tmp, CONFIG_TOML)
+
+
+def _get_users(data: dict) -> list[str]:
+    return list(data.get("recorder", {}).get("tiktok", {}).get("users", []))
+
+
+def _set_users(data: dict, users: list[str]) -> None:
+    data.setdefault("recorder", {}).setdefault("tiktok", {})["users"] = users
+
+
+def cmd_config_add(args: argparse.Namespace) -> int:
+    data = _load_toml()
+    users = _get_users(data)
+    u = args.user.lstrip("@")
+    if u in users:
+        print(f"@{u} already in list")
+        return 0
+    users.append(u)
+    _set_users(data, users)
+    _save_toml(data)
+    print(f"added @{u} (priority rank {len(users)})")
+    return 0
+
+
+def cmd_config_remove(args: argparse.Namespace) -> int:
+    data = _load_toml()
+    users = _get_users(data)
+    u = args.user.lstrip("@")
+    if u not in users:
+        print(f"@{u} not in list")
+        return 1
+    users.remove(u)
+    _set_users(data, users)
+    _save_toml(data)
+    print(f"removed @{u}")
+    return 0
+
+
+def cmd_config_list(args: argparse.Namespace) -> int:
+    users = _get_users(_load_toml())
+    if not users:
+        print("(no users configured)")
+        return 0
+    for i, u in enumerate(users, 1):
+        print(f"{i}. @{u}")
+    return 0
+
+
+def cmd_config_priority(args: argparse.Namespace) -> int:
+    data = _load_toml()
+    users = _get_users(data)
+    u = args.user.lstrip("@")
+    if u not in users:
+        print(f"@{u} not in list — add it first")
+        return 1
+    rank = args.rank
+    if not (1 <= rank <= len(users)):
+        print(f"rank must be 1..{len(users)}")
+        return 1
+    users.remove(u)
+    users.insert(rank - 1, u)
+    _set_users(data, users)
+    _save_toml(data)
+    print(f"@{u} moved to rank {rank}")
+    return 0
+
+
+# ── parser ──────────────────────────────────────────────────────────────────
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="recorder",
+                                description="TikTok live recorder.")
+    p.add_argument("-v", "--verbose", action="store_true")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    p_start = sub.add_parser("start", help="run the recorder")
+    p_start.add_argument("--daemon", action="store_true",
+                         help="fork into background (pid file in state_dir)")
+    sub.add_parser("stop", help="stop a running recorder via pid file")
+    sub.add_parser("status", help="show state + lock + user list")
+
+    p_cfg = sub.add_parser("config", help="manage the user list")
+    cfg_sub = p_cfg.add_subparsers(dest="config_command", required=True)
+
+    p_add = cfg_sub.add_parser("add"); p_add.add_argument("--user", required=True)
+    p_rm  = cfg_sub.add_parser("remove"); p_rm.add_argument("--user", required=True)
+    cfg_sub.add_parser("list")
+    p_pri = cfg_sub.add_parser("priority")
+    p_pri.add_argument("--user", required=True)
+    p_pri.add_argument("--rank", type=int, required=True)
+
+    return p
+
+
+_DISPATCH = {
+    ("start", None):              cmd_start,
+    ("stop", None):               cmd_stop,
+    ("status", None):             cmd_status,
+    ("config", "add"):            cmd_config_add,
+    ("config", "remove"):         cmd_config_remove,
+    ("config", "list"):           cmd_config_list,
+    ("config", "priority"):       cmd_config_priority,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    _setup_logging(args.verbose)
+    sub = getattr(args, "config_command", None)
+    handler = _DISPATCH.get((args.command, sub))
+    if handler is None:
+        log.error("no handler for %s/%s", args.command, sub)
+        return 2
+    try:
+        return handler(args)
+    except RuntimeError as e:
+        log.error("%s", e)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

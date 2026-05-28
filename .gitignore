@@ -1,0 +1,53 @@
+# ── Secrets / credentials (belt-and-suspenders; these usually live in ~/.config) ──
+.env
+*.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+cookies/
+*cookies*.txt
+tiktok.txt
+
+# ── Python build / install artifacts ──
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+*.egg
+.eggs/
+
+# ── pipx / venv (shouldn't be in repo, but just in case) ──
+.venv/
+venv/
+
+# ── Runtime state / databases / logs ──
+*.db
+*.db-wal
+*.db-shm
+*.session
+*.log
+pid
+room_id_cache.json
+locks/
+
+# ── Media output (never commit downloaded media) ──
+archiver_downloads/
+recorder-output/
+*.mp4
+*.ts
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.mkv
+
+# ── macOS / editor cruft ──
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ── The path-collision artifacts you already deleted ──
+mnt/

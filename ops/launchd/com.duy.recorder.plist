@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.duy.recorder</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/duynguyen/.local/bin/recorder</string>
+        <string>start</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- The recorder shells out to yt-dlp, which needs ffmpeg on PATH for
+         live HLS. launchd's minimal PATH would NOT find a Homebrew ffmpeg,
+         so this line is load-bearing, not boilerplate. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/duynguyen/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/duynguyen/.local/log/recorder.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/duynguyen/.local/log/recorder.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/duynguyen</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
