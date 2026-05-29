@@ -1,0 +1,28 @@
+name: core selftest
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "core/**"
+      - ".github/workflows/selftest.yml"
+  pull_request:
+    paths:
+      - "core/**"
+      - ".github/workflows/selftest.yml"
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install core (tomli_w)
+        run: pip install -e ./core
+
+      - name: Run state-machine selftest
+        run: python core/core/_selftest.py

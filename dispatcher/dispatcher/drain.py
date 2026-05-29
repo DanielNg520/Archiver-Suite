@@ -23,7 +23,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from core import ItemStore, Item, DeletePolicy
+from core import ClaimContentionError, ItemStore, Item, DeletePolicy
 from core.files import media_bucket
 from .tg_router import TelegramRouter
 
@@ -74,7 +74,12 @@ async def drain_forever(
             log.info("drain: stop requested, exiting cleanly")
             return
 
-        batch = store.claim_batch()
+        try:
+            batch = store.claim_batch()
+        except ClaimContentionError as exc:
+            log.warning("drain: %s — backing off", exc)
+            await asyncio.sleep(config.poll_interval_s)
+            continue
         if not batch:
             await asyncio.sleep(config.poll_interval_s)
             continue

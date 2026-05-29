@@ -37,6 +37,16 @@ from .files import media_bucket, ALBUM_MAX
 log = logging.getLogger(__name__)
 
 _CLAIM_RETRIES = 5
+
+
+class ClaimContentionError(RuntimeError):
+    """claim_* lost every CAS retry to a concurrent claimer."""
+
+    def __init__(self, retries: int = _CLAIM_RETRIES) -> None:
+        self.retries = retries
+        super().__init__(
+            f"claim exhausted after {retries} retries under contention"
+        )
 _ERROR_CAP = 1000
 
 
@@ -136,7 +146,8 @@ class ItemStore:
 
     def claim_next(self) -> Item | None:
         """Atomically claim the highest-priority pending item (pending →
-        sending). Returns None when nothing is pending."""
+        sending). Returns None when nothing is pending. Raises
+        ClaimContentionError when retries are exhausted under contention."""
         for _ in range(_CLAIM_RETRIES):
             with self._immediate() as cur:
                 row = cur.execute(
@@ -159,11 +170,12 @@ class ItemStore:
                 # else: lost the race; loop and try the next candidate
         log.warning("claim_next: %d retries exhausted under contention",
                     _CLAIM_RETRIES)
-        return None
+        raise ClaimContentionError(_CLAIM_RETRIES)
 
     def claim_batch(self, max_items: int = ALBUM_MAX) -> list[Item]:
         """Atomically claim a homogeneous group of pending items for one
-        album send. Returns [] when nothing is pending.
+        album send. Returns [] when nothing is pending. Raises
+        ClaimContentionError when retries are exhausted under contention.
 
         The group is defined by the highest-priority pending row (the
         "anchor") and everything sharing its (platform, username, source,
@@ -233,7 +245,7 @@ class ItemStore:
                     return [Item.from_row(r) for r in full]
         log.warning("claim_batch: %d retries exhausted under contention",
                     _CLAIM_RETRIES)
-        return []
+        raise ClaimContentionError(_CLAIM_RETRIES)
 
     def mark_sent(self, item_id: int, *, tg_message_id: int | None = None) -> None:
         with self._immediate() as cur:
