@@ -180,17 +180,10 @@ dispatcher queue retry <id>                  # reset a failed row to pending
 dispatcher queue cancel <id>                 # give up on a row
 ```
 
-If you must fall back to the legacy direct-upload path temporarily, flip
-the archiver's feature flag and let it send directly (bypassing the queue
-for archiver content only):
-
-```
-# in ~/.config/archiver/.env
-ARCHIVER_USE_DISPATCHER=false
-ops restart archiver
-```
-
-Remember to set it back to `true` once the dispatcher is healthy.
+There is no direct-upload fallback after the single-source migration. The
+dispatcher owns the only Telegram session and routing. If it is down, keep
+the durable rows in `pending`, fix or re-authenticate the dispatcher, then
+let it drain normally.
 
 ---
 

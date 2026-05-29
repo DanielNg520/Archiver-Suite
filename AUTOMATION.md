@@ -50,8 +50,8 @@ ops health        >/dev/null && echo "ops OK"
 # 3. ffmpeg present (recorder + archiver need it)
 which ffmpeg
 
-# 4. The archiver dispatcher flag is set
-grep -E "USE_DISPATCHER|DISPATCHER_DB" ~/.config/archiver/.env
+# 4. The shared suite database can be initialized
+PYTHONPATH=core python3.13 -c "from core import ItemStore; s=ItemStore.open(); s.close(); print('suite.db OK')"
 
 # 5. The external output drive is mounted
 ls /Volumes/StorEDGE/archiver_downloads >/dev/null && echo "drive OK"
@@ -78,17 +78,19 @@ idles on the queue, Ctrl-C. Confirm the session file exists:
 ls ~/.config/dispatcher/session.session
 ```
 
-The archiver only needs its own session if you ever use the legacy fallback
-(`ARCHIVER_USE_DISPATCHER=false`). In dispatcher mode it opens no session.
+The archiver has no Telegram session after the single-source migration. The
+dispatcher owns Telegram credentials and routing.
 
 ---
 
 ## Step 2 — Wire rotating logs (optional but recommended)
 
 Without this, the only logs are launchd's `.out`/`.err` files, which grow
-**unbounded**. The fix: each service uses a `RotatingFileHandler` (50 MB × 5).
+**unbounded**. The fix is to wire each service to a `RotatingFileHandler`
+(50 MB × 5).
 
-`log_setup.py` is a vendorable file. Copy it into each package and call it:
+`log_setup.py` is still a vendorable file. Copy it into each package and
+call it:
 
 ```
 cp ops/log_setup.py dispatcher/dispatcher/log_setup.py
@@ -262,12 +264,6 @@ ops unload            # stops all three, removes from launchd
 
 To stop just one: `launchctl unload ~/Library/LaunchAgents/com.duy.<svc>.plist`.
 
-To temporarily revert the archiver to direct-send (bypassing the queue):
-
-```
-# in ~/.config/archiver/.env
-ARCHIVER_USE_DISPATCHER=false
-launchctl kickstart -k gui/$(id -u)/com.duy.archiver
-```
-
-Set it back to `true` once the dispatcher is healthy again.
+There is no direct-send rollback path after this migration. If the
+dispatcher is unhealthy, stop the services, fix or re-authenticate the
+dispatcher, and let the durable `pending` rows drain when it is healthy.

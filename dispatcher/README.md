@@ -1,33 +1,33 @@
 # dispatcher
 
-Telegram upload dispatcher. Owns the single Telegram session. Drains a
-shared SQLite queue populated by `archiver` (priority 10) and `recorder`
-(priority 20). One file at a time; FloodWait-aware; crash-safe via a
-startup watchdog.
+Telegram upload dispatcher. Owns the single Telegram session. Drains
+pending rows from the shared `suite.db` / `items` table populated by
+`archiver` (priority 10) and `recorder` (priority 20). One file at a time;
+FloodWait-aware; crash-safe via a startup watchdog.
 
-Architectural context: see `IMPLEMENTATION_GUIDE.md` in the media-archiver
-project.
+Architectural context: see the root `README.md` and
+`MIGRATION-AND-INSTALL.md`.
 
 ## Install
 
-pipx-managed, no virtualenv:
+pipx-managed, with the shared `core` package injected into the isolated
+dispatcher venv:
 
 ```
-cd ~/code/dispatcher
-pipx install . --python 3.13
+pipx install ./dispatcher --python 3.13
+pipx inject --editable dispatcher ./core
 ```
 
 That puts `dispatcher` on your PATH via `~/.local/bin/dispatcher`, isolated
 in its own venv at `~/.local/pipx/venvs/dispatcher/`.
 
-After source edits, reinstall to pick them up:
+After dispatcher source edits, reinstall to pick them up:
 
 ```
 pipx reinstall dispatcher --python 3.13
 ```
 
-pipx does not support editable installs the way pip's `-e` flag does, so
-the edit → reinstall loop is the supported workflow.
+Edits to `core` are picked up immediately because it is injected editable.
 
 ## First-run setup
 
@@ -101,11 +101,13 @@ dispatcher/
 ├── __main__.py        # python -m dispatcher
 ├── cli.py             # argparse entry point
 ├── config.py          # frozen-dataclass config + .env loading
-├── db.py              # QueueDB: WAL, atomic claim, watchdog
 ├── send.py            # SendStrategy ABC + TelethonSendStrategy
 ├── drain.py           # the main loop (Template Method)
-├── delete.py          # safety-gated cleanup after successful upload
-├── policy_store.py    # TOML-backed PolicyStore (ported from archiver)
-├── policies.py        # DeletePolicy (ported from archiver)
-└── tg_router.py       # per-(platform,user) chat resolution (ported)
+└── delete.py          # safety-gated cleanup after successful upload
+
+../core/core/
+├── store.py           # ItemStore: WAL, atomic claim, watchdog, status changes
+├── schema.py          # shared suite.db schema
+├── policy_store.py    # TOML-backed PolicyStore
+└── policies.py        # DeletePolicy / DedupPolicy
 ```

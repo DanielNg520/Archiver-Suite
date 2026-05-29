@@ -161,12 +161,10 @@ The dispatcher reads this once at start, so restart it after editing.
 
 ---
 
-## 6. Still open (not done by this pass)
+## 6. Still open
 
 - **`log_setup.py`**: AUTOMATION.md still tells you to `cp` it into each
   package. It can now live in `core` and be imported (`from core import
   setup_file_logging`) instead of copied. Not yet moved.
-- **AUTOMATION.md** install/log sections still describe the old four-way
-  install; the launchd mechanics themselves are unchanged.
 - Verify `pipx reinstall` preserves the editable `core` inject on your
   machine (see §2).

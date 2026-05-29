@@ -1,15 +1,16 @@
 # Media Archiver
 
-Unified archiver for X (Twitter), TikTok, and Instagram → Telegram. One CLI,
-one DB, one Telegram client per run, with self-healing.
+Unified downloader for X (Twitter), TikTok, and Instagram. It discovers and
+downloads media, then writes pending rows into the shared
+`~/.config/archiver-suite/suite.db` database. The dispatcher is the only
+process that talks to Telegram.
 
 Version 1.1 highlights:
 - **Instagram support** (posts + reels by default; stories/highlights opt-in)
-- **Per-platform Telegram channels** — each platform's media can go to its own chat
 - **Per-(platform, user) `delete-after-upload`** — 3-level resolution chain
 - **`bootstrap` subcommand** — absorb an existing on-disk media library
-- **Manual media in subfolders** is auto-detected, uploaded, and (optionally) cleaned up
-- **Checkpoint = `MAX(upload_date) WHERE sent=1`** — survives deletion, robust across long gaps
+- **Manual media in subfolders** is auto-detected, queued, and (optionally) cleaned up by the dispatcher after send
+- **Checkpoint = `MAX(upload_date) WHERE status='sent'`** — survives deletion, robust across long gaps
 - **Sidecar-aware identity resolution** — sidecars (`.json` / `.info.json`) drive identifiers/dates/captions where available
 
 ## Layout
@@ -18,10 +19,7 @@ Version 1.1 highlights:
 .
 ├── archiver/                       # The Python package
 │   ├── config.py                   # Frozen dataclass config (X / TikTok / Instagram)
-│   ├── db.py                       # Unified SQLite + auto-migration to checkpoints v2
 │   ├── cookies.py                  # Firefox cookie export (TikTok + Instagram)
-│   ├── identity.py                 # Sidecar → filename → hash resolver chain
-│   ├── stability.py                # "Is this file safely closed?" check
 │   ├── reconcile.py                # Reconcile v2 (recursive, sidecar-aware, archive-seeding)
 │   ├── platforms.py                # Platform ABC + X / TikTok / Instagram strategies
 │   ├── orchestrator.py             # Template Method + circuit breaker + bootstrap
@@ -47,11 +45,14 @@ Version 1.1 highlights:
 ```
 
 **User config lives in `~/.config/archiver/.env`** (outside the project).
+User lists and behavior policies live in
+`~/.config/archiver-suite/config.toml`.
 
 ## First-time setup (new install)
 
 ```bash
 pipx install . --python 3.13
+pipx inject --editable media-archiver ../core
 mkdir -p ~/.config/archiver
 cp .env.example ~/.config/archiver/.env
 # Fill in env vars — see Env reference below.
@@ -86,10 +87,9 @@ beneath it (e.g. `downloads/instagram/carol/stories_2025/`). The next
 1. **Reconcile pass** walks recursively. Files with no sidecar and a
    non-standard filename get a `manual_<hash>` identifier and use
    their mtime as the `upload_date`.
-2. **Upload pass** sends them through Telegram normally (to the
-   correct per-platform channel).
+2. **Queue pass** inserts pending `items` rows for the dispatcher.
 3. With delete-after-upload enabled, they're deleted just like
-   extractor-downloaded files.
+   extractor-downloaded files after the dispatcher sends them.
 
 No special command needed; this is part of every run.
 
@@ -97,26 +97,11 @@ No special command needed; this is part of every run.
 
 ### Always required
 ```bash
-TELEGRAM_API_ID=12345
-TELEGRAM_API_HASH=abcd...
-TELEGRAM_PHONE=+1234567890
-TELEGRAM_CHAT_ID=-1001234567890      # global default destination
 ENABLED_PLATFORMS=x,tiktok,instagram
 ```
 
-### Per-platform Telegram channels (NEW, optional)
-```bash
-# Overrides the global TELEGRAM_CHAT_ID per platform.
-TELEGRAM_CHAT_ID_X=-1001111111111
-TELEGRAM_CHAT_ID_TIKTOK=-1002222222222
-TELEGRAM_CHAT_ID_INSTAGRAM=-1003333333333
-
-# Per-user override (rarely needed) — most specific wins:
-# resolution order: user → platform → global
-TELEGRAM_CHAT_ID_X_ALICE=-100xxx
-```
-
-Run `archiver chats` to see the resolved destination for every (platform, user).
+Telegram credentials and chat routing now belong to the dispatcher, not the
+archiver.
 
 ### Delete after upload (3-level chain)
 ```bash
@@ -125,8 +110,8 @@ DELETE_AFTER_UPLOAD_INSTAGRAM=true         # per-platform
 DELETE_AFTER_UPLOAD_X_ALICE=false          # per-user
 ```
 
-Run `archiver policy` to see the resolved decision per (platform, user). Typo'd
-env var names (e.g. `DELETE_AFTER_UPLOAD_X_ALCIE`) are detected and warned about at run start.
+Run `archiver policy` to see the resolved decision per (platform, user).
+Policy changes are stored in `~/.config/archiver-suite/config.toml`.
 
 ### X
 ```bash
@@ -169,8 +154,6 @@ archiver stats                              # totals + per-platform date_floor
 archiver stats --platform tiktok --user u
 
 archiver policy                             # resolved delete-after-upload per user
-archiver chats                              # resolved Telegram destination per user
-
 archiver health                             # check credentials
 archiver reconcile                          # scan disk → DB (subset of `run`)
 
@@ -226,11 +209,9 @@ for sanity-checking what "incremental from where?" means at any point.
 | TikTok / Instagram cookies expired     | Re-export from Firefox immediately, retry user once                          |
 | TikTok / Instagram cookies stale (>N d)| Re-export pre-emptively at run start                                         |
 | X cookies expired                      | Trip circuit, surface clear remediation, skip platform                       |
-| Telegram FloodWait ≤ 10min             | Sleep exactly the server-requested duration, retry                           |
-| Telegram FloodWait > 10min             | Bail this send; row stays pending for next run                               |
-| Telegram transient send failure        | Exponential backoff (2/4/8/16s), then mark failed                            |
-| Disk full during download              | Purge already-uploaded local files, retry once                               |
-| File vanished before upload            | Mark as failed, continue                                                     |
+| Dispatcher send failure                 | Row remains pending/failed in `suite.db`; dispatcher handles retry/send state |
+| Disk full during download              | Purge already-sent local files, retry once                                   |
+| File vanished before queueing          | Mark as failed, continue                                                     |
 | File still being written               | Stability check skips it; next reconcile catches it                          |
 | Crashed mid-download                   | Next run's `reconcile` step catches orphaned files                           |
 | Multiple consecutive auth fails        | Circuit breaker trips → skip platform for rest of run                        |
