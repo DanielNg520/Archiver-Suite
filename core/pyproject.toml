@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "archiver-suite-core"
+version = "1.0.0"
+description = "Shared data layer for the Archiver Suite: the single-source-of-truth items table, its state machine, schema, policy store, and filesystem helpers. Imported by the dispatcher, archiver, recorder, and ops."
+requires-python = ">=3.13"
+dependencies = [
+    # TOML writer for the hierarchical policy store (config.toml).
+    # tomllib (read) is stdlib on 3.11+; only the writer needs a dep.
+    "tomli_w>=1.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["core*"]

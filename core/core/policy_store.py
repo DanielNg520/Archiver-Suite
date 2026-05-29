@@ -1,45 +1,13 @@
 """
-archiver.policy_store
-─────────────────────
-Single source of truth for behavior config + user lists, backed by a
-TOML file at ~/.config/archiver/config.toml. Secrets stay in .env;
-this file holds everything else.
+core.policy_store
+───────────────────────
+Shared Repository for config.toml. Same atomic write semantics and same
+hierarchical lookup shape everywhere: user → platform → global.
 
-WHY TOML AND NOT ENV VARS:
-  The previous DELETE_AFTER_UPLOAD_<PLATFORM>_<USER> scheme silently
-  fails for usernames containing characters that aren't valid in POSIX
-  env-var names (dots, dashes, unicode). E.g. an Instagram user
-  "user.name!" produces DELETE_AFTER_UPLOAD_INSTAGRAM_USER.NAME!
-  which different shells/loaders handle inconsistently — typically
-  it gets dropped, and the override silently falls through to the
-  platform default with no error.
+Storage layout:
+  ~/.config/archiver-suite/config.toml
 
-  TOML quoted keys take any string: ["user.name!"], ["正常用户"]. No
-  encoding loss. No shell hazard.
-
-  Other wins:
-    - Native booleans/integers (no _parse_bool ceremony)
-    - Hierarchy matches resolution chain visually
-    - Adding a new policy = one new key, zero schema change
-
-DESIGN PATTERN: Repository.
-  PolicyStore owns the file and atomic writes. Every policy (Delete,
-  Dedup, ...) is a thin Specification on top — it knows its KEY and
-  DEFAULT and asks the Repository for resolved values. Adding a new
-  policy is a one-class addition; storage and persistence are free.
-
-ATOMIC WRITES:
-  Temp file in same dir → fsync → os.replace. POSIX guarantees rename
-  is atomic on the same filesystem, so a crash mid-write leaves either
-  the old file fully intact OR the new file fully written, never half.
-  Same-dir tempfile is critical: rename across filesystems is not
-  atomic (it becomes copy+unlink).
-
-CONCURRENCY:
-  An RLock guards the in-memory cache. The cache is loaded once at
-  construction and is the authoritative copy — we never reload from
-  disk after init. This prevents the classic lost-update bug where
-  two writers each read→modify→write and the first change is clobbered.
+Overridable via $ARCHIVER_SUITE_CONFIG for tests / alternate setups.
 """
 
 from __future__ import annotations
@@ -58,41 +26,35 @@ log = logging.getLogger(__name__)
 
 
 _HEADER = """\
-# archiver config — machine-managed but human-readable.
+# archiver-suite config — machine-managed but human-readable.
 # Edits are safe; the CLI may rewrite this file. Values are preserved on
-# rewrite but comments OUTSIDE this header are not (no Python TOML writer
-# round-trips comments losslessly). Don't put secrets here — those live
-# in .env. Resolution order: user → platform → global.
+# rewrite but comments OUTSIDE this header are not. Don't put secrets
+# here — those live in .env. Resolution order: user → platform → global.
 
 """
 
 
 def default_config_path() -> Path:
-    """The canonical location. Overridable via $ARCHIVER_CONFIG (tests, dev)."""
-    override = os.environ.get("ARCHIVER_CONFIG")
+    """Canonical config location. Override with $ARCHIVER_SUITE_CONFIG."""
+    override = os.environ.get("ARCHIVER_SUITE_CONFIG")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".config" / "archiver" / "config.toml"
+    return Path.home() / ".config" / "archiver-suite" / "config.toml"
 
 
 class PolicyStore:
     """
     Owns config.toml. Thread-safe via a single RLock.
 
-    Public surface:
+    Public surface (identical to archiver's):
       .get(key, *, platform=None, username=None, default=None)
       .explain(key, *, platform=None, username=None, default=None)
-        → (value, source) for diagnostics
-
       .set(key, value, *, platform=None, username=None)
       .unset(key, *, platform=None, username=None)
-
       .list_users(platform)
       .add_user(platform, username)
       .remove_user(platform, username)
-
       .iter_user_overrides()
-        → (platform, username, dict) per per-user section
     """
 
     def __init__(self, path: Path | None = None):
@@ -100,7 +62,7 @@ class PolicyStore:
         self._lock  = threading.RLock()
         self._data: dict[str, Any] = self._load()
 
-    # ── Loading / persistence ─────────────────────────────────────────────────
+    # ── Loading / persistence ─────────────────────────────────────────────
 
     def _load(self) -> dict[str, Any]:
         if not self._path.exists():
@@ -110,19 +72,12 @@ class PolicyStore:
             with self._path.open("rb") as f:
                 return tomllib.load(f)
         except tomllib.TOMLDecodeError as e:
-            # Fail loud at startup. Silent fallback would produce wrong
-            # behavior (everything resolves to defaults) without surfacing
-            # the parse error — much harder to debug later.
             raise RuntimeError(
-                f"config.toml is malformed: {e}. "
-                f"Fix or delete {self._path}."
+                f"config.toml is malformed: {e}. Fix or delete {self._path}."
             ) from e
 
     def _persist(self) -> None:
-        """
-        Atomic write: NamedTemporaryFile in same dir → fsync → os.replace.
-        Same dir = same filesystem = atomic rename on POSIX.
-        """
+        """Atomic write: tempfile (same dir) → fsync → os.replace."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = tempfile.NamedTemporaryFile(
             mode     = "w",
@@ -136,18 +91,17 @@ class PolicyStore:
             tmp.write(_HEADER)
             tmp.write(tomli_w.dumps(self._data))
             tmp.flush()
-            os.fsync(tmp.fileno())  # bytes hit disk before we rename
+            os.fsync(tmp.fileno())
             tmp.close()
             os.replace(tmp.name, self._path)
         except Exception:
-            # Best-effort cleanup. Don't swallow the original exception.
             try:
                 os.unlink(tmp.name)
             except OSError:
                 pass
             raise
 
-    # ── Hierarchical lookup ───────────────────────────────────────────────────
+    # ── Hierarchical lookup ───────────────────────────────────────────────
 
     def get(
         self,
@@ -157,12 +111,6 @@ class PolicyStore:
         username: str | None = None,
         default:  Any        = None,
     ) -> Any:
-        """
-        Walk user → platform → global. Return first hit.
-
-        A *present* False does NOT fall through; that's the whole point
-        of an override. Only absent keys fall through to the next level.
-        """
         with self._lock:
             if platform and username:
                 user_section = (
@@ -190,11 +138,6 @@ class PolicyStore:
         username: str | None = None,
         default:  Any        = None,
     ) -> tuple[Any, str]:
-        """
-        Returns (value, source). Mirrors get() exactly — keep in lockstep.
-        `source` is one of:
-          "user:<plat>/<user>", "platform:<plat>", "global", "default"
-        """
         with self._lock:
             if platform and username:
                 user_section = (
@@ -214,7 +157,7 @@ class PolicyStore:
                 return global_section[key], "global"
             return default, "default"
 
-    # ── Mutation ──────────────────────────────────────────────────────────────
+    # ── Mutation ──────────────────────────────────────────────────────────
 
     def set(
         self,
@@ -253,10 +196,6 @@ class PolicyStore:
         *,
         create: bool,
     ) -> dict[str, Any] | None:
-        """
-        Walk to the right section. With create=True, build missing
-        intermediate dicts. With create=False, return None on any miss.
-        """
         if platform and username:
             path: tuple[str, ...] = ("platform", platform, "user", username)
         elif platform:
@@ -274,7 +213,6 @@ class PolicyStore:
         return node
 
     def _prune_empty(self, platform: str | None, username: str | None) -> None:
-        """Drop now-empty per-user sections so the file stays tidy."""
         if platform and username:
             user_dict = (
                 self._data.get("platform", {})
@@ -284,11 +222,7 @@ class PolicyStore:
             if username in user_dict and not user_dict[username]:
                 del user_dict[username]
 
-    # ── User-list management ──────────────────────────────────────────────────
-    #
-    # `users` per platform lives at [platform.<name>].users as a TOML
-    # array of strings. These typed accessors are the ONLY way callers
-    # should touch user lists — no module should poke at the raw dict.
+    # ── User-list management ──────────────────────────────────────────────
 
     def list_users(self, platform: str) -> tuple[str, ...]:
         with self._lock:
@@ -299,7 +233,6 @@ class PolicyStore:
             )
 
     def add_user(self, platform: str, username: str) -> bool:
-        """Return True if added, False if already present."""
         with self._lock:
             section = self._resolve_section(platform, None, create=True)
             users = list(section.get("users", []))
@@ -311,12 +244,6 @@ class PolicyStore:
             return True
 
     def remove_user(self, platform: str, username: str) -> bool:
-        """
-        Return True if removed, False if not present.
-
-        Also drops any per-user overrides for the removed user. Otherwise
-        you accumulate dead overrides referencing users that no longer exist.
-        """
         with self._lock:
             section = self._resolve_section(platform, None, create=False)
             if section is None:
@@ -332,10 +259,9 @@ class PolicyStore:
             self._persist()
             return True
 
-    # ── Diagnostics ───────────────────────────────────────────────────────────
+    # ── Diagnostics ───────────────────────────────────────────────────────
 
     def iter_user_overrides(self) -> Iterator[tuple[str, str, dict[str, Any]]]:
-        """Yield (platform, username, overrides_dict) for every per-user section."""
         with self._lock:
             for plat_name, plat_data in self._data.get("platform", {}).items():
                 if not isinstance(plat_data, dict):
@@ -346,5 +272,4 @@ class PolicyStore:
 
     @property
     def path(self) -> Path:
-        """Read-only accessor for the underlying file path."""
         return self._path

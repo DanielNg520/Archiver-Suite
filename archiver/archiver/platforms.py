@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Iterable
 
 if TYPE_CHECKING:
     from .config import Config, XConfig, TikTokConfig, InstagramConfig
-    from .db import ArchiveDB
+    from core import ItemStore
 
 log = logging.getLogger(__name__)
 
@@ -97,7 +97,7 @@ class Platform(abc.ABC):
     def attempt_recovery(self) -> bool: ...
 
     @abc.abstractmethod
-    def download(self, username: str, db: "ArchiveDB") -> int: ...
+    def download(self, username: str, db: "ItemStore") -> int: ...
 
     @abc.abstractmethod
     def archive_path(self, username: str) -> Path:
@@ -258,7 +258,7 @@ class XPlatform(Platform):
     def seed_archive(self, username: str, entries: Iterable[str]) -> int:
         return _seed_gallery_dl_sqlite(self.archive_path(username), entries)
 
-    def download(self, username: str, db: "ArchiveDB") -> int:
+    def download(self, username: str, db: "ItemStore") -> int:
         import gallery_dl.config
         import gallery_dl.job
         import gallery_dl.exception
@@ -428,7 +428,7 @@ class TikTokPlatform(Platform):
         """
         return _seed_ytdlp_txt(self.archive_path(username), entries)
 
-    def download(self, username: str, db: "ArchiveDB") -> int:
+    def download(self, username: str, db: "ItemStore") -> int:
         import yt_dlp
 
         user_dir = self.download_root(username)
@@ -611,7 +611,7 @@ class InstagramPlatform(Platform):
     def seed_archive(self, username: str, entries: Iterable[str]) -> int:
         return _seed_gallery_dl_sqlite(self.archive_path(username), entries)
 
-    def download(self, username: str, db: "ArchiveDB") -> int:
+    def download(self, username: str, db: "ItemStore") -> int:
         import gallery_dl.config
         import gallery_dl.job
         import gallery_dl.exception
@@ -703,13 +703,13 @@ class InstagramPlatform(Platform):
 
 # ── Checkpoint helpers (shared across platforms) ──────────────────────────────
 
-def _compute_date_min(db: "ArchiveDB", platform: str, username: str,
+def _compute_date_min(db: "ItemStore", platform: str, username: str,
                       slack_days: int = 1) -> int | None:
     """
     Compute a Unix timestamp `date-min` for the next extractor call.
 
     Strategy:
-      1. Prefer `MAX(upload_date WHERE telegram_sent=1)` — the actual
+      1. Prefer `MAX(upload_date WHERE status='sent')` — the actual
          frontier of confirmed-archived content. This is what makes
          incremental work even with `delete_after_upload=true`.
       2. Fall back to `last_run_utc` if there's no completed upload yet.
@@ -718,7 +718,7 @@ def _compute_date_min(db: "ArchiveDB", platform: str, username: str,
 
     Returns None on first-ever run (no DB knowledge of this user).
     """
-    floor_str = db.max_upload_date(platform, username, sent_only=True)
+    floor_str = db.max_sent_upload_date(platform, username)
     if floor_str:
         try:
             dt = _date_str_to_datetime(floor_str)
@@ -737,7 +737,7 @@ def _compute_date_min(db: "ArchiveDB", platform: str, username: str,
     return None
 
 
-def _compute_date_after_str(db: "ArchiveDB", platform: str, username: str,
+def _compute_date_after_str(db: "ItemStore", platform: str, username: str,
                             slack_days: int = 1) -> str | None:
     """
     Same as _compute_date_min but returns YYYYMMDD string for yt-dlp
@@ -766,7 +766,7 @@ def _register_new_files(
     username: str,
     user_dir: Path,
     before:   set[Path],
-    db:       "ArchiveDB",
+    db:       "ItemStore",
 ) -> int:
     """
     Diff before/after, register new files in DB. Delegates to the
@@ -792,7 +792,8 @@ def _register_new_files(
             continue
 
         ident = identity.resolve(f)
-        inserted = db.add_file(
+        inserted = db.add_item(
+            source          = "archiver",
             platform        = platform,
             username        = username,
             identifier      = ident.identifier,
@@ -800,31 +801,10 @@ def _register_new_files(
             upload_date     = ident.upload_date,
             file_size_bytes = size,
             title           = ident.title,
+            priority        = 10,
         )
         if inserted:
             added += 1
             log.info("  + %s (%.1f MB)", f.name, size / 1_048_576)
     log.info("  Download done: @%s — %d new file(s)", username, added)
     return added
-
-
-# ── Factory used by db.reconcile() back-compat path ───────────────────────────
-
-def build_platform_by_name(name: str) -> Platform | None:
-    """
-    Construct a Platform instance for `name` using the current Config.
-    Returns None if that platform isn't configured.
-
-    Used by db.reconcile()'s back-compat shim so it can call
-    Platform.seed_archive() without holding a Platform instance.
-    Loading Config here is cheap (re-reads env, no I/O beyond that).
-    """
-    from .config import Config
-    cfg = Config.load()
-    if name == "x" and cfg.x:
-        return XPlatform(cfg)
-    if name == "tiktok" and cfg.tiktok:
-        return TikTokPlatform(cfg)
-    if name == "instagram" and cfg.instagram:
-        return InstagramPlatform(cfg)
-    return None

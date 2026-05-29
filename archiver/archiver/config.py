@@ -45,7 +45,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .policy_store import PolicyStore
+from core import PolicyStore, db_path as _core_db_path
 
 load_dotenv(Path.home() / ".config" / "archiver" / ".env")
 
@@ -65,34 +65,12 @@ def _opt(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
-# ── Telegram (always required) ────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class TelegramConfig:
-    """
-    Telethon MTProto config — credentials only. The chat_id here is the
-    GLOBAL default. Per-platform / per-user overrides are still env vars
-    (TELEGRAM_CHAT_ID_*) resolved by TelegramRouter at send time —
-    chat IDs are always numeric or @username, so env-var encoding works
-    cleanly for them.
-    """
-    api_id:       int
-    api_hash:     str
-    phone:        str
-    chat_id:      str
-    session_name: str = "archiver"
-
-    @classmethod
-    def from_env(cls) -> "TelegramConfig":
-        default_session = os.path.expanduser("~/.config/archiver/session")
-        os.makedirs(os.path.dirname(default_session), exist_ok=True)
-        return cls(
-            api_id       = int(_req("TELEGRAM_API_ID")),
-            api_hash     = _req("TELEGRAM_API_HASH"),
-            phone        = _req("TELEGRAM_PHONE"),
-            chat_id      = _req("TELEGRAM_CHAT_ID"),
-            session_name = _opt("TELEGRAM_SESSION", default_session),
-        )
+# NOTE: The archiver no longer holds any Telegram configuration. Post-cutover
+# it sends nothing — it only writes pending rows into the shared items table.
+# The dispatcher is the sole Telegram session owner and resolves the
+# destination peer (TELEGRAM_CHAT_ID_*) at send time from (platform, username).
+# Keeping creds here would be dead weight that the archiver would needlessly
+# require at startup.
 
 
 # ── X / Twitter ───────────────────────────────────────────────────────────────
@@ -179,14 +157,13 @@ class InstagramConfig:
 # hashing aren't useful here.
 @dataclass(frozen=True, eq=False)
 class Config:
-    telegram:     TelegramConfig
     x:            XConfig         | None
     tiktok:       TikTokConfig    | None
     instagram:    InstagramConfig | None
     policy_store: PolicyStore
 
     output_dir: str = "./downloads"
-    db_path:    str = "./.archiver/archive.db"
+    db_path:    str = ""   # resolved in load() via core.db_path()
     log_file:   str = "./.archiver/archiver.log"
     state_dir:  str = "./.archiver"
 
@@ -195,12 +172,11 @@ class Config:
 
     auth_failure_threshold: int = 3
 
-    dispatcher_db_path: str  = "~/.config/dispatcher/dispatcher.db"
-
     enabled_platforms: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls, *, load_platform_configs: bool = True,
+             require_platforms: bool = True) -> "Config":
         # 1. Build the store first — it sources user lists for the rest.
         store = PolicyStore()
 
@@ -213,19 +189,18 @@ class Config:
 
         # 3. Build per-platform config blocks only for enabled platforms
         #    with at least one configured user in config.toml.
-        x_cfg = None
-        if "x" in enabled and store.list_users("x"):
-            x_cfg = XConfig.from_store(store)
+        x_cfg = tt_cfg = ig_cfg = None
+        if load_platform_configs:
+            if "x" in enabled and store.list_users("x"):
+                x_cfg = XConfig.from_store(store)
 
-        tt_cfg = None
-        if "tiktok" in enabled and store.list_users("tiktok"):
-            tt_cfg = TikTokConfig.from_store(store)
+            if "tiktok" in enabled and store.list_users("tiktok"):
+                tt_cfg = TikTokConfig.from_store(store)
 
-        ig_cfg = None
-        if "instagram" in enabled and store.list_users("instagram"):
-            ig_cfg = InstagramConfig.from_store(store)
+            if "instagram" in enabled and store.list_users("instagram"):
+                ig_cfg = InstagramConfig.from_store(store)
 
-        if not (x_cfg or tt_cfg or ig_cfg):
+        if require_platforms and not (x_cfg or tt_cfg or ig_cfg):
             raise RuntimeError(
                 "No platforms configured. Add users via "
                 "`archiver config add --platform <x|tiktok|instagram> "
@@ -234,18 +209,15 @@ class Config:
             )
 
         return cls(
-            telegram          = TelegramConfig.from_env(),
             x                 = x_cfg,
             tiktok            = tt_cfg,
             instagram         = ig_cfg,
             policy_store      = store,
             output_dir        = _opt("OUTPUT_DIR", "./downloads"),
-            db_path           = _opt("DB_PATH",    "./.archiver/archive.db"),
+            db_path           = str(_core_db_path()),
             log_file          = _opt("LOG_FILE",   "./.archiver/archiver.log"),
             state_dir         = _opt("STATE_DIR",  "./.archiver"),
             sleep_min         = float(_opt("SLEEP_MIN", "3")),
             sleep_max         = float(_opt("SLEEP_MAX", "8")),
-            dispatcher_db_path = _opt("DISPATCHER_DB",
-                                      "~/.config/dispatcher/dispatcher.db"),
             enabled_platforms = enabled,
         )

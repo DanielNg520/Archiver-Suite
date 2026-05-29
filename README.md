@@ -11,8 +11,8 @@ TikTok live streams to Telegram, losslessly and unattended.
                  │           │
                  ▼           ▼
             ┌────────────────────┐
-            │   dispatcher.db    │   ← SQLite queue (the only shared state)
-            │   (upload_queue)   │
+            │     suite.db       │   ← the ONE database (shared state)
+            │    (items table)   │
             └─────────┬──────────┘
                       │
                       ▼
@@ -46,12 +46,22 @@ to Telegram inline. That coupling caused three problems this redesign fixes:
 
 ## The one rule that holds it together
 
-**Processes communicate ONLY through `dispatcher.db`.** No process imports
-another's Python code. The archiver and recorder write rows; the dispatcher
-reads them. This is why each can be installed, upgraded, crashed, or rolled
-back independently. Shared logic (the `policy_store`, `tg_router`) was
-*copied* into each package rather than imported — intentional duplication to
-preserve independence.
+**There is exactly one source of truth: the `items` table in `suite.db`.**
+A file's entire life — discovered, downloaded, queued, sending, sent or
+failed — is one row with one `status` column. Every process reads and
+writes that one table through a shared `core` library; none of them keeps
+its own private copy of delivery state, so there is nothing to reconcile.
+
+The processes stay separate (separate crashable, separately-scheduled
+units — see below), but they share *code*, not duplicate it. `core` holds
+the schema, the state-machine transitions, the policy store, and the
+filesystem helpers. One definition, imported four times. (The earlier
+design copied `policy_store`/`tg_router` into each package "to preserve
+independence"; in practice that just meant the copies could drift against
+the one schema they all depend on. Process isolation comes from running
+separate processes — not from giving them disjoint code.)
+
+Install/upgrade/migration details: see **MIGRATION-AND-INSTALL.md**.
 
 ---
 
@@ -59,10 +69,11 @@ preserve independence.
 
 ### dispatcher — the only thing that talks to Telegram
 
-Owns the Telegram session. Polls `upload_queue` for `pending` rows, claims
-one atomically, sends it, marks it `done` (or `failed` after retries).
+Owns the Telegram session. Polls the shared `items` table for `pending`
+rows, claims one atomically, sends it, marks it `sent` (or `failed` after
+retries).
 Handles FloodWait, retries with backoff, and an optional delete-after-upload
-policy. A startup watchdog reverts rows stuck in `claimed` (from a previous
+policy. A startup watchdog reverts rows stuck in `sending` (from a previous
 crash) back to `pending`.
 
 Priority order: lower number drains first. Archiver enqueues at **10**,
@@ -73,18 +84,17 @@ Detailed docs: `dispatcher/README.md`.
 
 ### archiver — pulls VODs from X / Instagram / TikTok
 
-Your existing multi-platform archiver, now modified to enqueue into
-`dispatcher.db` instead of sending directly. Controlled by one feature flag:
+Your existing multi-platform archiver, now writing pending rows directly
+into the shared `items` table instead of sending to Telegram itself. There
+is no feature flag and no Telegram session in the archiver anymore — it
+holds zero Telegram credentials. Writing the row *is* the handoff; the
+dispatcher claims it on its next poll.
 
-- `ARCHIVER_USE_DISPATCHER=true` → enqueue (new behavior)
-- `ARCHIVER_USE_DISPATCHER=false` → send directly via its own session (legacy
-  fallback, your rollback path)
-
-When enqueuing, files are marked `telegram_sent=2` (queued) locally. On the
-next run, `reconcile_dispatch_outcomes()` reads the dispatcher's results and
-flips them to `1` (sent) or `0` (failed). The download cutoff (`date_floor`)
-only advances past files Telegram has *confirmed*, so a crash never loses
-ground.
+The download cutoff (`date_floor`) reads `MAX(upload_date WHERE
+status='sent')` straight from the one table, so it only advances past
+posts the dispatcher has actually confirmed delivered. A crash or a slow
+queue never loses ground, even though sending is asynchronous — and there
+is no mirror column or reconcile step to keep in sync.
 
 While the recorder is actively recording TikTok, the archiver skips the
 TikTok *download* step (it reads the recorder's lockfile). Uploads of existing
@@ -94,9 +104,9 @@ TikTok backlog still proceed.
 
 Watches a priority-ordered list of TikTok usernames. When one goes live, it
 records the stream with yt-dlp (ffmpeg backend), and when the stream ends it
-enqueues the file into `dispatcher.db`. Records one stream at a time; between
-recordings it re-scans the list so a higher-priority user who just went live
-gets picked up.
+registers the file in `suite.db` as a pending dispatcher item. Records one
+stream at a time; between recordings it re-scans the list so a higher-priority
+user who just went live gets picked up.
 
 Holds a lockfile (`~/.config/archiver/locks/tiktok.lock`) only while actively
 recording, so the archiver knows to skip TikTok downloads during that window.
@@ -126,23 +136,24 @@ Also ships the three launchd plists and `RUNBOOK.md` (failure recovery).
 ## On-disk layout
 
 ```
+~/.config/archiver-suite/
+    suite.db                THE ONE DATABASE: items + checkpoints + circuit
+                            + metadata (+ -wal, -shm while running)
+    config.toml             shared policy store (user lists + per-user
+                            delete-after-upload / dedup policies)
+
 ~/.config/dispatcher/
     .env                    Telegram credentials + chat routing
-    config.toml             delete-after-upload policy (machine-managed)
-    dispatcher.db           THE QUEUE (+ -wal, -shm while running)
     session.session         dispatcher's Telegram session
 
 ~/.config/archiver/
-    .env                    archiver creds, paths, ARCHIVER_USE_DISPATCHER
-    config.toml             user lists + per-user policies
-    archive.db              archiver's own record of downloaded media
-    session                 archiver's Telegram session (legacy path only)
+    .env                    archiver creds + paths (NO Telegram creds)
     locks/tiktok.lock       written by recorder while recording
     cookies/                Instagram/TikTok cookies
 
 ~/.config/recorder/
     .env                    TIKTOK_COOKIES_FILE, paths
-    config.toml             priority-ordered TikTok user list
+    config.toml             priority-ordered TikTok user list (recorder-owned)
 
 ~/.local/log/
     {dispatcher,recorder,archiver}.log          rotating app logs (if wired)
@@ -158,24 +169,31 @@ Also ships the three launchd plists and `RUNBOOK.md` (failure recovery).
 
 ---
 
-## Install order (matters)
+## Install
 
-The dispatcher owns the DB schema the others write into, so install it first.
-
-```
-cd dispatcher  && pipx install . --python 3.13
-cd ../archiver && pipx install . --python 3.13
-cd ../recorder && pipx install . --python 3.13
-cd ../ops      && pipx install . --python 3.13
-```
-
-pipx has no editable mode. After any source edit:
+Install order **no longer matters** — `core` creates the schema
+idempotently the first time any process connects. Each app is installed
+with pipx, then the shared `core` library is injected (editable) into each
+app's venv:
 
 ```
-pipx reinstall <package> --python 3.13
+pipx install ./dispatcher --python 3.13
+pipx install ./archiver   --python 3.13
+pipx install ./recorder   --python 3.13
+pipx install ./ops        --python 3.13
+
+pipx inject --editable dispatcher     ./core
+pipx inject --editable media-archiver ./core
+pipx inject --editable recorder       ./core
+pipx inject --editable ops            ./core
 ```
 
-(packages: `dispatcher`, `media-archiver`, `recorder`, `ops`)
+Editing `core` needs no reinstall (editable). After editing a service:
+`pipx reinstall <package> --python 3.13` (packages: `dispatcher`,
+`media-archiver`, `recorder`, `ops`).
+
+The full install, the one-time data migration from the old two databases,
+and what changed are in **MIGRATION-AND-INSTALL.md**.
 
 First run requires interactive Telegram auth (launchd can't answer the SMS
 prompt). See AUTOMATION.md step 2.

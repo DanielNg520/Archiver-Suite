@@ -22,7 +22,6 @@ Subcommands:
   config list/add/remove User-list management (edits config.toml)
   policy                 Show or edit delete-after-upload policy
   dedup-policy           Show or edit dedup-after-download policy
-  chats                  Show or edit Telegram destination chat per user
   migrate                One-shot: import legacy .env user lists + delete
                          policies into config.toml
 
@@ -44,10 +43,10 @@ import sys
 from pathlib import Path
 
 from .config import Config
-from .db import ArchiveDB
 from .orchestrator import Archiver, bootstrap, build_platforms
-from .policies import DeletePolicy, DedupPolicy
-from .tg_router import TelegramRouter
+from .reconcile import reconcile_user
+
+from core import ItemStore, DeletePolicy, DedupPolicy
 
 
 PLATFORM_CHOICES = ["x", "tiktok", "instagram"]
@@ -68,7 +67,7 @@ def setup_logging(log_file: str, verbose: bool = False) -> None:
             logging.FileHandler(log_file, encoding="utf-8"),
         ],
     )
-    for lib in ("telethon", "httpx", "httpcore", "urllib3", "asyncio"):
+    for lib in ("httpx", "httpcore", "urllib3", "asyncio"):
         logging.getLogger(lib).setLevel(logging.WARNING if not verbose else logging.INFO)
 
 
@@ -241,32 +240,6 @@ def build_parser() -> argparse.ArgumentParser:
     dp_unset.add_argument("--user", metavar="USERNAME",
                             help="Per-user override. Requires --platform.")
 
-    # ── chats ───
-    s_ch = sub.add_parser(
-        "chats",
-        help="Show or edit Telegram destination chat per (platform, user)",
-    )
-    s_ch.add_argument("--platform", choices=PLATFORM_CHOICES)
-    s_ch.add_argument("--user", metavar="USERNAME")
-    ch_sub = s_ch.add_subparsers(dest="chats_action", required=False,
-                                  metavar="ACTION",
-                                  help="omit to print resolution; "
-                                       "'set'/'unset' to mutate .env")
-
-    ch_set = ch_sub.add_parser("set",
-        help="Write TELEGRAM_CHAT_ID_<PLAT>[_<USER>]=CHAT into .env")
-    ch_set.add_argument("--platform", choices=PLATFORM_CHOICES, required=True)
-    ch_set.add_argument("--user", metavar="USERNAME",
-                         help="If given, sets a per-user override.")
-    ch_set.add_argument("--chat", metavar="CHAT_ID", required=True,
-                         help="Chat ID (e.g. -1001234567890) or @username")
-
-    ch_unset = ch_sub.add_parser("unset",
-        help="Remove a TELEGRAM_CHAT_ID_<PLAT>[_<USER>] entry from .env")
-    ch_unset.add_argument("--platform", choices=PLATFORM_CHOICES, required=True)
-    ch_unset.add_argument("--user", metavar="USERNAME",
-                           help="If given, removes a per-user override.")
-
     # ── migrate ───
     sub.add_parser(
         "migrate",
@@ -279,7 +252,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
-def cmd_run(args, config: Config, db: ArchiveDB) -> int:
+def cmd_run(args, config: Config, db: ItemStore) -> int:
     arch = Archiver(config, db)
     results = asyncio.run(arch.run(
         platform_filter = args.platform,
@@ -291,9 +264,16 @@ def cmd_run(args, config: Config, db: ArchiveDB) -> int:
     for key, r in results.items():
         status = r.get("status", "?")
         if status == "ok":
-            line = f"  ✓ {key:32s} dl={r.get('downloaded',0):>3} up={r.get('uploaded',0):>3}"
+            line = (
+                f"  ✓ {key:32s} dl={r.get('downloaded',0):>3} "
+                f"pending={r.get('pending',0):>3} sent={r.get('sent',0):>3} "
+                f"failed={r.get('failed',0):>3}"
+            )
         elif status == "partial":
-            line = f"  ⚠ {key:32s} dl={r.get('downloaded',0):>3} up={r.get('uploaded',0):>3} fail={r.get('failed',0)}"
+            line = (
+                f"  ⚠ {key:32s} dl={r.get('downloaded',0):>3} "
+                f"pending={r.get('pending',0):>3} failed={r.get('failed',0)}"
+            )
         else:
             line = f"  ✗ {key:32s} {status}: {r.get('reason','')[:40]}"
         log.info(line)
@@ -301,7 +281,7 @@ def cmd_run(args, config: Config, db: ArchiveDB) -> int:
     return 0 if all(r.get("status") in ("ok",) for r in results.values()) else 1
 
 
-def cmd_bootstrap(args, config: Config, db: ArchiveDB) -> int:
+def cmd_bootstrap(args, config: Config, db: ItemStore) -> int:
     """Absorb existing on-disk archive — no network calls."""
     log.info("Bootstrap: scanning %s and seeding extractor archives…",
              config.output_dir)
@@ -333,7 +313,7 @@ def cmd_bootstrap(args, config: Config, db: ArchiveDB) -> int:
     return 0
 
 
-def cmd_reset(args, config: Config, db: ArchiveDB) -> int:
+def cmd_reset(args, config: Config, db: ItemStore) -> int:
     sub = args.reset_cmd
     user = args.user.lstrip("@") if getattr(args, "user", None) else None
     if sub == "failed":
@@ -346,7 +326,7 @@ def cmd_reset(args, config: Config, db: ArchiveDB) -> int:
         for platform in platforms:
             users = (user,) if user else platform.users
             for u in users:
-                n = db.reconcile(platform.name, u, config.output_dir)
+                n = reconcile_user(platform, u, db, config.output_dir).inserted
                 if n:
                     log.info("  reconcile [%s] @%s: +%d orphan(s)", platform.name, u, n)
         n = db.reset_uploads(args.platform, user)
@@ -398,7 +378,7 @@ def cmd_reset(args, config: Config, db: ArchiveDB) -> int:
     return 0
 
 
-def cmd_reconcile(args, config: Config, db: ArchiveDB) -> int:
+def cmd_reconcile(args, config: Config, db: ItemStore) -> int:
     platforms = build_platforms(config)
     if args.platform:
         platforms = [p for p in platforms if p.name == args.platform]
@@ -407,14 +387,14 @@ def cmd_reconcile(args, config: Config, db: ArchiveDB) -> int:
     for platform in platforms:
         users = (args.user.lstrip("@"),) if args.user else platform.users
         for u in users:
-            n = db.reconcile(platform.name, u, config.output_dir)
+            n = reconcile_user(platform, u, db, config.output_dir).inserted
             log.info("[%s] @%s: reconciled %d", platform.name, u, n)
             total += n
     log.info("Total reconciled: %d", total)
     return 0
 
 
-def cmd_dedup(args, config: Config, db: ArchiveDB) -> int:
+def cmd_dedup(args, config: Config, db: ItemStore) -> int:
     """
     Content-hash dedup for one or all users. Dry-run by default;
     pass --yes for actual deletion.
@@ -467,7 +447,7 @@ def cmd_dedup(args, config: Config, db: ArchiveDB) -> int:
     return 0
 
 
-def cmd_stats(args, config: Config, db: ArchiveDB) -> int:
+def cmd_stats(args, config: Config, db: ItemStore) -> int:
     user = args.user.lstrip("@") if args.user else None
     if args.platform or user:
         s = db.stats(args.platform, user)
@@ -480,19 +460,21 @@ def cmd_stats(args, config: Config, db: ArchiveDB) -> int:
             log.info("[%s]: total=%d sent=%d pending=%d failed=%d (%.1f MB)",
                      p, s["total"], s["sent"], s["pending"], s["failed"], s["total_mb"])
 
-    platforms = build_platforms(config)
-    if platforms:
-        log.info("")
-        log.info("date_floor (next incremental cutoff):")
-        for p in platforms:
-            users = [user] if user else list(p.users)
-            for u in users:
-                floor = db.get_date_floor(p.name, u)
-                log.info("  [%s] @%s → %s", p.name, u, floor or "(none — full fetch)")
+    log.info("")
+    log.info("date_floor (next incremental cutoff):")
+    rows = 0
+    for platform in ([args.platform] if args.platform else PLATFORM_CHOICES):
+        users = [user] if user else list(config.policy_store.list_users(platform))
+        for u in users:
+            floor = db.get_date_floor(platform, u)
+            log.info("  [%s] @%s → %s", platform, u, floor or "(none — full fetch)")
+            rows += 1
+    if rows == 0:
+        log.info("  (no configured users matched)")
     return 0
 
 
-def cmd_health(args, config: Config, db: ArchiveDB) -> int:
+def cmd_health(args, config: Config, db: ItemStore) -> int:
     platforms = build_platforms(config)
     if not platforms:
         log.error("No platforms configured.")
@@ -569,26 +551,21 @@ def _cmd_boolpolicy(
     log.info("  default for %s: %s", policy.KEY, default_value)
     log.info("")
 
-    platforms = build_platforms(config)
-    if args.platform:
-        platforms = [p for p in platforms if p.name == args.platform]
-        if not platforms:
-            log.error("No matching platform configured: %s", args.platform)
-            return 2
-
     user_filter = args.user.lstrip("@") if args.user else None
     rows = 0
-    for p in platforms:
-        users = [u for u in p.users if user_filter is None or u == user_filter]
+    platforms = [args.platform] if args.platform else PLATFORM_CHOICES
+    for platform in platforms:
+        configured = config.policy_store.list_users(platform)
+        users = [u for u in configured if user_filter is None or u == user_filter]
         for u in users:
-            log.info("  [%s] @%s → %s", p.name, u, policy.explain(p.name, u))
+            log.info("  [%s] @%s → %s", platform, u, policy.explain(platform, u))
             rows += 1
     if rows == 0:
         log.warning("No (platform, user) matched the filter.")
     return 0
 
 
-def cmd_policy(args, config: Config, db: ArchiveDB) -> int:
+def cmd_policy(args, config: Config, db: ItemStore) -> int:
     return _cmd_boolpolicy(
         args, config, DeletePolicy,
         action_attr = "policy_action",
@@ -597,46 +574,13 @@ def cmd_policy(args, config: Config, db: ArchiveDB) -> int:
     )
 
 
-def cmd_dedup_policy(args, config: Config, db: ArchiveDB) -> int:
+def cmd_dedup_policy(args, config: Config, db: ItemStore) -> int:
     return _cmd_boolpolicy(
         args, config, DedupPolicy,
         action_attr = "dp_action",
         value_attr  = "enabled",
         cmd_label   = "dedup-policy",
     )
-
-
-# ── chats commands (still env-var-backed; chat IDs are always safe ASCII) ────
-
-def cmd_chats(args, config: Config, db: ArchiveDB) -> int:
-    action = getattr(args, "chats_action", None)
-    if action == "set":
-        return _cmd_chats_set(args, config)
-    if action == "unset":
-        return _cmd_chats_unset(args, config)
-
-    router = TelegramRouter(default_chat_id=config.telegram.chat_id)
-    log.info("Telegram destination resolution:")
-    log.info("  global default (TELEGRAM_CHAT_ID): %s", config.telegram.chat_id)
-    log.info("")
-
-    platforms = build_platforms(config)
-    if args.platform:
-        platforms = [p for p in platforms if p.name == args.platform]
-        if not platforms:
-            log.error("No matching platform configured: %s", args.platform)
-            return 2
-
-    user_filter = args.user.lstrip("@") if args.user else None
-    rows = 0
-    for p in platforms:
-        users = [u for u in p.users if user_filter is None or u == user_filter]
-        for u in users:
-            log.info("  [%s] @%s → %s", p.name, u, router.explain(p.name, u))
-            rows += 1
-    if rows == 0:
-        log.warning("No (platform, user) matched the filter.")
-    return 0
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -656,15 +600,14 @@ def _env_path() -> Path:
 def _warn_unknown_user(config: Config, platform: str, username: str) -> None:
     """Soft warning if the user isn't currently in the platform's user list.
     Doesn't block writes — operators sometimes pre-stage overrides."""
-    cfg_block = getattr(config, platform, None)
-    if cfg_block is None:
+    if platform not in PLATFORM_CHOICES:
         log.warning(
-            "Platform [%s] is not currently configured. The override "
-            "will be written but inactive until the platform is enabled.",
+            "Unknown platform [%s]. The override will be written but no "
+            "archiver command currently knows how to use it.",
             platform,
         )
         return
-    if username not in cfg_block.users:
+    if username not in config.policy_store.list_users(platform):
         log.warning(
             "User '%s' is not currently in [%s] users. Override will be "
             "written but won't apply until the user is added via "
@@ -707,59 +650,10 @@ def _unset_env_var(key: str) -> bool:
     return bool(removed)
 
 
-# ── chats set / unset (still env-backed) ─────────────────────────────────────
-
-def _cmd_chats_set(args, config: Config) -> int:
-    from .tg_router import _user_key, _platform_key
-
-    platform = args.platform
-    username = args.user.lstrip("@") if args.user else None
-    chat     = args.chat.strip()
-
-    err = _validate_chat_id_format(chat)
-    if err:
-        log.error("chats set: %s", err)
-        return 2
-
-    if username:
-        _warn_unknown_user(config, platform, username)
-        key = _user_key(platform, username)
-        scope = f"[{platform}] @{username}"
-    else:
-        key = _platform_key(platform)
-        scope = f"[{platform}] (platform-wide)"
-
-    _set_env_var(key, chat)
-    log.info("chats set: %s → %s   [%s=%s]", scope, chat, key, chat)
-    log.info("Note: a running `archiver loop` won't see this change until it restarts.")
-    return 0
-
-
-def _cmd_chats_unset(args, config: Config) -> int:
-    from .tg_router import _user_key, _platform_key
-
-    platform = args.platform
-    username = args.user.lstrip("@") if args.user else None
-
-    if username:
-        key = _user_key(platform, username)
-        scope = f"[{platform}] @{username}"
-    else:
-        key = _platform_key(platform)
-        scope = f"[{platform}] (platform-wide)"
-
-    removed = _unset_env_var(key)
-    if removed:
-        log.info("chats unset: removed %s   [%s]", scope, key)
-        log.info("Resolution now falls through to the next level.")
-    else:
-        log.info("chats unset: %s was not set in .env — nothing to do.", scope)
-    return 0
-
 
 # ── config (user-list management, now backed by PolicyStore) ─────────────────
 
-def cmd_config(args, config: Config, db: ArchiveDB) -> int:
+def cmd_config(args, config: Config, db: ItemStore) -> int:
     store = config.policy_store
 
     if args.config_cmd == "list":
@@ -794,7 +688,7 @@ def cmd_config(args, config: Config, db: ArchiveDB) -> int:
 
 # ── cookies ──────────────────────────────────────────────────────────────────
 
-def cmd_cookies(args, config: Config, db: ArchiveDB) -> int:
+def cmd_cookies(args, config: Config, db: ItemStore) -> int:
     from . import cookies
 
     if args.ck_cmd == "list":
@@ -842,7 +736,7 @@ def cmd_cookies(args, config: Config, db: ArchiveDB) -> int:
 
 # ── migrate (.env → config.toml) ─────────────────────────────────────────────
 
-def cmd_migrate(args, config: Config, db: ArchiveDB) -> int:
+def cmd_migrate(args, config: Config, db: ItemStore) -> int:
     """
     Import legacy state from .env into config.toml:
       - X_USERS / TIKTOK_USERS / INSTAGRAM_USERS → store.add_user(...)
@@ -973,7 +867,7 @@ def cmd_migrate(args, config: Config, db: ArchiveDB) -> int:
 
 # ── loop ─────────────────────────────────────────────────────────────────────
 
-def cmd_loop(args, config: Config, db: ArchiveDB) -> int:
+def cmd_loop(args, config: Config, db: ItemStore) -> int:
     import random
     import signal
     import time
@@ -1136,8 +1030,15 @@ def main() -> int:
     parser = build_parser()
     args   = parser.parse_args()
 
+    config_only = args.cmd in {"config", "migrate", "policy", "dedup-policy", "stats"}
+    if args.cmd == "reset" and args.reset_cmd in {"failed", "user"}:
+        config_only = True
+
     try:
-        config = Config.load()
+        config = Config.load(
+            load_platform_configs = not config_only,
+            require_platforms     = not config_only,
+        )
     except RuntimeError as e:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 2
@@ -1151,7 +1052,7 @@ def main() -> int:
 
     _check_old_state_files(config)
 
-    db = ArchiveDB(config.db_path)
+    db = ItemStore.open(config.db_path)
     try:
         dispatch = {
             "run":          cmd_run,
@@ -1166,7 +1067,6 @@ def main() -> int:
             "config":       cmd_config,
             "policy":       cmd_policy,
             "dedup-policy": cmd_dedup_policy,
-            "chats":        cmd_chats,
             "migrate":      cmd_migrate,
         }
         return dispatch[args.cmd](args, config, db)

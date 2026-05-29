@@ -6,8 +6,8 @@ Argparse-based CLI. Subcommands:
   dispatcher start                      Run the drain loop in foreground.
   dispatcher status                     Queue counts + top pending rows.
   dispatcher queue list [--status S]    List rows; default newest 50.
-  dispatcher queue retry <id>           Reset failed/done row to pending.
-  dispatcher queue cancel <id>          Force pending/claimed row to failed.
+  dispatcher queue retry <id>           Reset failed/sent row to pending.
+  dispatcher queue cancel <id>          Force pending/sending row to failed.
   dispatcher config show                Dump effective config + .env path.
 
 Design notes:
@@ -28,10 +28,10 @@ import signal
 import sys
 from pathlib import Path
 
+from core import ItemStore, DeletePolicy
+
 from .config import DispatcherConfig
-from .db import QueueDB
 from .drain import drain_forever
-from .policies import DeletePolicy
 from .send import TelethonSendStrategy
 from .tg_router import TelegramRouter
 
@@ -52,7 +52,9 @@ def _setup_logging(verbose: bool) -> None:
 # ── Subcommand: start ─────────────────────────────────────────────────────
 
 async def _run_drain(config: DispatcherConfig) -> None:
-    queue_db      = QueueDB(config.db_path)
+    if config.telegram is None or config.default_chat_id is None:
+        raise RuntimeError("dispatcher start requires Telegram credentials")
+    store         = ItemStore.open(config.db_path)
     router        = TelegramRouter(default_chat_id=config.default_chat_id)
     delete_policy = DeletePolicy(config.policy_store)
 
@@ -78,18 +80,19 @@ async def _run_drain(config: DispatcherConfig) -> None:
         try:
             await drain_forever(
                 config=config,
-                queue_db=queue_db,
+                store=store,
                 send_strategy=send_strategy,
                 router=router,
                 delete_policy=delete_policy,
                 stop_event=stop_event,
             )
         finally:
-            queue_db.close()
+            store.close()
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    config = DispatcherConfig.load()
+    config = DispatcherConfig.load(require_telegram=True)
+    assert config.telegram is not None
     log.info("cli: db=%s session=%s",
              config.db_path, config.telegram.session_name)
     try:
@@ -105,17 +108,17 @@ def cmd_start(args: argparse.Namespace) -> int:
 # ── Subcommand: status ────────────────────────────────────────────────────
 
 def cmd_status(args: argparse.Namespace) -> int:
-    config = DispatcherConfig.load()
-    queue_db = QueueDB(config.db_path)
+    config = DispatcherConfig.load(require_telegram=False)
+    store = ItemStore.open(config.db_path)
     try:
-        counts = queue_db.counts_by_status()
+        counts = store.counts_by_status()
         total = sum(counts.values())
-        print(f"queue: {config.db_path}")
+        print(f"db: {config.db_path}")
         print(f"  total: {total}")
-        for s in ("pending", "claimed", "done", "failed"):
-            print(f"  {s:8s}: {counts.get(s, 0)}")
+        for st in ("pending", "sending", "sent", "failed"):
+            print(f"  {st:8s}: {counts.get(st, 0)}")
 
-        pending = queue_db.list_rows(status="pending", limit=10)
+        pending = store.list_items(status="pending", limit=10)
         if pending:
             print(f"\ntop 10 pending (priority asc):")
             for r in pending:
@@ -125,17 +128,17 @@ def cmd_status(args: argparse.Namespace) -> int:
                     f"{Path(r.file_path).name}"
                 )
     finally:
-        queue_db.close()
+        store.close()
     return 0
 
 
 # ── Subcommand: queue ─────────────────────────────────────────────────────
 
 def cmd_queue_list(args: argparse.Namespace) -> int:
-    config = DispatcherConfig.load()
-    queue_db = QueueDB(config.db_path)
+    config = DispatcherConfig.load(require_telegram=False)
+    store = ItemStore.open(config.db_path)
     try:
-        rows = queue_db.list_rows(
+        rows = store.list_items(
             status=args.status, limit=args.limit, offset=args.offset,
         )
         for r in rows:
@@ -147,48 +150,48 @@ def cmd_queue_list(args: argparse.Namespace) -> int:
             )
         print(f"\n({len(rows)} rows)")
     finally:
-        queue_db.close()
+        store.close()
     return 0
 
 
 def cmd_queue_retry(args: argparse.Namespace) -> int:
-    config = DispatcherConfig.load()
-    queue_db = QueueDB(config.db_path)
+    config = DispatcherConfig.load(require_telegram=False)
+    store = ItemStore.open(config.db_path)
     try:
-        if queue_db.retry(args.id):
+        if store.retry(args.id):
             print(f"id={args.id} reset to pending (attempts=0)")
             return 0
         print(f"id={args.id} not found", file=sys.stderr)
         return 1
     finally:
-        queue_db.close()
+        store.close()
 
 
 def cmd_queue_cancel(args: argparse.Namespace) -> int:
-    config = DispatcherConfig.load()
-    queue_db = QueueDB(config.db_path)
+    config = DispatcherConfig.load(require_telegram=False)
+    store = ItemStore.open(config.db_path)
     try:
-        if queue_db.cancel(args.id):
+        if store.cancel(args.id):
             print(f"id={args.id} cancelled (status=failed)")
             return 0
         print(
-            f"id={args.id} not found, or not in pending/claimed",
+            f"id={args.id} not found, or not in pending/sending",
             file=sys.stderr,
         )
         return 1
     finally:
-        queue_db.close()
+        store.close()
 
 
 # ── Subcommand: config show ───────────────────────────────────────────────
 
 def cmd_config_show(args: argparse.Namespace) -> int:
-    config = DispatcherConfig.load()
+    config = DispatcherConfig.load(require_telegram=False)
     print(f".env path:        {config.env_path()}")
     print(f"config.toml path: {config.config_toml_path()}")
     print(f"db path:          {config.db_path}")
-    print(f"session:          {config.telegram.session_name}")
-    print(f"default chat:     {config.default_chat_id}")
+    print("session:          (load with `dispatcher start`)")
+    print("default chat:     (load with `dispatcher start`)")
     print(f"poll interval:    {config.poll_interval_s}s")
     print(f"max retries:      {config.max_retries}")
     print(f"retry base delay: {config.retry_base_delay}s")
@@ -219,7 +222,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_list = queue_sub.add_parser("list", help="list queue rows")
     p_list.add_argument(
         "--status",
-        choices=["pending", "claimed", "done", "failed"],
+        choices=["pending", "sending", "sent", "failed"],
         default=None,
     )
     p_list.add_argument("--limit", type=int, default=50)

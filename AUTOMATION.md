@@ -147,7 +147,7 @@ ops health
 Expect `dispatcher: running`. Now feed it manually:
 
 ```
-archiver run          # downloads, enqueues into dispatcher.db, exits
+archiver run          # downloads, inserts pending rows into suite.db, exits
 ```
 
 Watch the dispatcher drain via `ops watch`. The dispatcher (launchd) and the
@@ -202,7 +202,7 @@ ops watch
 ```
 
 Leave it open through one archiver cycle and confirm: archiver enqueues →
-dispatcher sends → rows go `done`. Walk away.
+dispatcher sends → rows go `sent`. Walk away.
 
 To confirm restart-on-crash works, kill the dispatcher and watch launchd
 respawn it within ~30s:
@@ -217,18 +217,17 @@ sleep 5 && ops health
 ## What each automated piece does, end to end
 
 1. **At login**, launchd starts dispatcher, recorder, archiver.
-2. **Dispatcher** connects to Telegram and begins polling `upload_queue`
-   every 2s. On startup it runs the watchdog (reverts stuck `claimed` rows).
+2. **Dispatcher** connects to Telegram and begins polling `items`
+   every 2s. On startup it runs the watchdog (reverts stuck `sending` rows).
 3. **Archiver** runs a cycle: for each configured user on each platform, it
-   downloads new media, enqueues it (priority 10), marks it `telegram_sent=2`,
-   then reconciles any prior dispatcher outcomes. Then it sleeps 2–4h and
-   repeats. If the recorder holds the TikTok lock, it skips TikTok downloads
-   that cycle.
+   downloads new media and inserts pending `items` rows (priority 10). Then it
+   sleeps 2–4h and repeats. If the recorder holds the TikTok lock, it skips
+   TikTok downloads that cycle.
 4. **Recorder** polls its TikTok user list every 60s. When someone's live, it
    acquires the lock, records with yt-dlp until the stream ends, releases the
    lock, enqueues the file (priority 20), and re-scans.
 5. **Dispatcher** claims queued rows (priority 10 before 20), sends each to
-   the Telegram chat resolved for that platform/user, marks `done`, and (if
+   the Telegram chat resolved for that platform/user, marks `sent`, and (if
    the delete policy is on) removes the local file + sidecars.
 6. **You** run `ops health` whenever you want to check, and consult
    `RUNBOOK.md` if something breaks.

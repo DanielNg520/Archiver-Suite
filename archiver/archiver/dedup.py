@@ -65,7 +65,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Iterator
 
 if TYPE_CHECKING:
-    from .db import ArchiveDB
+    from core import ItemStore
 
 log = logging.getLogger(__name__)
 
@@ -282,7 +282,7 @@ def _pick_winner(
 # ── DB reconciliation ─────────────────────────────────────────────────────────
 
 def _fetch_db_meta(
-    db:    "ArchiveDB",
+    db:    "ItemStore",
     paths: list[Path],
 ) -> dict[Path, dict | None]:
     """
@@ -292,8 +292,8 @@ def _fetch_db_meta(
     out: dict[Path, dict | None] = {}
     for p in paths:
         row = db.conn.execute(
-            "SELECT id, identifier, downloaded_at, telegram_sent "
-            "FROM media WHERE file_path = ?",
+            "SELECT id, identifier, discovered_at AS downloaded_at, status "
+            "FROM items WHERE file_path = ?",
             (str(p),),
         ).fetchone()
         out[p] = dict(row) if row else None
@@ -329,7 +329,7 @@ def dedup_user(
     platform_name: str,
     username:      str,
     user_dir:      Path,
-    db:            "ArchiveDB",
+    db:            "ItemStore",
     *,
     dry_run:       bool = True,
 ) -> DedupReport:
@@ -340,7 +340,7 @@ def dedup_user(
       platform_name: 'x', 'tiktok', 'instagram' — for reporting only.
       username:      ditto.
       user_dir:      typically {output_dir}/{platform}/{username}/.
-      db:            ArchiveDB — used for both metadata lookup and
+      db:            ItemStore — used for both metadata lookup and
                      post-delete row maintenance.
       dry_run:       if True, plan but do not modify disk or DB.
 
@@ -422,11 +422,11 @@ def dedup_user(
             # DB reconciliation — four cases. The ADOPT case is the
             # subtle one: when the winner has no DB row but the loser
             # does, we re-point the loser's row at the winner's path
-            # to preserve telegram_sent history.
+            # to preserve delivery-status history.
             if winner_row is not None and loser_row is not None:
                 if not dry_run:
                     db.conn.execute(
-                        "DELETE FROM media WHERE id = ?", (loser_row["id"],),
+                        "DELETE FROM items WHERE id = ?", (loser_row["id"],),
                     )
                     db.conn.commit()
                 report.db_rows_removed += 1
@@ -435,7 +435,7 @@ def dedup_user(
                 # ADOPT
                 if not dry_run:
                     db.conn.execute(
-                        "UPDATE media SET file_path = ? WHERE id = ?",
+                        "UPDATE items SET file_path = ? WHERE id = ?",
                         (str(winner), loser_row["id"]),
                     )
                     db.conn.commit()

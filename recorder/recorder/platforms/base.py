@@ -13,7 +13,7 @@ Why Protocol, not ABC:
 
 Contract:
   name         — short platform tag ("tiktok"), also the source/platform
-                 value used downstream in dispatcher.db.
+                 value used downstream in the shared items table.
   is_live(u)   — cheap liveness check for one username. MUST be safe to
                  call on a 60s poll loop: no heavy connection, no
                  long-lived sockets. Returns False on any ambiguity or

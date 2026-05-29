@@ -69,7 +69,7 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     platform = TikTokLivePlatform(config.tiktok_cookies_file, config.state_dir)
     capture  = StreamCapture(config.output_dir, config.tiktok_cookies_file)
-    enqueue_client = EnqueueClient(config.dispatcher_db_path)
+    enqueue_client = EnqueueClient(config.db_path)
     lock = TikTokLock(config.lock_path, os.getpid())
 
     def _enqueue(platform_name, username, file_path, caption):
@@ -153,7 +153,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"tiktok.lock: {'held' if lock_path.exists() else 'not held'}")
     print(f"users (priority order): {', '.join(config.tiktok_users) or '(none)'}")
     print(f"output dir: {config.output_dir}")
-    print(f"dispatcher db: {config.dispatcher_db_path}")
+    print(f"suite db: {config.db_path}")
     return 0 if running or not pid_path.exists() else 0
 
 

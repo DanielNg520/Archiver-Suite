@@ -22,8 +22,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-DISPATCHER_DB = Path("~/.config/dispatcher/dispatcher.db").expanduser()
-ARCHIVE_DB    = Path("~/.config/archiver/archive.db").expanduser()
+from core import db_path as _core_db_path
+
+# Single source of truth: one DB for the whole suite. ops still imports no
+# *service* package (dispatcher/recorder/archiver) — it only borrows the
+# canonical DB path from the shared `core` library so the location isn't
+# duplicated here and can't drift from what the services actually write.
+SUITE_DB      = _core_db_path()
 RECORDER_PID  = Path("~/.recorder/pid").expanduser()
 TIKTOK_LOCK   = Path("~/.config/archiver/locks/tiktok.lock").expanduser()
 
@@ -74,12 +79,12 @@ def _connect_ro(path: Path) -> sqlite3.Connection | None:
 
 
 def dispatcher_queue_counts() -> dict[str, int] | None:
-    conn = _connect_ro(DISPATCHER_DB)
+    conn = _connect_ro(SUITE_DB)
     if conn is None:
         return None
     try:
         rows = conn.execute(
-            "SELECT status, COUNT(*) AS n FROM upload_queue GROUP BY status"
+            "SELECT status, COUNT(*) AS n FROM items GROUP BY status"
         ).fetchall()
         return {r["status"]: r["n"] for r in rows}
     except sqlite3.Error:
@@ -89,7 +94,7 @@ def dispatcher_queue_counts() -> dict[str, int] | None:
 
 
 def archiver_last_run() -> str | None:
-    conn = _connect_ro(ARCHIVE_DB)
+    conn = _connect_ro(SUITE_DB)
     if conn is None:
         return None
     try:
@@ -141,8 +146,8 @@ def render() -> str:
     if pid:
         counts = dispatcher_queue_counts() or {}
         q = (f"queue: {counts.get('pending',0)} pending, "
-             f"{counts.get('claimed',0)} claimed, "
-             f"{counts.get('done',0)} done, "
+             f"{counts.get('sending',0)} sending, "
+             f"{counts.get('sent',0)} sent, "
              f"{counts.get('failed',0)} failed")
         lines.append(f"dispatcher: running (pid {pid}, {q})")
     else:

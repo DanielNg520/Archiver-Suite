@@ -1,28 +1,21 @@
 """
 dispatcher.delete
 ─────────────────
-Delete-after-upload safety gate.
+Delete-after-upload safety gate, now reading the ONE shared table.
 
-SAFETY CONTRACT (do not reorder these checks; this is the whole point of
-the module):
-
-  A local file is deleted ONLY when ALL of the following are true, IN ORDER:
+SAFETY CONTRACT (order is the point of the module):
+  A local file is deleted ONLY when, IN ORDER:
     (1) SendStrategy.send returned ok=True
-    (2) QueueDB.mark_done(row.id) committed status='done'
-    (3) DeletePolicy.should_delete(platform, username) returns True
+    (2) ItemStore.mark_sent committed status='sent'
+    (3) DeletePolicy.should_delete(platform, username) is True
 
-  The orchestration is in drain.py, which calls send -> mark_done ->
-  maybe_delete. This module only owns step (3) + the actual unlink.
+  drain.py owns step (1)->(2)->maybe_delete. This module owns (3) + unlink.
 
-  Defense-in-depth: maybe_delete() RE-CHECKS the DB state before unlinking.
-  If a future refactor moves the delete call BEFORE mark_done, the re-read
-  fires an ERROR log and refuses to delete — silent data loss becomes a
-  loud "file didn't delete, why?" question.
-
-SIDECAR CLEANUP:
-  gallery-dl and yt-dlp leave .json / .info.json sidecars next to media
-  files. We delete those too when removing the media. Pattern lifted
-  verbatim from archiver.telegram._cleanup.
+  Defense-in-depth: maybe_delete RE-READS the row and refuses to delete
+  unless status=='sent'. If a future refactor calls delete before
+  mark_sent, this fires an ERROR instead of losing the file silently.
+  With one table the check is a single authoritative read — no risk of
+  reading a stale mirror.
 """
 
 from __future__ import annotations
@@ -30,66 +23,25 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from .db import QueueDB
-from .policies import DeletePolicy
+from core import ItemStore, Status, cleanup_sidecars, DeletePolicy
 
 log = logging.getLogger(__name__)
 
 
-def _cleanup_sidecars(file_path: str) -> None:
-    """
-    Raw delete of media file + its known sidecars. No gating here —
-    gating is maybe_delete's job. Do NOT add direct callers from outside
-    this module.
-    """
-    p = Path(file_path)
-    try:
-        p.unlink(missing_ok=True)
-    except OSError as e:
-        log.warning("cleanup: unlink %s failed: %s", p.name, e)
+def maybe_delete(store: ItemStore, item_id: int, *,
+                 delete_policy: DeletePolicy) -> None:
+    """Gated cleanup. Caller must have already called mark_sent(item_id)."""
+    item = store.get(item_id)
+    if item is None:
+        log.error("maybe_delete: item id=%d not found", item_id)
         return
-
-    # yt-dlp sidecars: <stem>.info.json
-    for suffix in (".json", ".info.json"):
-        try:
-            p.with_suffix(suffix).unlink(missing_ok=True)
-        except OSError:
-            pass
-    # gallery-dl sidecar: <full_name>.json (note: full name, not stem)
-    try:
-        (p.parent / (p.name + ".json")).unlink(missing_ok=True)
-    except OSError:
-        pass
-
-
-def maybe_delete(
-    queue_db: QueueDB,
-    row_id: int,
-    *,
-    delete_policy: DeletePolicy,
-) -> None:
-    """
-    Gated cleanup. Caller must have already called mark_done(row_id).
-
-    We re-read the row fresh from the DB to:
-      (a) verify status='done' (defense against ordering regressions)
-      (b) get the authoritative file_path (in case caller had a stale ref)
-      (c) get platform/username for the policy lookup
-    """
-    row = queue_db.get(row_id)
-    if row is None:
-        log.error("maybe_delete: row id=%d not found", row_id)
-        return
-
-    if row.status != "done":
+    if item.status != Status.SENT.value:
         log.error(
-            "maybe_delete: refusing to delete %s — DB status=%r (expected 'done'). "
+            "maybe_delete: refusing to delete %s — status=%r (expected 'sent'). "
             "Possible regression in drain ordering.",
-            Path(row.file_path).name, row.status,
+            Path(item.file_path).name, item.status,
         )
         return
-
-    if not delete_policy.should_delete(row.platform, row.username):
+    if not delete_policy.should_delete(item.platform, item.username):
         return
-
-    _cleanup_sidecars(row.file_path)
+    cleanup_sidecars(item.file_path)

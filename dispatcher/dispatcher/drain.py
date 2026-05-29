@@ -1,132 +1,158 @@
 """
 dispatcher.drain
 ────────────────
-The drain loop. Claims one row at a time, sends it, finalizes the
-outcome, repeats.
+The drain loop, now reading/writing the ONE shared table via core.ItemStore.
+No QueueDB, no second database, no reconcile bridge.
 
-TEMPLATE METHOD:
-  drain_forever is the skeleton. Each step is a single method call you
-  could override:
-    1. claim     — QueueDB.claim_next
-    2. send      — SendStrategy.send
-    3. finalize  — mark_done / requeue / mark_failed
-    4. cleanup   — maybe_delete (only on success)
-  If you ever need a fifth step (e.g. notify on failure), add it here.
-  Don't sprinkle if-statements through the loop body.
+TEMPLATE METHOD: claim → send → finalize → cleanup. Each is one call.
 
-CLAIM-THEN-SEND vs SEND-THEN-MARK:
-  We claim BEFORE sending. If we crash mid-send, the watchdog will
-  revert the row to pending and we'll re-send on next startup. That
-  risks a duplicate Telegram upload — but the alternative (send first,
-  then mark done) also risks duplicates on crash. There's no
-  exactly-once without Telegram-side idempotency keys (they don't
-  provide them).
+CLAIM-THEN-SEND: we flip pending→sending before the send. A crash mid-send
+leaves the row 'sending'; the startup watchdog (reset_stuck_sending) reverts
+it to pending and we re-send. The only duplicate window is a crash between
+send-success and mark_sent — unavoidable without Telegram idempotency keys,
+and now at least auditable via tg_message_id once recorded.
 
-  Tradeoff: claim-first MINIMIZES the duplicate window (only crashes
-  between send-success and mark_done cause dupes). Accepted.
-
-SERIAL DRAIN:
-  One send at a time. Telethon's send_file from a single session can
-  hit per-method rate limits if parallelized, complicating FloodWait
-  handling. If throughput becomes a problem, that's a later slice.
+CAPTION: items may carry a producer-set caption. If absent, the dispatcher
+formats a default — caption is a presentation concern of the sender, so it
+lives here, not duplicated into every producer.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
+
+from core import ItemStore, Item, DeletePolicy
+from core.files import media_bucket
+from .tg_router import TelegramRouter
 
 from .config import DispatcherConfig
-from .db import QueueDB
 from .delete import maybe_delete
-from .policies import DeletePolicy
 from .send import SendStrategy
-from .tg_router import TelegramRouter
 
 log = logging.getLogger(__name__)
 
 
+def caption_for(item: Item) -> str:
+    """Producer-set caption wins; else the default single-file format
+    (identical to what the archiver used to store at enqueue time)."""
+    if item.caption:
+        return item.caption
+    if item.identifier and not item.identifier.startswith(("manual_", "recorder_")):
+        return f"@{item.username} · {item.platform} · {item.identifier}"
+    return f"@{item.username} · {item.platform}"
+
+
+def album_caption_for(batch: list[Item]) -> str:
+    """A1 album header. Telegram shows a caption only on the album's first
+    item, so per-file captions can't all be displayed; we use a single
+    header describing the group, matching the old uploader's behavior:
+    '📷 @user · platform' (📷 photos / 🎬 videos)."""
+    head = batch[0]
+    icon = {"photo": "📷", "video": "🎬"}.get(media_bucket(head.file_path), "📦")
+    return f"{icon} @{head.username} · {head.platform}"
+
+
 async def drain_forever(
-    config:         DispatcherConfig,
-    queue_db:       QueueDB,
-    send_strategy:  SendStrategy,
-    router:         TelegramRouter,
-    delete_policy:  DeletePolicy,
+    config:        DispatcherConfig,
+    store:         ItemStore,
+    send_strategy: SendStrategy,
+    router:        TelegramRouter,
+    delete_policy: DeletePolicy,
     *,
-    stop_event:     asyncio.Event | None = None,
+    stop_event:    asyncio.Event | None = None,
 ) -> None:
-    """
-    Main loop. Runs until stop_event is set (or forever if None).
-
-    Per iteration:
-      - If a row is pending: claim it, send it, finalize.
-      - If nothing pending: sleep poll_interval_s.
-
-    `stop_event` lets the CLI / signal handler ask for a clean shutdown
-    without killing mid-send. The loop checks it between rows, so the
-    longest a shutdown can wait is one send's worth of time.
-    """
     log.info("drain: starting (poll=%.1fs, max_retries=%d)",
              config.poll_interval_s, config.max_retries)
 
-    # Startup watchdog: any rows stuck in 'claimed' from a previous
-    # process get reverted to 'pending'. See db.reset_stuck_claimed.
-    queue_db.reset_stuck_claimed(older_than_minutes=config.stuck_claim_min)
+    # Startup watchdog: revert rows left 'sending' by a crashed predecessor.
+    store.reset_stuck_sending(older_than_minutes=config.stuck_claim_min)
 
     while True:
         if stop_event is not None and stop_event.is_set():
             log.info("drain: stop requested, exiting cleanly")
             return
 
-        row = queue_db.claim_next()
-        if row is None:
+        batch = store.claim_batch()
+        if not batch:
             await asyncio.sleep(config.poll_interval_s)
             continue
 
-        log.info(
-            "drain: id=%d src=%s prio=%d @%s [%s] file=%s attempt=%d",
-            row.id, row.source, row.priority, row.username, row.platform,
-            row.file_path, row.attempts,
-        )
+        # Decision B: drop files missing on disk BEFORE sending. A claimed
+        # row whose file vanished can't go in the album; mark it failed
+        # individually and album-send the survivors. (mark_failed here is
+        # terminal-ish per its retry budget — a vanished file won't come
+        # back, but the operator can `queue retry` if they restore it.)
+        present: list[Item] = []
+        for it in batch:
+            if Path(it.file_path).exists():
+                present.append(it)
+            else:
+                store.mark_failed(
+                    it.id, error=f"file missing on disk: {it.file_path}",
+                    max_retries=config.max_retries,
+                )
+                log.warning("drain: id=%d file missing, marked failed: %s",
+                            it.id, it.file_path)
+        if not present:
+            continue
 
-        peer = router.peer_for(row.platform, row.username)
-        result = await send_strategy.send(
-            peer=peer,
-            file_path=row.file_path,
-            caption=row.caption,
-        )
+        head = present[0]
+        peer = router.peer_for(head.platform, head.username)
+
+        if len(present) == 1:
+            # single send (gif/other bucket, or a group that filtered to one)
+            it = present[0]
+            log.info("drain: id=%d src=%s prio=%d @%s [%s] file=%s attempt=%d",
+                     it.id, it.source, it.priority, it.username,
+                     it.platform, it.file_path, it.attempts)
+            result = await send_strategy.send(
+                peer=peer, file_path=it.file_path, caption=caption_for(it),
+            )
+        else:
+            # album send (homogeneous photo/video batch, all same producer)
+            log.info("drain: album n=%d src=%s prio=%d @%s [%s] ids=%s",
+                     len(present), head.source, head.priority, head.username,
+                     head.platform, [it.id for it in present])
+            result = await send_strategy.send_album(
+                peer=peer,
+                file_paths=[it.file_path for it in present],
+                caption=album_caption_for(present),
+            )
 
         if result.ok:
-            queue_db.mark_done(row.id)
-            log.info("drain: id=%d done", row.id)
-            # Delete AFTER mark_done — see delete.py safety contract.
-            try:
-                maybe_delete(queue_db, row.id, delete_policy=delete_policy)
-            except Exception as e:
-                # Never let a cleanup error mask a successful send.
-                log.exception("drain: id=%d cleanup raised: %s", row.id, e)
+            # All-or-nothing: the whole batch went up as one atomic send,
+            # so mark every row sent together, then run delete gate per row.
+            for it in present:
+                store.mark_sent(it.id)
+            log.info("drain: %s sent (%d item(s))",
+                     "album" if len(present) > 1 else f"id={head.id}",
+                     len(present))
+            for it in present:
+                try:
+                    maybe_delete(store, it.id, delete_policy=delete_policy)
+                except Exception as e:
+                    log.exception("drain: id=%d cleanup raised: %s", it.id, e)
+            # Decision C: pace between album sends to avoid FloodWait.
+            if len(present) > 1:
+                await asyncio.sleep(config.inter_album_sleep)
 
         elif result.flood_wait_s is not None:
-            # Server-side rate limit beyond our inline cap. Sleep here in
-            # the drain loop (not inside send) so OTHER work stays queued
-            # — though with single-threaded drain that's moot today.
-            log.warning(
-                "drain: id=%d FloodWait %ds — sleeping then requeueing",
-                row.id, result.flood_wait_s,
-            )
-            queue_db.requeue(
-                row.id,
-                reason=f"floodwait {result.flood_wait_s}s",
-            )
+            log.warning("drain: FloodWait %ds — requeue %d item(s), then sleep",
+                        result.flood_wait_s, len(present))
+            for it in present:
+                store.requeue(it.id, reason=f"floodwait {result.flood_wait_s}s")
             await asyncio.sleep(result.flood_wait_s + 1)
 
         else:
-            new_status = queue_db.mark_failed(
-                row.id,
-                error=result.error or "unknown",
-                max_retries=config.max_retries,
-            )
-            log.warning(
-                "drain: id=%d failed (%s): %s",
-                row.id, new_status, result.error,
-            )
+            # Whole-batch failure: every row gets an attempt counted. Since
+            # the album is atomic, none were posted — all are eligible to
+            # retry (or hit failed at max_retries) together.
+            for it in present:
+                new_status = store.mark_failed(
+                    it.id, error=result.error or "unknown",
+                    max_retries=config.max_retries,
+                )
+            log.warning("drain: %d item(s) failed (%s): %s",
+                        len(present), new_status, result.error)

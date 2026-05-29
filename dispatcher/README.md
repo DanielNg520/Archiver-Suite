@@ -50,8 +50,8 @@ auth code interactively and write a session file at
 dispatcher start                 # foreground drain loop
 dispatcher status                # queue counts + top pending
 dispatcher queue list --status pending --limit 100
-dispatcher queue retry <id>      # failed/done -> pending
-dispatcher queue cancel <id>     # pending/claimed -> failed
+dispatcher queue retry <id>      # failed/sent -> pending
+dispatcher queue cancel <id>     # pending/sending -> failed
 dispatcher config show
 ```
 
@@ -60,14 +60,17 @@ dispatcher config show
 ```
 dispatcher status
 
-sqlite3 ~/.config/dispatcher/dispatcher.db
+sqlite3 ~/.config/archiver-suite/suite.db
 ```
 
 Then in the sqlite shell:
 
 ```
-INSERT INTO upload_queue (source, platform, username, file_path, priority, submitted_at)
-VALUES ('test', 'x', 'testuser', '/tmp/test_image.jpg', 10, datetime('now'));
+INSERT INTO items
+  (source, platform, username, identifier, file_path, discovered_at, status, priority, attempts)
+VALUES
+  ('test', 'x', 'testuser', 'manual_smoke', '/tmp/test_image.jpg',
+   strftime('%Y-%m-%dT%H:%M:%SZ','now'), 'pending', 10, 0);
 .quit
 ```
 
@@ -77,18 +80,18 @@ Drop a real image at `/tmp/test_image.jpg`, then:
 dispatcher start
 ```
 
-You should see the file get picked up, uploaded, and marked done.
+You should see the file get picked up, uploaded, and marked sent.
 
 ## Failure modes to verify
 
 - Ctrl-C mid-send. Restart `dispatcher start`. Watchdog should reset the
-  stuck `claimed` row back to `pending`. Note: a duplicate upload is
+  stuck `sending` row back to `pending`. Note: a duplicate upload is
   possible if the crash happened after the Telegram send-success but
-  before mark_done committed. Accepted tradeoff (see drain.py).
+  before `mark_sent` committed. Accepted tradeoff (see drain.py).
 - Insert a row with a non-existent file path. After max_retries it should
   end up in `failed` status with a clear `last_error`.
 - Insert rows at different priorities — drain order is priority ASC,
-  then submitted_at ASC.
+  then discovered_at ASC.
 
 ## Files
 

@@ -84,6 +84,15 @@ class SendStrategy(abc.ABC):
         caption: str | None,
     ) -> SendResult: ...
 
+    @abc.abstractmethod
+    async def send_album(
+        self,
+        *,
+        peer: Any,
+        file_paths: list[str],
+        caption: str | None,
+    ) -> SendResult: ...
+
 
 # ── Telethon implementation ───────────────────────────────────────────────
 
@@ -157,15 +166,57 @@ class TelethonSendStrategy(SendStrategy):
                 error=f"parent dir unreachable: {Path(file_path).parent}",
             )
 
+        async def _do():
+            await self._client.send_file(
+                peer, file_path, caption=caption, supports_streaming=True,
+            )
+        return await self._send_with_retries(_do, what=Path(file_path).name)
+
+    async def send_album(
+        self,
+        *,
+        peer: Any,
+        file_paths: list[str],
+        caption: str | None,
+    ) -> SendResult:
+        """Send up to 10 files as ONE Telegram album (SendMultiMedia).
+
+        Atomic at the API level: the single send_file([..]) call either
+        returns (all items posted) or raises (none posted) — there is no
+        partial album, which is what lets the drain loop mark the whole
+        batch sent-or-failed together.
+
+        A1 caption semantics: Telegram shows the caption only on the album's
+        first item, so we pass [caption, None, None, ...]. Caller is
+        responsible for pre-filtering missing files (drain does this so it
+        can mark the missing ones failed individually).
+        """
+        assert self._client is not None, "use as async context manager"
+        if not file_paths:
+            return SendResult(ok=False, error="send_album: empty file list")
+
+        # caption only on the first item; rest None.
+        captions: list[str | None] = [caption] + [None] * (len(file_paths) - 1)
+
+        async def _do():
+            await self._client.send_file(
+                peer, file_paths, caption=captions, supports_streaming=True,
+            )
+        return await self._send_with_retries(
+            _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
+        )
+
+    async def _send_with_retries(self, send_fn, *, what: str) -> SendResult:
+        """Shared FloodWait + exponential-backoff envelope for both single
+        and album sends. `send_fn` is an async no-arg callable performing
+        the actual Telethon send_file; the only thing that differs between
+        single and album is that call, so the retry/flood logic lives here
+        once rather than being duplicated (and able to drift)."""
         attempts = 0
         last_error: str | None = None
         while attempts < self._max_retries:
             try:
-                await self._client.send_file(
-                    peer, file_path,
-                    caption=caption,
-                    supports_streaming=True,
-                )
+                await send_fn()
                 return SendResult(ok=True)
 
             except FloodWaitError as e:
@@ -174,12 +225,9 @@ class TelethonSendStrategy(SendStrategy):
                         "telethon: FloodWait %ds > cap %ds — surfacing to dispatcher",
                         e.seconds, self._max_flood_wait_s,
                     )
-                    return SendResult(
-                        ok=False, flood_wait_s=int(e.seconds),
-                    )
-                # Sub-cap waits: handle inline within this attempt.
+                    return SendResult(ok=False, flood_wait_s=int(e.seconds))
                 wait_s = int(e.seconds) + 1
-                log.warning("telethon: FloodWait %ds — sleeping", wait_s)
+                log.warning("telethon: FloodWait %ds (%s) — sleeping", wait_s, what)
                 await asyncio.sleep(wait_s)
                 continue   # do NOT count as an attempt
 
@@ -188,8 +236,8 @@ class TelethonSendStrategy(SendStrategy):
                 last_error = f"{type(e).__name__}: {e}"
                 delay = self._retry_base_delay * (2 ** (attempts - 1))
                 log.warning(
-                    "telethon: network err attempt %d/%d: %s — retry in %.1fs",
-                    attempts, self._max_retries, e, delay,
+                    "telethon: network err attempt %d/%d (%s): %s — retry in %.1fs",
+                    attempts, self._max_retries, what, e, delay,
                 )
                 if attempts < self._max_retries:
                     await asyncio.sleep(delay)
@@ -199,8 +247,8 @@ class TelethonSendStrategy(SendStrategy):
                 last_error = f"{type(e).__name__}: {e}"
                 delay = self._retry_base_delay * (2 ** (attempts - 1))
                 log.warning(
-                    "telethon: send err attempt %d/%d: %s: %s — retry in %.1fs",
-                    attempts, self._max_retries,
+                    "telethon: send err attempt %d/%d (%s): %s: %s — retry in %.1fs",
+                    attempts, self._max_retries, what,
                     type(e).__name__, e, delay,
                 )
                 if attempts < self._max_retries:

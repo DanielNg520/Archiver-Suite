@@ -1,10 +1,7 @@
 """
-dispatcher.policies
+core.policies
 ───────────────────
-Ported from archiver.policies. DeletePolicy only — dedup is archiver-only
-and has no role in upload dispatch.
-
-Same Specification-on-Repository pattern: each policy owns its TOML key
+Shared Specification-on-Repository policies: each policy owns its TOML key
 and default; PolicyStore handles storage and hierarchical resolution.
 """
 
@@ -63,3 +60,42 @@ class DeletePolicy(BooleanPolicy):
 
     def should_delete(self, platform: str, username: str) -> bool:
         return self.is_enabled(platform, username)
+
+
+class DedupPolicy(BooleanPolicy):
+    """Whether to run content-hash dedup after a successful download."""
+    KEY     = "dedup_after_download"
+    DEFAULT = False
+
+    def should_dedup(self, platform: str, username: str) -> bool:
+        return self.is_enabled(platform, username)
+
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+def validate_overrides(
+    store:       PolicyStore,
+    known_users: dict[str, tuple[str, ...]],
+) -> list[str]:
+    """
+    Find per-user override sections whose (platform, user) doesn't match
+    any configured user. Almost always a typo or stale config from when
+    the user was removed without unsetting the override.
+
+    Returns warning strings; does not raise (typos shouldn't crash a run).
+    Called at startup so issues surface immediately.
+    """
+    valid: set[tuple[str, str]] = set()
+    for platform, users in known_users.items():
+        for u in users:
+            valid.add((platform, u))
+
+    warnings: list[str] = []
+    for plat, user, _overrides in store.iter_user_overrides():
+        if (plat, user) not in valid:
+            warnings.append(
+                f"policies: per-user override [platform.{plat}.user.\"{user}\"] "
+                f"in config.toml doesn't match any configured user. "
+                f"Will be ignored. Remove it or add the user."
+            )
+    return warnings

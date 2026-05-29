@@ -3,7 +3,7 @@ recorder
 ────────
 TikTok live recorder. Monitors a priority-ordered user list, records one
 stream at a time via yt-dlp, and enqueues finished files into
-dispatcher.db (source='recorder', priority=20).
+the shared suite items table (source='recorder', priority=20).
 
 Coordinates with archiver via a soft lockfile (~/.config/archiver/locks/
 tiktok.lock) held only during active recording.

@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING
 from . import identity, stability
 
 if TYPE_CHECKING:
-    from .db import ArchiveDB
+    from core import ItemStore
     from .platforms import Platform
 
 log = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ class ReconcileReport:
 def reconcile_user(
     platform: "Platform",
     username: str,
-    db: "ArchiveDB",
+    db: "ItemStore",
     output_dir: str,
     seed_extractor_archive: bool = True,
 ) -> ReconcileReport:
@@ -138,7 +138,8 @@ def reconcile_user(
             log.warning("  reconcile: vanished mid-walk: %s", f)
             continue
 
-        inserted = db.add_file(
+        inserted = db.add_item(
+            source          = "archiver",
             platform        = platform.name,
             username        = username,
             identifier      = ident.identifier,
@@ -146,6 +147,7 @@ def reconcile_user(
             upload_date     = ident.upload_date,
             file_size_bytes = size,
             title           = ident.title,
+            priority        = 10,
         )
         if inserted:
             report.inserted += 1
@@ -159,9 +161,9 @@ def reconcile_user(
             if entry:
                 new_archive_entries.append(entry)
         else:
-            # add_file returned False — UNIQUE constraint hit. Means
-            # we have an identifier collision (e.g. same (platform, identifier)
-            # already in DB under a different path). Rare; log and move on.
+            # add_item returned False — INSERT OR IGNORE hit a UNIQUE
+            # constraint (same (platform, identifier) or file_path already
+            # present, possibly under a different path). Rare; log + move on.
             report.already_known += 1
             log.debug("  reconcile: collision on %s id=%s",
                       f.name, ident.identifier)

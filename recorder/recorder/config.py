@@ -18,6 +18,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from core import db_path as _core_db_path
+
 load_dotenv(Path.home() / ".config" / "recorder" / ".env")
 
 CONFIG_TOML = Path.home() / ".config" / "recorder" / "config.toml"
@@ -30,7 +32,7 @@ def _opt(key: str, default: str = "") -> str:
 @dataclass(frozen=True)
 class RecorderConfig:
     poll_interval_s:     float
-    dispatcher_db_path:  str
+    db_path:             str
     output_dir:          str
     state_dir:           str
     lock_path:           str
@@ -53,8 +55,7 @@ class RecorderConfig:
         return cls(
             poll_interval_s     = float(rec.get("poll_interval_s",
                                        _opt("POLL_INTERVAL_S", "60"))),
-            dispatcher_db_path  = _opt("DISPATCHER_DB",
-                                       "~/.config/dispatcher/dispatcher.db"),
+            db_path             = str(_core_db_path()),
             output_dir          = rec.get("output_dir",
                                        _opt("OUTPUT_DIR",
                                             os.path.expanduser("~/recorder-output"))),

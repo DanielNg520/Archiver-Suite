@@ -1,7 +1,7 @@
 [project]
 name = "recorder"
 version = "0.1.0"
-description = "TikTok live recorder. Monitors a priority list, records one stream at a time via yt-dlp, enqueues into dispatcher.db."
+description = "TikTok live recorder. Monitors a priority list, records one stream at a time via yt-dlp, registers finished files in the shared suite DB (via core)."
 requires-python = ">=3.13"
 dependencies = [
     "TikTokLive==6.6.5",

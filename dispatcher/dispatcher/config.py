@@ -18,7 +18,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .policy_store import PolicyStore, default_config_path
+from core import PolicyStore, DEFAULT_DB_PATH
 
 # Load dispatcher's own .env BEFORE any os.environ reads. This is a side
 # effect on import; matches archiver's pattern. Test code that needs a
@@ -67,8 +67,8 @@ class TelegramCreds:
 
 @dataclass(frozen=True)
 class DispatcherConfig:
-    telegram:           TelegramCreds
-    default_chat_id:    str
+    telegram:           TelegramCreds | None
+    default_chat_id:    str | None
     db_path:            str
     policy_store:       PolicyStore
     poll_interval_s:    float = 2.0
@@ -79,7 +79,7 @@ class DispatcherConfig:
     stuck_claim_min:    int   = 10    # watchdog threshold
 
     @classmethod
-    def load(cls) -> "DispatcherConfig":
+    def load(cls, *, require_telegram: bool = True) -> "DispatcherConfig":
         """
         Build the full config from .env + config.toml.
 
@@ -87,11 +87,13 @@ class DispatcherConfig:
         before the drain loop, so failing here is the right time to fail.
         """
         store = PolicyStore()
-        default_db = os.path.expanduser("~/.config/dispatcher/dispatcher.db")
+        default_db = os.path.expanduser(DEFAULT_DB_PATH)
+        telegram = TelegramCreds.from_env() if require_telegram else None
+        default_chat_id = _req("TELEGRAM_CHAT_ID") if require_telegram else None
         return cls(
-            telegram          = TelegramCreds.from_env(),
-            default_chat_id   = _req("TELEGRAM_CHAT_ID"),
-            db_path           = _opt("DISPATCHER_DB", default_db),
+            telegram          = telegram,
+            default_chat_id   = default_chat_id,
+            db_path           = _opt("ARCHIVER_DB", _opt("DISPATCHER_DB", default_db)),
             policy_store      = store,
             poll_interval_s   = float(_opt("POLL_INTERVAL_S", "2.0")),
             max_retries       = int(_opt("MAX_RETRIES", "4")),

@@ -23,10 +23,7 @@ Version 1.1 highlights:
 │   ├── identity.py                 # Sidecar → filename → hash resolver chain
 │   ├── stability.py                # "Is this file safely closed?" check
 │   ├── reconcile.py                # Reconcile v2 (recursive, sidecar-aware, archive-seeding)
-│   ├── delete_policy.py            # 3-level delete-after-upload resolution
-│   ├── tg_router.py                # 3-level Telegram destination resolution
 │   ├── platforms.py                # Platform ABC + X / TikTok / Instagram strategies
-│   ├── telegram.py                 # Persistent Telethon uploader (gated cleanup)
 │   ├── orchestrator.py             # Template Method + circuit breaker + bootstrap
 │   └── cli.py                      # Subcommand CLI
 ├── downloads/                      # Created at runtime
@@ -34,7 +31,6 @@ Version 1.1 highlights:
 │   ├── tiktok/<username>/...
 │   └── instagram/<username>/...   ← manual files in subfolders also picked up
 ├── .archiver/                      # Hidden runtime state
-│   ├── archive.db                  # SQLite (+ -wal / -shm)
 │   ├── archiver.log
 │   ├── loop.log
 │   ├── gallery_dl/
@@ -201,17 +197,17 @@ archiver config remove --platform instagram --user olduser
 ## The "incremental + auto-deletion" guarantee
 
 With `DELETE_AFTER_UPLOAD=true` (any level), the local file is deleted
-after successful upload. But the system still knows what's been
-archived:
+after successful upload by the dispatcher. But the system still knows what's
+been archived:
 
-1. The DB row for that file persists with `telegram_sent=1` and the
+1. The shared `suite.db` row for that file persists with `status='sent'` and the
    post's `upload_date`. That row alone tells the next run "we've seen
    this post."
 2. Each platform's extractor archive file (gallery-dl sqlite or
    yt-dlp txt) ALSO holds the post's canonical ID — so the extractor
    itself short-circuits the download before any I/O.
-3. The checkpoint stores `date_floor = MAX(upload_date WHERE
-   telegram_sent=1)`. The next run's `date-min` / `dateafter` is
+3. The checkpoint stores `date_floor = MAX(upload_date WHERE status='sent')`.
+   The next run's `date-min` / `dateafter` is
    `date_floor - 1 day` (slack for timezones). Posts older than that
    are never fetched.
 

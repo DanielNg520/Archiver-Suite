@@ -5,7 +5,7 @@ find it at 2am.
 
 ```
 recorder ──┐
-           ├──→ dispatcher.db ──→ dispatcher ──→ Telegram
+           ├──→ suite.db ──→ dispatcher ──→ Telegram
 archiver ──┘
 ```
 
@@ -35,17 +35,23 @@ log for crashes that happened before logging started.
 
 ## First-time install order
 
-Order matters: dispatcher owns the DB schema the others write into.
+Install order no longer matters: the shared `core` package owns the schema
+and initializes `suite.db` idempotently.
 
 ```
-cd ~/code/dispatcher && pipx install . --python 3.13
-cd ~/code/media-archiver && pipx reinstall media-archiver --python 3.13
-cd ~/code/recorder && pipx install . --python 3.13
-cd ~/code/ops && pipx install . --python 3.13
+pipx install ./dispatcher --python 3.13
+pipx install ./archiver   --python 3.13
+pipx install ./recorder   --python 3.13
+pipx install ./ops        --python 3.13
+
+pipx inject --editable dispatcher     ./core
+pipx inject --editable media-archiver ./core
+pipx inject --editable recorder       ./core
+pipx inject --editable ops            ./core
 ```
 
-Create the dispatcher DB + authenticate Telegram ONCE interactively before
-handing control to launchd (launchd can't answer the SMS prompt):
+Authenticate Telegram ONCE interactively before handing control to launchd
+(launchd can't answer the SMS prompt):
 
 ```
 dispatcher start          # complete SMS auth, see "connected", then Ctrl-C
@@ -64,7 +70,7 @@ ops health
 ## Telegram session died (dispatcher can't send)
 
 Symptom: `ops health` shows dispatcher running but queue `pending` only
-climbs, never `done`. App log shows auth/session errors.
+climbs, never `sent`. App log shows auth/session errors.
 
 Telethon sessions expire or get invalidated (password change, Telegram
 logout-all-devices, too-long offline). Re-auth is interactive, so launchd
@@ -101,7 +107,7 @@ ops restart recorder
 
 ---
 
-## dispatcher.db is corrupt
+## suite.db is corrupt
 
 Symptom: dispatcher crashes on startup with `database disk image is
 malformed`, or `ops health` can't read queue counts.
@@ -111,24 +117,22 @@ first (all three), then attempt recovery:
 
 ```
 ops unload
-cd ~/.config/dispatcher
-sqlite3 dispatcher.db ".recover" | sqlite3 dispatcher_recovered.db
-mv dispatcher.db dispatcher.db.corrupt
-mv dispatcher_recovered.db dispatcher.db
+cd ~/.config/archiver-suite
+sqlite3 suite.db ".recover" | sqlite3 suite_recovered.db
+mv suite.db suite.db.corrupt
+mv suite_recovered.db suite.db
 ops load
 ops health
 ```
 
-If `.recover` fails entirely: the queue is a transient work list, not your
-archive of record (that's `archive.db` + the files on disk). Worst case,
-delete `dispatcher.db` and let the dispatcher recreate an empty one — the
-archiver will re-enqueue anything still marked `telegram_sent=2` on its
-next run via `reconcile_dispatch_outcomes`, and re-enqueue `pending` files
-normally. You may get a few duplicate uploads; you won't lose media.
+If `.recover` fails entirely: keep `suite.db.corrupt`, recreate an empty
+`suite.db`, then run `archiver bootstrap`/`archiver reconcile` for configured
+users to register files still on disk. You may need to retry or re-send some
+items manually, but the media files remain the durable source.
 
 ```
 ops unload
-rm ~/.config/dispatcher/dispatcher.db*       # removes -wal and -shm too
+rm ~/.config/archiver-suite/suite.db*       # removes -wal and -shm too
 ops load
 ```
 

@@ -13,8 +13,8 @@ STATES:
 
 PRODUCER/CONSUMER (guide lesson, kept):
   The state machine PRODUCES finished files onto a queue.Queue; a daemon
-  uploader thread CONSUMES them and enqueues into dispatcher.db. This
-  decouples "recording" from "enqueuing" so a slow dispatcher.db write
+  uploader thread CONSUMES them and enqueues into the shared items table. This
+  decouples "recording" from "enqueuing" so a slow DB write
   can't make us miss the next stream start. queue.Queue is thread-safe by
   construction — no manual locks.
 
@@ -100,6 +100,11 @@ class StateMachine:
         finally:
             # Ensure the lock is released even if we exit mid-recording.
             self._release_lock_if_held()
+            self._stop.set()
+            uploader_thread.join(timeout=15.0)
+            if uploader_thread.is_alive():
+                log.warning("recorder: uploader still draining after shutdown; "
+                            "remaining files stay on disk for manual recovery")
             self.state = RecorderState.STOPPED
             log.info("recorder: stopped")
 
@@ -140,7 +145,14 @@ class StateMachine:
             self.state = RecorderState.LISTENING
             return
         self._acquire_lock()
-        self.capture.start(url, username)
+        try:
+            self.capture.start(url, username)
+        except Exception as e:
+            self._release_lock_if_held()
+            log.error("recorder: capture start for @%s failed: %s — back to listening",
+                      username, e)
+            self.state = RecorderState.LISTENING
+            return
         self.current_user = username
         self.state = RecorderState.RECORDING
 
@@ -188,7 +200,7 @@ class StateMachine:
     # ── consumer thread ───────────────────────────────────────────────────
 
     def _uploader_loop(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop.is_set() or not self._upload_q.empty():
             try:
                 job = self._upload_q.get(timeout=1.0)
             except queue.Empty:
