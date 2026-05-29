@@ -193,13 +193,8 @@ class Config:
     sleep_min: float = 3.0
     sleep_max: float = 8.0
 
-    max_retries:       int   = 4
-    retry_base_delay:  float = 2.0
-    inter_album_sleep: float = 2.0
-
     auth_failure_threshold: int = 3
 
-    use_dispatcher:     bool = True
     dispatcher_db_path: str  = "~/.config/dispatcher/dispatcher.db"
 
     enabled_platforms: frozenset[str] = field(default_factory=frozenset)
@@ -250,8 +245,6 @@ class Config:
             state_dir         = _opt("STATE_DIR",  "./.archiver"),
             sleep_min         = float(_opt("SLEEP_MIN", "3")),
             sleep_max         = float(_opt("SLEEP_MAX", "8")),
-            use_dispatcher    = _opt("ARCHIVER_USE_DISPATCHER", "true").lower()
-                                 in ("1", "true", "yes", "on"),
             dispatcher_db_path = _opt("DISPATCHER_DB",
                                       "~/.config/dispatcher/dispatcher.db"),
             enabled_platforms = enabled,

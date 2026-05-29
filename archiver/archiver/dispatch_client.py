@@ -42,8 +42,8 @@ class DispatchClient:
         if not self._path.exists():
             raise RuntimeError(
                 f"dispatcher.db not found at {self._path}. Start the "
-                f"dispatcher once to create it, or set ARCHIVER_USE_DISPATCHER"
-                f"=false to use the legacy direct-upload path."
+                f"dispatcher once to create it (the archiver has no direct-"
+                f"upload fallback — the dispatcher is the only send path)."
             )
         self.conn = sqlite3.connect(str(self._path), timeout=10.0)
         self.conn.execute("PRAGMA busy_timeout=5000")

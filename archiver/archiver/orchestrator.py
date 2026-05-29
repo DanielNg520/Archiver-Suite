@@ -39,10 +39,41 @@ from .lock_reader import tiktok_lock_held
 from .platforms import Platform, AuthError, HealthStatus
 from .policies import DeletePolicy, DedupPolicy, validate_overrides as _validate_policies
 from .reconcile import reconcile_user
-from .telegram import TelegramUploader, _cleanup
 from .tg_router import TelegramRouter, validate_overrides as _validate_router
 
 log = logging.getLogger(__name__)
+
+
+# ── Local sidecar cleanup (disk-full purge only) ──────────────────────────────
+#
+# The legacy archiver.telegram._cleanup was the old uploader's delete helper.
+# That module is gone — the dispatcher now owns all sending AND all
+# delete-after-upload. The ONE remaining archiver-side delete is the disk-full
+# emergency purge of already-confirmed-sent files (telegram_sent=1), which must
+# work even when the dispatcher isn't running. We inline the unlink here rather
+# than import dispatcher.delete: the archiver↔dispatcher contract is the SQLite
+# schema (see dispatch_client.py), not a Python import. ~8 lines is cheaper than
+# coupling the two installable packages.
+
+def _purge_one(file_path: str) -> None:
+    """Unlink a media file plus its yt-dlp / gallery-dl sidecars. Ungated;
+    callers must already know the row is sent. Mirrors the old
+    archiver.telegram._cleanup byte-for-byte so purge behavior is unchanged."""
+    p = Path(file_path)
+    try:
+        p.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("    cleanup failed: %s", e)
+        return
+    for suffix in (".json", ".info.json"):       # yt-dlp: <stem>.info.json
+        try:
+            p.with_suffix(suffix).unlink(missing_ok=True)
+        except OSError:
+            pass
+    try:                                          # gallery-dl: <full_name>.json
+        (p.parent / (p.name + ".json")).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ── Platform registry ─────────────────────────────────────────────────────────
@@ -110,24 +141,16 @@ class Archiver:
         run_time = datetime.now(timezone.utc)
         results: dict[str, dict] = {}
 
-        if self.config.use_dispatcher:
-            # Dispatcher mode: archiver never opens a Telegram session.
-            # It enqueues into dispatcher.db; the dispatcher process owns
-            # the session and does the sends. No TelegramUploader here.
-            log.info("upload mode: dispatcher (enqueue → %s)",
-                     self.config.dispatcher_db_path)
-            await self._run_platforms(platforms, user_filter, run_time,
-                                      results, uploader=None)
-            # Pull any completions the dispatcher recorded since last run.
-            self.db.reconcile_dispatch_outcomes(self.config.dispatcher_db_path)
-            return results
-
-        log.info("upload mode: direct (legacy TelegramUploader)")
-        async with TelegramUploader(
-            self.config, self.db, self.delete_policy, self.router,
-        ) as uploader:
-            await self._run_platforms(platforms, user_filter, run_time,
-                                      results, uploader=uploader)
+        # Dispatcher is the only upload path. The archiver never opens a
+        # Telegram session; it enqueues into dispatcher.db and the dispatcher
+        # process owns the session, the sends, the album/sort decisions (it
+        # makes none — one row, one send), and delete-after-upload.
+        log.info("upload mode: dispatcher (enqueue → %s)",
+                 self.config.dispatcher_db_path)
+        await self._run_platforms(platforms, user_filter, run_time, results)
+        # Pull any completions the dispatcher recorded since the last run
+        # (flips archive.db rows telegram_sent 2 → 1, advancing date_floor).
+        self.db.reconcile_dispatch_outcomes(self.config.dispatcher_db_path)
         return results
 
     async def _run_platforms(
@@ -136,11 +159,8 @@ class Archiver:
         user_filter: str | None,
         run_time: datetime,
         results: dict[str, dict],
-        *,
-        uploader: TelegramUploader | None,
     ) -> None:
-        """The per-platform / per-user loop, shared by both upload modes.
-        uploader is None in dispatcher mode."""
+        """The per-platform / per-user loop."""
         for platform in platforms:
             if not await self._ensure_platform_healthy(platform):
                 self._tripped.add(platform.name)
@@ -169,7 +189,7 @@ class Archiver:
                 key = f"{platform.name}/{username}"
                 try:
                     results[key] = await self._archive_user(
-                        platform, username, uploader, run_time,
+                        platform, username, run_time,
                     )
                 except Exception as e:
                     log.error("[%s] uncaught error: %s",
@@ -259,7 +279,6 @@ class Archiver:
         self,
         platform: Platform,
         username: str,
-        uploader: TelegramUploader | None,
         run_time: datetime,
     ) -> dict:
         log.info("━━━ [%s] @%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
@@ -284,13 +303,10 @@ class Archiver:
                 return dl["_error"]
             new_count = dl["count"]
 
-        # 4c. Upload: enqueue (dispatcher mode) or send directly (legacy).
-        if self.config.use_dispatcher:
-            enqueued, failed = self._enqueue_pending(platform.name, username)
-            sent = enqueued   # "sent" here means "handed off"; real send is async
-        else:
-            assert uploader is not None
-            sent, failed = await uploader.upload_pending(platform.name, username)
+        # 4c. Upload: hand off to the dispatcher. "sent" here means
+        # "handed off"; the real send happens later in the dispatcher.
+        enqueued, failed = self._enqueue_pending(platform.name, username)
+        sent = enqueued
 
         # 4d. Advance checkpoints (both last_run_utc AND date_floor).
         #
@@ -312,16 +328,14 @@ class Archiver:
                                                  sent_only=True)
             self.db.set_date_floor(platform.name, username, new_floor)
             self.db.reset_circuit(platform.name)
-            verb = "enqueued" if self.config.use_dispatcher else "sent"
-            log.info("  ✓ Checkpoint → last_run=%s floor=%s (%s=%d)",
+            log.info("  ✓ Checkpoint → last_run=%s floor=%s (enqueued=%d)",
                      run_time.strftime("%Y-%m-%d %H:%M UTC"),
-                     new_floor or "-", verb, sent)
+                     new_floor or "-", sent)
         else:
-            noun = "enqueue" if self.config.use_dispatcher else "upload"
             log.warning(
-                "  ✗ %d %s failure(s) — checkpoint NOT advanced. "
+                "  ✗ %d enqueue failure(s) — checkpoint NOT advanced. "
                 "Run: archiver reset failed --platform %s --user %s",
-                failed, noun, platform.name, username,
+                failed, platform.name, username,
             )
 
         s = self.db.stats(platform.name, username)
@@ -502,7 +516,7 @@ class Archiver:
             try:
                 if path.exists():
                     freed += path.stat().st_size
-                _cleanup(fp)
+                _purge_one(fp)
             except OSError:
                 pass
         log.info("  Purged %.1f MB of already-sent files", freed / 1_048_576)
