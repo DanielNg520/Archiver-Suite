@@ -59,6 +59,7 @@ class StreamCapture:
         self._proc: subprocess.Popen | None = None
         self._run_dir: Path | None = None
         self._started_at: float = 0.0
+        self._log_fh = None  # yt-dlp stdout/stderr sink; closed in wait()
 
     def start(self, stream_url: str, username: str) -> None:
         """Launch yt-dlp. Files land in output_dir/<username>/."""
@@ -87,8 +88,16 @@ class StreamCapture:
 
         log.info("capture: starting yt-dlp for @%s → %s", username, self._run_dir)
         log.debug("capture cmd: %s", " ".join(cmd))
+        # yt-dlp/ffmpeg emit continuous progress on stderr while recording.
+        # Capturing with subprocess.PIPE and never reading it fills the OS
+        # pipe buffer (~16-64KB) within minutes, blocking the child's next
+        # write() and silently freezing the recording. Redirect to a regular
+        # file fd instead: kernel appends never block the writer. stderr is
+        # merged into stdout so one file holds the full diagnostic stream.
+        log_path = self._run_dir / f"{username}_{int(self._started_at)}_ytdlp.log"
+        self._log_fh = open(log_path, "ab", buffering=0)
         self._proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cmd, stdout=self._log_fh, stderr=subprocess.STDOUT,
         )
 
     def is_running(self) -> bool:
@@ -111,10 +120,20 @@ class StreamCapture:
                 except subprocess.TimeoutExpired:
                     log.warning("capture: yt-dlp ignored SIGTERM — killing")
                     self._proc.kill()
+                self._close_log()
                 return -1
         rc = self._proc.returncode
         log.info("capture: yt-dlp exited rc=%d", rc)
+        self._close_log()
         return rc
+
+    def _close_log(self) -> None:
+        """Release the yt-dlp log fd. Idempotent — safe to call twice."""
+        if self._log_fh is not None:
+            try:
+                self._log_fh.close()
+            finally:
+                self._log_fh = None
 
     def output_files(self) -> list[Path]:
         """Files written by this run: anything in the run dir with mtime
@@ -125,7 +144,7 @@ class StreamCapture:
         for p in self._run_dir.iterdir():
             if not p.is_file():
                 continue
-            if p.suffix in (".part", ".ytdl", ".temp"):
+            if p.suffix in (".part", ".ytdl", ".temp", ".log"):
                 continue
             try:
                 if p.stat().st_mtime >= self._started_at - 1:
