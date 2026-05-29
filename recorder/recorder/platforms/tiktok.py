@@ -111,12 +111,14 @@ class TikTokLivePlatform:
 
     async def _stream_url_async(self, uid: str) -> str:
         client = await self._make_client(uid)
-        # fetch_room_info populates the live stream pull data. The HLS URL
-        # lives in the stream_url block of room info. Key paths have shifted
-        # historically; we probe the known variants and fail loudly if none
-        # match so a TikTok change surfaces as an error, not a silent
-        # wrong-URL recording.
-        info = await client.web.fetch_room_info()
+        # fetch_room_info() resolves the room from EITHER a room_id or a
+        # unique_id. Called with no args it falls back to a stored
+        # _web.params["room_id"], which is unset on this fresh client (that
+        # state is only populated by is_live(), which ran on a different
+        # client instance) — hence the KeyError('room_id') in the logs.
+        # Query by unique_id instead: it hits the info_by_user/ endpoint,
+        # needs no room_id, and returns the same payload shape.
+        info = await client.web.fetch_room_info(unique_id=uid)
         url = _extract_hls_url(info)
         if not url:
             raise RuntimeError(
