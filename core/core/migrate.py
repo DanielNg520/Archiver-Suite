@@ -32,7 +32,7 @@ duplicate. Run it once with the daemons stopped.
 
 Usage:
     python -m core.migrate \
-        --archive-db    ~/.config/archiver/archive.db \
+        --archive-db    ~/.config/archiver-suite/archive.db \
         --dispatcher-db ~/.config/dispatcher/dispatcher.db \
         --out           ~/.config/archiver-suite/suite.db
 """
@@ -206,7 +206,7 @@ def migrate(archive_db: Path, dispatcher_db: Path, out_db: Path) -> dict:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     p = argparse.ArgumentParser(prog="core.migrate")
-    p.add_argument("--archive-db",    default="~/.config/archiver/archive.db")
+    p.add_argument("--archive-db",    default="~/.config/archiver-suite/archive.db")
     p.add_argument("--dispatcher-db", default="~/.config/dispatcher/dispatcher.db")
     p.add_argument("--out",           default=schema.DEFAULT_DB_PATH)
     a = p.parse_args(argv)

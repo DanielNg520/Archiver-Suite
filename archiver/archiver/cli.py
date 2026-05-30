@@ -129,9 +129,16 @@ def build_parser() -> argparse.ArgumentParser:
                       help="Skip the y/N confirmation prompt")
 
     # ── reconcile ───
-    s_rec = sub.add_parser("reconcile", help="Scan disk for files missing from DB")
+    s_rec = sub.add_parser(
+        "reconcile",
+        help="Dedup platform folders, then scan disk for files missing from DB",
+    )
     s_rec.add_argument("--platform", choices=PLATFORM_CHOICES)
     s_rec.add_argument("--user", metavar="USERNAME")
+    s_rec.add_argument("--no-dedup", action="store_true",
+                       help="Skip the pre-reconcile content dedup pass")
+    s_rec.add_argument("--dry-run-dedup", action="store_true",
+                       help="Report duplicate files but do not delete them")
 
     # ── dedup ───
     s_dedup = sub.add_parser(
@@ -189,6 +196,37 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_rem = cfg_sub.add_parser("remove", help="Remove a user from a platform")
     cfg_rem.add_argument("--platform", choices=PLATFORM_CHOICES, required=True)
     cfg_rem.add_argument("--user", metavar="USERNAME", required=True)
+
+    # ── platform (run enablement) ───
+    s_plat = sub.add_parser(
+        "platform",
+        help="Show or edit platforms included in archiver run",
+    )
+    plat_sub = s_plat.add_subparsers(dest="platform_cmd", required=True)
+    plat_sub.add_parser("list", help="List enabled platforms")
+
+    plat_add = plat_sub.add_parser("add", help="Enable a platform for runs")
+    plat_add.add_argument("platform", choices=PLATFORM_CHOICES)
+
+    plat_rem = plat_sub.add_parser("remove", help="Disable a platform for runs")
+    plat_rem.add_argument("platform", choices=PLATFORM_CHOICES)
+
+    # ── run-settings ───
+    s_run_settings = sub.add_parser(
+        "run-settings",
+        help="Show or edit run-level behavior flags",
+    )
+    run_settings_sub = s_run_settings.add_subparsers(
+        dest="run_settings_cmd",
+        required=True,
+    )
+    run_settings_sub.add_parser("show", help="Show run-level behavior flags")
+
+    rs_reconcile = run_settings_sub.add_parser(
+        "reconcile-after-run",
+        help="Turn the post-run reconcile sweep on or off",
+    )
+    rs_reconcile.add_argument("value", choices=["on", "off"])
 
     # ── policy (delete-after-upload) ───
     s_pol = sub.add_parser(
@@ -379,18 +417,47 @@ def cmd_reset(args, config: Config, db: ItemStore) -> int:
 
 
 def cmd_reconcile(args, config: Config, db: ItemStore) -> int:
+    from .dedup import dedup_user
+
     platforms = build_platforms(config)
     if args.platform:
         platforms = [p for p in platforms if p.name == args.platform]
+        if not platforms:
+            log.error("reconcile: no matching enabled/configured platform: %s",
+                      args.platform)
+            return 2
 
-    total = 0
+    total_inserted = 0
+    total_deleted = 0
+    total_bytes_freed = 0
     for platform in platforms:
-        users = (args.user.lstrip("@"),) if args.user else platform.users
+        users = _reconcile_users_for_platform(config, platform, args.user)
         for u in users:
-            n = reconcile_user(platform, u, db, config.output_dir).inserted
-            log.info("[%s] @%s: reconciled %d", platform.name, u, n)
-            total += n
-    log.info("Total reconciled: %d", total)
+            user_dir = Path(config.output_dir) / platform.name / u
+            if not args.no_dedup:
+                dedup_report = dedup_user(
+                    platform.name,
+                    u,
+                    user_dir,
+                    db,
+                    dry_run=args.dry_run_dedup,
+                )
+                log.info("dedup before reconcile: %s", dedup_report)
+                total_deleted += dedup_report.deleted
+                total_bytes_freed += dedup_report.bytes_freed
+
+            report = reconcile_user(platform, u, db, config.output_dir)
+            log.info("reconcile: %s", report)
+            total_inserted += report.inserted
+
+    log.info("")
+    log.info("════════════════ Reconcile summary ══════════════")
+    log.info("  queued new file(s): %d", total_inserted)
+    if not args.no_dedup:
+        mb = total_bytes_freed / (1024 * 1024)
+        action = "would delete" if args.dry_run_dedup else "deleted"
+        log.info("  dedup %s: %d file(s), %.1f MB", action, total_deleted, mb)
+    log.info("═════════════════════════════════════════════════")
     return 0
 
 
@@ -594,7 +661,31 @@ def _scope_label(platform: str | None, username: str | None) -> str:
 
 
 def _env_path() -> Path:
-    return Path.home() / ".config" / "archiver" / ".env"
+    return Path.home() / ".config" / "archiver-suite" / ".env"
+
+
+def _write_enabled_platforms(enabled: set[str]) -> None:
+    ordered = [p for p in PLATFORM_CHOICES if p in enabled]
+    _set_env_var("ENABLED_PLATFORMS", ",".join(ordered))
+
+
+def _reconcile_users_for_platform(
+    config: Config,
+    platform,
+    user_filter: str | None,
+) -> tuple[str, ...]:
+    if user_filter:
+        return (user_filter.lstrip("@"),)
+
+    platform_dir = Path(config.output_dir) / platform.name
+    disk_users = {
+        p.name
+        for p in platform_dir.iterdir()
+        if p.is_dir()
+    } if platform_dir.exists() else set()
+
+    users = set(platform.users) | disk_users
+    return tuple(sorted(users))
 
 
 def _warn_unknown_user(config: Config, platform: str, username: str) -> None:
@@ -684,6 +775,61 @@ def cmd_config(args, config: Config, db: ItemStore) -> int:
             return 1
 
     return 0
+
+
+# ── platform (run enablement, backed by ENABLED_PLATFORMS in .env) ───────────
+
+def cmd_platform(args, config: Config, db: ItemStore) -> int:
+    enabled = set(config.enabled_platforms)
+
+    if args.platform_cmd == "list":
+        shown = ", ".join(p for p in PLATFORM_CHOICES if p in enabled) or "(none)"
+        log.info("enabled platforms: %s", shown)
+        log.info("env: %s", _env_path())
+        return 0
+
+    platform = args.platform
+    if args.platform_cmd == "add":
+        if platform in enabled:
+            log.info("[%s] already enabled.", platform)
+            return 0
+        enabled.add(platform)
+        _write_enabled_platforms(enabled)
+        log.info("Enabled [%s] for future runs.", platform)
+        log.info("Note: a running `archiver loop` won't see this change until it restarts.")
+        return 0
+
+    if args.platform_cmd == "remove":
+        if platform not in enabled:
+            log.info("[%s] already disabled.", platform)
+            return 0
+        enabled.remove(platform)
+        _write_enabled_platforms(enabled)
+        log.info("Disabled [%s] for future runs.", platform)
+        log.info("Note: configured users and existing queued rows were not removed.")
+        log.info("A running `archiver loop` won't see this change until it restarts.")
+        return 0
+
+    return 1
+
+
+# ── run-settings (run-level behavior flags in .env) ─────────────────────────
+
+def cmd_run_settings(args, config: Config, db: ItemStore) -> int:
+    if args.run_settings_cmd == "show":
+        log.info("RECONCILE_AFTER_RUN=%s",
+                 "true" if config.reconcile_after_run else "false")
+        log.info("env: %s", _env_path())
+        return 0
+
+    if args.run_settings_cmd == "reconcile-after-run":
+        enabled = args.value == "on"
+        _set_env_var("RECONCILE_AFTER_RUN", "true" if enabled else "false")
+        log.info("RECONCILE_AFTER_RUN=%s", "true" if enabled else "false")
+        log.info("Note: a running `archiver loop` won't see this change until it restarts.")
+        return 0
+
+    return 1
 
 
 # ── cookies ──────────────────────────────────────────────────────────────────
@@ -1030,7 +1176,10 @@ def main() -> int:
     parser = build_parser()
     args   = parser.parse_args()
 
-    config_only = args.cmd in {"config", "migrate", "policy", "dedup-policy", "stats"}
+    config_only = args.cmd in {
+        "config", "platform", "run-settings", "migrate", "policy",
+        "dedup-policy", "stats",
+    }
     if args.cmd == "reset" and args.reset_cmd in {"failed", "user"}:
         config_only = True
 
@@ -1065,6 +1214,8 @@ def main() -> int:
             "cookies":      cmd_cookies,
             "loop":         cmd_loop,
             "config":       cmd_config,
+            "platform":     cmd_platform,
+            "run-settings": cmd_run_settings,
             "policy":       cmd_policy,
             "dedup-policy": cmd_dedup_policy,
             "migrate":      cmd_migrate,

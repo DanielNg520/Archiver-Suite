@@ -30,7 +30,7 @@ from core import db_path as _core_db_path
 # duplicated here and can't drift from what the services actually write.
 SUITE_DB      = _core_db_path()
 RECORDER_PID  = Path("~/.recorder/pid").expanduser()
-TIKTOK_LOCK   = Path("~/.config/archiver/locks/tiktok.lock").expanduser()
+TIKTOK_LOCK   = Path("~/.config/archiver-suite/locks/tiktok.lock").expanduser()
 
 LABELS = {
     "dispatcher": "com.duy.dispatcher",

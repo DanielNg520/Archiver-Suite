@@ -63,7 +63,7 @@ class RecorderConfig:
                                        os.path.expanduser("~/.recorder")),
             lock_path           = _opt("LOCK_PATH",
                                        os.path.expanduser(
-                                           "~/.config/archiver/locks/tiktok.lock")),
+                                           "~/.config/archiver-suite/locks/tiktok.lock")),
             tiktok_users        = users,
             tiktok_cookies_file = cookies,
         )

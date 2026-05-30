@@ -155,9 +155,9 @@ If the lock is STILL held after restart (stale lock — recorder was
 SIGKILLed previously and `__exit__` never ran):
 
 ```
-cat ~/.config/archiver/locks/tiktok.lock     # check the pid inside
+cat ~/.config/archiver-suite/locks/tiktok.lock     # check the pid inside
 # if that pid is dead:
-rm ~/.config/archiver/locks/tiktok.lock
+rm ~/.config/archiver-suite/locks/tiktok.lock
 ```
 
 The archiver only skips TikTok *downloads* while this lock exists; a stale

@@ -110,6 +110,8 @@ class Archiver:
         # table; the dispatcher drains them asynchronously. There is no
         # enqueue handoff and no reconcile bridge — one table, one truth.
         await self._run_platforms(platforms, user_filter, run_time, results)
+        if self.config.reconcile_after_run:
+            await self._reconcile_after_run(platforms, user_filter)
         return results
 
     async def _run_platforms(
@@ -180,6 +182,66 @@ class Archiver:
             log.info("delete-after-upload: OFF for all users this run")
         if not any_dedup:
             log.info("dedup-after-download: OFF for all users this run")
+
+    async def _reconcile_after_run(
+        self,
+        platforms: list[Platform],
+        user_filter: str | None,
+    ) -> None:
+        """Optional final disk sweep: dedup user folders, then queue any
+        stable media files missing from the shared DB."""
+        log.info("post-run reconcile: starting")
+        total_inserted = 0
+        total_deleted = 0
+        total_bytes_freed = 0
+
+        for platform in platforms:
+            users = self._reconcile_users_for_platform(platform, user_filter)
+            for username in users:
+                user_dir = Path(self.config.output_dir) / platform.name / username
+                dedup_report = await asyncio.to_thread(
+                    dedup_user,
+                    platform.name, username, user_dir, self.db,
+                    dry_run=False,
+                )
+                if dedup_report.confirmed_groups:
+                    log.info("post-run dedup: %s", dedup_report)
+                total_deleted += dedup_report.deleted
+                total_bytes_freed += dedup_report.bytes_freed
+
+                report = await asyncio.to_thread(
+                    reconcile_user, platform, username, self.db,
+                    self.config.output_dir, True,
+                )
+                if report.inserted or report.seeded_archive:
+                    log.info("post-run reconcile: %s", report)
+                total_inserted += report.inserted
+
+        log.info(
+            "post-run reconcile: queued %d file(s), dedup deleted %d file(s) "
+            "(%.1f MB)",
+            total_inserted,
+            total_deleted,
+            total_bytes_freed / (1024 * 1024),
+        )
+
+    def _reconcile_users_for_platform(
+        self,
+        platform: Platform,
+        user_filter: str | None,
+    ) -> tuple[str, ...]:
+        if user_filter:
+            return (user_filter.lstrip("@"),)
+
+        platform_dir = Path(self.config.output_dir) / platform.name
+        disk_users = {
+            p.name
+            for p in platform_dir.iterdir()
+            if p.is_dir()
+        } if platform_dir.exists() else set()
+
+        users = set(platform.users) | disk_users
+        return tuple(sorted(users))
 
     # ── Per-user cycle ───────────────────────────────────────────────────────
 

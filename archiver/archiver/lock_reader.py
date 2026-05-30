@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-LOCK_PATH = Path("~/.config/archiver/locks/tiktok.lock").expanduser()
+LOCK_PATH = Path("~/.config/archiver-suite/locks/tiktok.lock").expanduser()
 
 
 def tiktok_lock_held() -> bool:

@@ -44,7 +44,7 @@ Version 1.1 highlights:
 └── pyproject.toml
 ```
 
-**User config lives in `~/.config/archiver/.env`** (outside the project).
+**User config lives in `~/.config/archiver-suite/.env`** (outside the project).
 User lists and behavior policies live in
 `~/.config/archiver-suite/config.toml`.
 
@@ -53,8 +53,8 @@ User lists and behavior policies live in
 ```bash
 pipx install . --python 3.13
 pipx inject --editable media-archiver ../core
-mkdir -p ~/.config/archiver
-cp .env.example ~/.config/archiver/.env
+mkdir -p ~/.config/archiver-suite
+cp .env.example ~/.config/archiver-suite/.env
 # Fill in env vars — see Env reference below.
 archiver health
 archiver run
@@ -102,6 +102,14 @@ ENABLED_PLATFORMS=x,tiktok,instagram
 
 Telegram credentials and chat routing now belong to the dispatcher, not the
 archiver.
+
+### Run behavior
+```bash
+RECONCILE_AFTER_RUN=false
+```
+
+When true, each `archiver run` finishes with a disk sweep that dedups platform
+folders, then queues any stable files missing from the shared dispatcher DB.
 
 ### Delete after upload (3-level chain)
 ```bash

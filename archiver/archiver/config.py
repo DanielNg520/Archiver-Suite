@@ -47,7 +47,7 @@ from dotenv import load_dotenv
 
 from core import PolicyStore, db_path as _core_db_path
 
-load_dotenv(Path.home() / ".config" / "archiver" / ".env")
+load_dotenv(Path.home() / ".config" / "archiver-suite" / ".env")
 
 
 # ── env-var primitives (secrets only) ─────────────────────────────────────────
@@ -173,6 +173,7 @@ class Config:
     auth_failure_threshold: int = 3
 
     enabled_platforms: frozenset[str] = field(default_factory=frozenset)
+    reconcile_after_run: bool = False
 
     @classmethod
     def load(cls, *, load_platform_configs: bool = True,
@@ -220,4 +221,6 @@ class Config:
             sleep_min         = float(_opt("SLEEP_MIN", "3")),
             sleep_max         = float(_opt("SLEEP_MAX", "8")),
             enabled_platforms = enabled,
+            reconcile_after_run = _opt("RECONCILE_AFTER_RUN", "false").lower()
+                                  in {"1", "true", "yes", "on"},
         )

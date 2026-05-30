@@ -95,7 +95,7 @@ Run the migrator. It needs `core` importable; the simplest way from the
 repo root is to put `core` on the path for this one command:
 
 ```
-PYTHONPATH=core python3.13 -m core.migrate --archive-db ~/.config/archiver/archive.db --dispatcher-db ~/.config/dispatcher/dispatcher.db --out ~/.config/archiver-suite/suite.db
+PYTHONPATH=core python3.13 -m core.migrate --archive-db ~/.config/archiver-suite/archive.db --dispatcher-db ~/.config/dispatcher/dispatcher.db --out ~/.config/archiver-suite/suite.db
 ```
 
 What it does, and why it's safe:

@@ -6,7 +6,7 @@ skip your TikTok download." Context manager — writes a JSON lockfile on
 enter, removes it on exit.
 
 Contract with archiver.lock_reader (Slice 3):
-  - File location: ~/.config/archiver/locks/tiktok.lock
+  - File location: ~/.config/archiver-suite/locks/tiktok.lock
   - Presence = lock held. The archiver only checks existence.
   - JSON contents (pid, started_at, block) are for human/ops debugging
     and future extension (e.g. block="full"), not required by the reader.
@@ -30,7 +30,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LOCK_PATH = "~/.config/archiver/locks/tiktok.lock"
+DEFAULT_LOCK_PATH = "~/.config/archiver-suite/locks/tiktok.lock"
 
 
 def _now_iso() -> str:

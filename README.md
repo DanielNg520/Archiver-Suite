@@ -108,7 +108,7 @@ registers the file in `suite.db` as a pending dispatcher item. Records one
 stream at a time; between recordings it re-scans the list so a higher-priority
 user who just went live gets picked up.
 
-Holds a lockfile (`~/.config/archiver/locks/tiktok.lock`) only while actively
+Holds a lockfile (`~/.config/archiver-suite/locks/tiktok.lock`) only while actively
 recording, so the archiver knows to skip TikTok downloads during that window.
 
 TikTok live detection uses the `TikTokLive` library (not fragile manual
@@ -145,11 +145,6 @@ Also ships the three launchd plists and `RUNBOOK.md` (failure recovery).
 ~/.config/dispatcher/
     .env                    Telegram credentials + chat routing
     session.session         dispatcher's Telegram session
-
-~/.config/archiver/
-    .env                    archiver creds + paths (NO Telegram creds)
-    locks/tiktok.lock       written by recorder while recording
-    cookies/                Instagram/TikTok cookies
 
 ~/.config/recorder/
     .env                    TIKTOK_COOKIES_FILE, paths
