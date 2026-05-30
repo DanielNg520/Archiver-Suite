@@ -90,14 +90,22 @@ class TikTokLivePlatform:
         from TikTokLive import TikTokLiveClient
 
         web_kwargs: dict = {}
+        cookies: dict[str, str] = {}
         if self._cookies_file:
             # TikTokLive forwards web_kwargs to its httpx client. A cookies
             # file improves detection reliability for age-gated / region-
             # restricted lives.
             cookies = _parse_netscape_cookies(self._cookies_file)
             if cookies:
-                web_kwargs["cookies"] = cookies
-        return TikTokLiveClient(unique_id=f"@{uid}", web_kwargs=web_kwargs)
+                web_kwargs["httpx_kwargs"] = {"cookies": cookies}
+        client = TikTokLiveClient(unique_id=f"@{uid}", web_kwargs=web_kwargs)
+        session_id = cookies.get("sessionid")
+        if session_id:
+            client.web.set_session(
+                session_id=session_id,
+                tt_target_idc=cookies.get("tt-target-idc"),
+            )
+        return client
 
     async def _is_live_async(self, uid: str) -> bool:
         client = await self._make_client(uid)
