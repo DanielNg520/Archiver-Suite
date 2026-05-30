@@ -34,14 +34,24 @@ from .send import SendStrategy
 log = logging.getLogger(__name__)
 
 
+def is_tiktok_live(item: Item) -> bool:
+    return item.platform.lower() == "tiktok" and item.source.lower() == "recorder"
+
+
+def with_live_tag(caption: str) -> str:
+    return caption if "#live" in caption.split() else f"{caption} #live"
+
+
 def caption_for(item: Item) -> str:
     """Producer-set caption wins; else the default single-file format
     (identical to what the archiver used to store at enqueue time)."""
     if item.caption:
-        return item.caption
-    if item.identifier and not item.identifier.startswith(("manual_", "recorder_")):
-        return f"@{item.username} · {item.platform} · {item.identifier}"
-    return f"@{item.username} · {item.platform}"
+        caption = item.caption
+    elif item.identifier and not item.identifier.startswith(("manual_", "recorder_")):
+        caption = f"@{item.username} · {item.platform} · {item.identifier}"
+    else:
+        caption = f"@{item.username} · {item.platform}"
+    return with_live_tag(caption) if is_tiktok_live(item) else caption
 
 
 def album_caption_for(batch: list[Item]) -> str:
@@ -51,7 +61,8 @@ def album_caption_for(batch: list[Item]) -> str:
     '📷 @user · platform' (📷 photos / 🎬 videos)."""
     head = batch[0]
     icon = {"photo": "📷", "video": "🎬"}.get(media_bucket(head.file_path), "📦")
-    return f"{icon} @{head.username} · {head.platform}"
+    caption = f"{icon} @{head.username} · {head.platform}"
+    return with_live_tag(caption) if is_tiktok_live(head) else caption
 
 
 async def drain_forever(
@@ -104,7 +115,7 @@ async def drain_forever(
             continue
 
         head = present[0]
-        peer = router.peer_for(head.platform, head.username)
+        peer = router.peer_for(head.platform, head.username, source=head.source)
 
         if len(present) == 1:
             # single send (gif/other bucket, or a group that filtered to one)

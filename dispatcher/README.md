@@ -40,6 +40,11 @@ chmod 600 ~/.config/dispatcher/.env
 Edit `~/.config/dispatcher/.env` to fill in `TELEGRAM_API_ID`,
 `TELEGRAM_API_HASH`, `TELEGRAM_PHONE`, and `TELEGRAM_CHAT_ID`.
 
+Optional Telegram routing overrides live in the same file. TikTok videos use
+`TELEGRAM_CHAT_ID_TIKTOK`; TikTok live recordings produced by the recorder
+use `TELEGRAM_CHAT_ID_TIKTOK_LIVE`, or
+`TELEGRAM_CHAT_ID_TIKTOK_LIVE_<USER>` for a single recorded account.
+
 First time you run `dispatcher start`, Telethon will prompt for the SMS
 auth code interactively and write a session file at
 `~/.config/dispatcher/session`. After that, sessions persist.
