@@ -53,9 +53,15 @@ log = logging.getLogger(__name__)
 
 
 class StreamCapture:
-    def __init__(self, output_dir: str, cookies_file: str | None):
+    def __init__(self, output_dir: str, cookies_file: str | None,
+                 start_timeout_s: float = 120.0):
         self.output_dir = Path(output_dir).expanduser()
         self.cookies_file = cookies_file
+        # Dead-stream guard: terminate yt-dlp if it produces ZERO bytes
+        # within this many seconds of starting. Zero bytes means there is no
+        # recording to lose, so this can never drop captured data; set to 0
+        # to disable.
+        self.start_timeout_s = start_timeout_s
         self._proc: subprocess.Popen | None = None
         self._run_dir: Path | None = None
         self._started_at: float = 0.0
@@ -114,18 +120,50 @@ class StreamCapture:
         while self.is_running():
             if stop_event.wait(timeout=2.0):
                 log.info("capture: stop requested — terminating yt-dlp")
-                self._proc.terminate()
-                try:
-                    self._proc.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    log.warning("capture: yt-dlp ignored SIGTERM — killing")
-                    self._proc.kill()
+                self._terminate()
                 self._close_log()
                 return -1
+            # Dead-stream guard. After a live ends, the recorder's handoff
+            # re-scan can re-detect the just-ended user as live (TikTok lag)
+            # and we relaunch yt-dlp on a dead URL. With --retries infinite
+            # that call would hang here forever and the recorder would never
+            # return to LISTENING. If no bytes have arrived within the
+            # startup window the stream is dead — bail. Safe: zero bytes
+            # means there is no recording to lose.
+            if (self.start_timeout_s > 0
+                    and time.time() - self._started_at > self.start_timeout_s
+                    and self._recorded_bytes() == 0):
+                log.warning("capture: no data after %.0fs — assuming dead "
+                            "stream, terminating yt-dlp", self.start_timeout_s)
+                self._terminate()
+                self._close_log()
+                return -2
         rc = self._proc.returncode
         log.info("capture: yt-dlp exited rc=%d", rc)
         self._close_log()
         return rc
+
+    def _terminate(self) -> None:
+        """SIGTERM yt-dlp, escalating to SIGKILL if it ignores us."""
+        if self._proc is None:
+            return
+        self._proc.terminate()
+        try:
+            self._proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            log.warning("capture: yt-dlp ignored SIGTERM — killing")
+            self._proc.kill()
+
+    def _recorded_bytes(self) -> int:
+        """Total bytes written so far for this run. output_files() already
+        excludes logs/sidecars, so this measures only the recording."""
+        total = 0
+        for p in self.output_files():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        return total
 
     def _close_log(self) -> None:
         """Release the yt-dlp log fd. Idempotent — safe to call twice."""

@@ -96,7 +96,18 @@ class StateMachine:
                  len(self.config.tiktok_users), self.config.poll_interval_s)
         try:
             while not self._stop.is_set():
-                self._tick()
+                try:
+                    self._tick()
+                except Exception as e:
+                    # A single bad tick must never permanently stop the
+                    # recorder. Log with traceback, pause one poll interval
+                    # so we don't hot-loop on a persistent fault, then carry
+                    # on listening.
+                    log.error("recorder: tick failed in state %s: %s — recovering",
+                              self.state.name, e, exc_info=True)
+                    self._release_lock_if_held()
+                    self.state = RecorderState.LISTENING
+                    self._stop.wait(self.config.poll_interval_s)
         finally:
             # Ensure the lock is released even if we exit mid-recording.
             self._release_lock_if_held()

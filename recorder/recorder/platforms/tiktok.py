@@ -109,31 +109,52 @@ class TikTokLivePlatform:
 
     async def _is_live_async(self, uid: str) -> bool:
         client = await self._make_client(uid)
-        live = await client.is_live()
-        if live:
-            rid = getattr(client, "room_id", None)
-            if rid:
-                self._room_cache[uid] = str(rid)
-                self._save_cache()
-        return bool(live)
+        try:
+            live = await client.is_live()
+            if live:
+                rid = getattr(client, "room_id", None)
+                if rid:
+                    self._room_cache[uid] = str(rid)
+                    self._save_cache()
+            return bool(live)
+        finally:
+            await self._safe_close(client)
 
     async def _stream_url_async(self, uid: str) -> str:
         client = await self._make_client(uid)
-        # fetch_room_info() resolves the room from EITHER a room_id or a
-        # unique_id. Called with no args it falls back to a stored
-        # _web.params["room_id"], which is unset on this fresh client (that
-        # state is only populated by is_live(), which ran on a different
-        # client instance) — hence the KeyError('room_id') in the logs.
-        # Query by unique_id instead: it hits the info_by_user/ endpoint,
-        # needs no room_id, and returns the same payload shape.
-        info = await client.web.fetch_room_info(unique_id=uid)
-        url = _extract_hls_url(info)
-        if not url:
-            raise RuntimeError(
-                f"could not extract HLS URL for @{uid} from room info; "
-                f"TikTok response shape may have changed"
-            )
-        return url
+        try:
+            # fetch_room_info() resolves the room from EITHER a room_id or a
+            # unique_id. Called with no args it falls back to a stored
+            # _web.params["room_id"], which is unset on this fresh client (that
+            # state is only populated by is_live(), which ran on a different
+            # client instance) — hence the KeyError('room_id') in the logs.
+            # Query by unique_id instead: it hits the info_by_user/ endpoint,
+            # needs no room_id, and returns the same payload shape.
+            info = await client.web.fetch_room_info(unique_id=uid)
+            url = _extract_hls_url(info)
+            if not url:
+                raise RuntimeError(
+                    f"could not extract HLS URL for @{uid} from room info; "
+                    f"TikTok response shape may have changed"
+                )
+            return url
+        finally:
+            await self._safe_close(client)
+
+    @staticmethod
+    async def _safe_close(client) -> None:
+        """Close the client's HTTP sessions (httpx + curl_cffi).
+
+        is_live()/stream_url() build a fresh client on EVERY poll. Without
+        this close the sessions leak file descriptors and connections; after
+        enough polls (accelerated by the per-recording HANDOFF re-scan)
+        is_live() starts failing, is caught as 'not live', and the recorder
+        appears to stop listening. Never raises — a close failure must not
+        kill the poll loop."""
+        try:
+            await client.close()
+        except Exception as e:  # noqa: BLE001 — best-effort cleanup
+            log.debug("tiktok: client close failed (ignored): %s", e)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
