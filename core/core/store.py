@@ -179,7 +179,7 @@ class ItemStore:
 
         The group is defined by the highest-priority pending row (the
         "anchor") and everything sharing its (platform, username, source,
-        media-bucket):
+        caption/group caption, media-bucket):
 
           - source in the key  → an album is never mixed across producers
             (archiver rows and recorder rows form separate batches), which
@@ -202,7 +202,7 @@ class ItemStore:
         for _ in range(_CLAIM_RETRIES):
             with self._immediate() as cur:
                 anchor = cur.execute(
-                    """SELECT id, platform, username, source, file_path
+                    """SELECT id, platform, username, source, caption, file_path
                          FROM items WHERE status='pending'
                         ORDER BY priority ASC, discovered_at ASC LIMIT 1"""
                 ).fetchone()
@@ -218,8 +218,14 @@ class ItemStore:
                         """SELECT * FROM items
                             WHERE status='pending'
                               AND platform=? AND username=? AND source=?
+                              AND COALESCE(caption, '')=?
                             ORDER BY priority ASC, discovered_at ASC""",
-                        (anchor["platform"], anchor["username"], anchor["source"]),
+                        (
+                            anchor["platform"],
+                            anchor["username"],
+                            anchor["source"],
+                            anchor["caption"] or "",
+                        ),
                     ).fetchall()
                     chosen = []
                     for row in candidates:

@@ -36,7 +36,9 @@ from .config import Config
 from .dedup import dedup_user
 from .lock_reader import tiktok_lock_held
 from .platforms import Platform, AuthError, HealthStatus
-from .reconcile import reconcile_user
+from .reconcile import (
+    reconcile_platform_root, reconcile_recordings, reconcile_user,
+)
 
 from core import (
     ItemStore, DeletePolicy, DedupPolicy, cleanup_sidecars,
@@ -196,6 +198,15 @@ class Archiver:
         total_bytes_freed = 0
 
         for platform in platforms:
+            if not user_filter:
+                root_report = await asyncio.to_thread(
+                    reconcile_platform_root,
+                    platform, self.db, self.config.output_dir,
+                )
+                if root_report.scanned or root_report.inserted:
+                    log.info("post-run reconcile: %s", root_report)
+                total_inserted += root_report.inserted
+
             users = self._reconcile_users_for_platform(platform, user_filter)
             for username in users:
                 user_dir = Path(self.config.output_dir) / platform.name / username
@@ -215,6 +226,15 @@ class Archiver:
                 )
                 if report.inserted or report.seeded_archive:
                     log.info("post-run reconcile: %s", report)
+                total_inserted += report.inserted
+
+        if not user_filter:
+            recording_reports = await asyncio.to_thread(
+                reconcile_recordings, self.db,
+            )
+            for report in recording_reports:
+                if report.scanned or report.inserted:
+                    log.info("post-run reconcile recordings: %s", report)
                 total_inserted += report.inserted
 
         log.info(

@@ -44,9 +44,11 @@ from pathlib import Path
 
 from .config import Config
 from .orchestrator import Archiver, bootstrap, build_platforms
-from .reconcile import reconcile_user
+from .reconcile import (
+    reconcile_platform_root, reconcile_recordings, reconcile_user,
+)
 
-from core import ItemStore, DeletePolicy, DedupPolicy
+from core import ItemStore, DeletePolicy, RecorderDeletePolicy, DedupPolicy
 
 
 PLATFORM_CHOICES = ["x", "tiktok", "instagram"]
@@ -227,6 +229,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Turn the post-run reconcile sweep on or off",
     )
     rs_reconcile.add_argument("value", choices=["on", "off"])
+
+    rs_delete_records = run_settings_sub.add_parser(
+        "delete-records-after-upload",
+        help="Turn delete-after-upload for recorder files on or off",
+    )
+    rs_delete_records.add_argument("value", choices=["on", "off"])
 
     # ── policy (delete-after-upload) ───
     s_pol = sub.add_parser(
@@ -431,6 +439,12 @@ def cmd_reconcile(args, config: Config, db: ItemStore) -> int:
     total_deleted = 0
     total_bytes_freed = 0
     for platform in platforms:
+        if not args.user:
+            root_report = reconcile_platform_root(platform, db, config.output_dir)
+            if root_report.scanned or root_report.inserted:
+                log.info("reconcile: %s", root_report)
+            total_inserted += root_report.inserted
+
         users = _reconcile_users_for_platform(config, platform, args.user)
         for u in users:
             user_dir = Path(config.output_dir) / platform.name / u
@@ -448,6 +462,12 @@ def cmd_reconcile(args, config: Config, db: ItemStore) -> int:
 
             report = reconcile_user(platform, u, db, config.output_dir)
             log.info("reconcile: %s", report)
+            total_inserted += report.inserted
+
+    if not args.platform and not args.user:
+        for report in reconcile_recordings(db):
+            if report.scanned or report.inserted:
+                log.info("reconcile recordings: %s", report)
             total_inserted += report.inserted
 
     log.info("")
@@ -817,9 +837,14 @@ def cmd_platform(args, config: Config, db: ItemStore) -> int:
 
 def cmd_run_settings(args, config: Config, db: ItemStore) -> int:
     if args.run_settings_cmd == "show":
+        recorder_delete_policy = RecorderDeletePolicy(config.policy_store)
         log.info("RECONCILE_AFTER_RUN=%s",
                  "true" if config.reconcile_after_run else "false")
+        log.info("DELETE_RECORDS_AFTER_UPLOAD=%s",
+                 "true" if recorder_delete_policy.should_delete_recording()
+                 else "false")
         log.info("env: %s", _env_path())
+        log.info("config.toml: %s", config.policy_store._path)
         return 0
 
     if args.run_settings_cmd == "reconcile-after-run":
@@ -827,6 +852,17 @@ def cmd_run_settings(args, config: Config, db: ItemStore) -> int:
         _set_env_var("RECONCILE_AFTER_RUN", "true" if enabled else "false")
         log.info("RECONCILE_AFTER_RUN=%s", "true" if enabled else "false")
         log.info("Note: a running `archiver loop` won't see this change until it restarts.")
+        return 0
+
+    if args.run_settings_cmd == "delete-records-after-upload":
+        enabled = args.value == "on"
+        config.policy_store.set(
+            RecorderDeletePolicy.KEY,
+            enabled,
+        )
+        log.info("DELETE_RECORDS_AFTER_UPLOAD=%s",
+                 "true" if enabled else "false")
+        log.info("Note: a running `dispatcher start` won't see this change until it restarts.")
         return 0
 
     return 1

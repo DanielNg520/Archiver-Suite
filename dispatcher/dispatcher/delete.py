@@ -23,13 +23,14 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from core import ItemStore, Status, cleanup_sidecars, DeletePolicy
+from core import ItemStore, Status, cleanup_sidecars, DeletePolicy, RecorderDeletePolicy
 
 log = logging.getLogger(__name__)
 
 
 def maybe_delete(store: ItemStore, item_id: int, *,
-                 delete_policy: DeletePolicy) -> None:
+                 delete_policy: DeletePolicy,
+                 recorder_delete_policy: RecorderDeletePolicy) -> None:
     """Gated cleanup. Caller must have already called mark_sent(item_id)."""
     item = store.get(item_id)
     if item is None:
@@ -42,6 +43,10 @@ def maybe_delete(store: ItemStore, item_id: int, *,
             Path(item.file_path).name, item.status,
         )
         return
-    if not delete_policy.should_delete(item.platform, item.username):
+    if item.source.lower() == "recorder":
+        should_delete = recorder_delete_policy.should_delete_recording()
+    else:
+        should_delete = delete_policy.should_delete(item.platform, item.username)
+    if not should_delete:
         return
     cleanup_sidecars(item.file_path)

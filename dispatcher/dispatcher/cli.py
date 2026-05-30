@@ -28,7 +28,7 @@ import signal
 import sys
 from pathlib import Path
 
-from core import ItemStore, DeletePolicy
+from core import ItemStore, DeletePolicy, RecorderDeletePolicy
 
 from .config import DispatcherConfig
 from .drain import drain_forever
@@ -57,6 +57,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
     store         = ItemStore.open(config.db_path)
     router        = TelegramRouter(default_chat_id=config.default_chat_id)
     delete_policy = DeletePolicy(config.policy_store)
+    recorder_delete_policy = RecorderDeletePolicy(config.policy_store)
 
     stop_event = asyncio.Event()
 
@@ -84,6 +85,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
                 send_strategy=send_strategy,
                 router=router,
                 delete_policy=delete_policy,
+                recorder_delete_policy=recorder_delete_policy,
                 stop_event=stop_event,
             )
         finally:

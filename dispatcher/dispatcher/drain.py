@@ -23,7 +23,9 @@ import asyncio
 import logging
 from pathlib import Path
 
-from core import ClaimContentionError, ItemStore, Item, DeletePolicy
+from core import (
+    ClaimContentionError, ItemStore, Item, DeletePolicy, RecorderDeletePolicy,
+)
 from core.files import media_bucket
 from .tg_router import TelegramRouter
 
@@ -60,6 +62,9 @@ def album_caption_for(batch: list[Item]) -> str:
     header describing the group, matching the old uploader's behavior:
     '📷 @user · platform' (📷 photos / 🎬 videos)."""
     head = batch[0]
+    if head.caption:
+        caption = head.caption
+        return with_live_tag(caption) if is_tiktok_live(head) else caption
     icon = {"photo": "📷", "video": "🎬"}.get(media_bucket(head.file_path), "📦")
     caption = f"{icon} @{head.username} · {head.platform}"
     return with_live_tag(caption) if is_tiktok_live(head) else caption
@@ -71,6 +76,7 @@ async def drain_forever(
     send_strategy: SendStrategy,
     router:        TelegramRouter,
     delete_policy: DeletePolicy,
+    recorder_delete_policy: RecorderDeletePolicy,
     *,
     stop_event:    asyncio.Event | None = None,
 ) -> None:
@@ -147,7 +153,12 @@ async def drain_forever(
                      len(present))
             for it in present:
                 try:
-                    maybe_delete(store, it.id, delete_policy=delete_policy)
+                    maybe_delete(
+                        store,
+                        it.id,
+                        delete_policy=delete_policy,
+                        recorder_delete_policy=recorder_delete_policy,
+                    )
                 except Exception as e:
                     log.exception("drain: id=%d cleanup raised: %s", it.id, e)
             # Decision C: pace between album sends to avoid FloodWait.

@@ -62,6 +62,15 @@ class DeletePolicy(BooleanPolicy):
         return self.is_enabled(platform, username)
 
 
+class RecorderDeletePolicy(BooleanPolicy):
+    """Delete recorded files after a successful Telegram upload."""
+    KEY     = "delete_after_upload_records"
+    DEFAULT = False
+
+    def should_delete_recording(self) -> bool:
+        return self.is_enabled("tiktok", "_recorder")
+
+
 class DedupPolicy(BooleanPolicy):
     """Whether to run content-hash dedup after a successful download."""
     KEY     = "dedup_after_download"

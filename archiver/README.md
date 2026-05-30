@@ -93,6 +93,15 @@ beneath it (e.g. `downloads/instagram/carol/stories_2025/`). The next
 
 No special command needed; this is part of every run.
 
+## Manually adding loose root media
+
+Media files dropped directly into `downloads/<platform>/` are treated as
+loose root files. Reconcile clusters them by the longest shared filename-stem
+prefix, ignoring punctuation/underscores and case. At least 5 shared
+alphanumeric prefix characters are required for a cluster; otherwise the file
+is queued by itself. The dispatcher sends each loose-root cluster in chunks of
+10 or fewer items, using the display prefix as the Telegram caption.
+
 ## Env vars
 
 ### Always required
@@ -110,6 +119,8 @@ RECONCILE_AFTER_RUN=false
 
 When true, each `archiver run` finishes with a disk sweep that dedups platform
 folders, then queues any stable files missing from the shared dispatcher DB.
+That sweep also checks the recorder output directory from
+`~/.config/recorder/config.toml`.
 
 ### Delete after upload (3-level chain)
 ```bash
@@ -164,6 +175,9 @@ archiver stats --platform tiktok --user u
 archiver policy                             # resolved delete-after-upload per user
 archiver health                             # check credentials
 archiver reconcile                          # scan disk → DB (subset of `run`)
+archiver run-settings show
+archiver run-settings reconcile-after-run on
+archiver run-settings delete-records-after-upload on
 
 archiver loop                               # see "Automation" below
 archiver loop --min 3600 --max 7200
