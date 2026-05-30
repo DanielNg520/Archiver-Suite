@@ -68,12 +68,8 @@ def is_stable(path: Path) -> bool:
     """
     if _is_hidden(path):
         return False
-    if path.suffix.lower() in _INCOMPLETE_SUFFIXES:
-        return False
-    # Two-suffix check catches "foo.mp4.part" style names where the real
-    # extension is buried (Path.suffix only gives the last segment).
-    if any(part.lower() in _INCOMPLETE_SUFFIXES
-           for part in (s for s in path.suffixes)):
+    # Check all suffixes: catches both "foo.part" and "foo.mp4.part" styles.
+    if any(s.lower() in _INCOMPLETE_SUFFIXES for s in path.suffixes):
         return False
 
     try:

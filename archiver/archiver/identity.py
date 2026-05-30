@@ -84,11 +84,9 @@ _SIDECAR_ID_KEYS = (
     "tweet_id",        # twitter
     "post_shortcode",  # instagram (URL-stable, preferred over numeric)
     "post_id",         # instagram (numeric, fallback if shortcode missing)
-    "media_id",        # instagram per-asset
+    "media_id",        # instagram per-asset / tiktok photo carousel
     # yt-dlp
     "id",              # tiktok video, generic
-    # gallery-dl tiktok photo carousel
-    "media_id",
 )
 
 _SIDECAR_DATE_KEYS_INT = (

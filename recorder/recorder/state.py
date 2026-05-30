@@ -207,7 +207,7 @@ class StateMachine:
                 continue
             try:
                 caption = (f"@{job.username} · tiktok · live · "
-                           f"{job.file_path.name}")
+                           f"{job.file_path.stem}")
                 self.enqueue("tiktok", job.username, str(job.file_path), caption)
             except Exception as e:
                 # Keep the file on disk; ops can re-enqueue via the

@@ -176,10 +176,11 @@ async def drain_forever(
             # Whole-batch failure: every row gets an attempt counted. Since
             # the album is atomic, none were posted — all are eligible to
             # retry (or hit failed at max_retries) together.
+            statuses: set[str] = set()
             for it in present:
-                new_status = store.mark_failed(
+                statuses.add(store.mark_failed(
                     it.id, error=result.error or "unknown",
                     max_retries=config.max_retries,
-                )
+                ))
             log.warning("drain: %d item(s) failed (%s): %s",
-                        len(present), new_status, result.error)
+                        len(present), "/".join(sorted(statuses)), result.error)

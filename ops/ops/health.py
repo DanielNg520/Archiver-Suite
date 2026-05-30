@@ -156,7 +156,6 @@ def render() -> str:
     # recorder
     pid = launchctl_pid(LABELS["recorder"])
     if pid:
-        state = "running"
         # recorder's internal state isn't exposed via launchctl; the pid
         # file just confirms which pid it thinks it is. State would require
         # an IPC channel we deliberately didn't build for Slice 4.
