@@ -74,8 +74,14 @@ class Platform(abc.ABC):
 
     Subclasses MUST set `name` as a class attribute — used as a stable
     identifier in the DB and the on-disk folder structure.
+
+    `fetches` is True for real extractors and False for user-managed folders
+    (LocalPlatform). The orchestrator routes a non-fetching platform through
+    the reconcile-and-upload-only path every run, which (unlike the per-user
+    download path) also sweeps files dropped directly in the platform folder.
     """
     name: str
+    fetches: bool = True
 
     def __init__(self, config: "Config"):
         self.config = config
@@ -131,6 +137,7 @@ class LocalPlatform(Platform):
     No auth (always healthy) and no extractor archive (manual files have no
     upstream id to seed).
     """
+    fetches = False   # user-managed; never downloads
 
     def __init__(self, config: "Config", name: str):
         super().__init__(config)

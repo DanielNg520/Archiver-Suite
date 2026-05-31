@@ -28,6 +28,7 @@ DISCRIMINATOR (the safety-critical bit)
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,13 @@ from .routing import is_chat_id
 from .store import ItemStore
 
 log = logging.getLogger(__name__)
+
+# Quarantine for files that fail to hash (unreadable / corrupt). Stored as one
+# JSON blob {path: mtime_ns} in the metadata table so a repeated auto-ingest
+# pass doesn't re-read + re-warn on the same bad file every cycle. A file is
+# re-attempted only once its mtime changes (it was replaced/fixed). One read +
+# at most one write per folder — never a per-file query.
+_HASHFAIL_META_KEY = "orphaned_hashfail"
 
 ORPHANED_SOURCE = "orphaned"
 # Synthetic platform value for orphaned rows. Keeps them out of every
@@ -130,6 +138,17 @@ def ingest_folder(
     Reusable for both the chat_id-folder sweep and `archiver ingest --path`,
     where `folder` is arbitrary and `chat_id` is supplied explicitly."""
     rep = OrphanedReport(chat_id=chat_id)
+    quarantine, q_dirty = _load_quarantine(store), False
+    # NOT wrapped in store.batch() — deliberately. register_file's dedup-collapse
+    # can delete a file from disk (the "adopt" branch deletes the losing copy)
+    # right alongside its relink_file DB write. A filesystem delete is not part
+    # of the SQLite transaction, so folding these inserts into a roll-back-able
+    # batch would create a window where the batch rolls back (a failed flush
+    # under lock contention) AFTER the file was already deleted — leaving a row
+    # pointing at a missing file. Per-file autocommit keeps each relink durable
+    # before its paired delete. Loose drops are low-volume, so the lost insert
+    # amortization here is immaterial; the high-volume reconcile path (pure
+    # inserts, no in-loop destructive FS op) is the one that stays batched.
     for f in sorted(folder.rglob("*")):
         try:
             if not f.is_file():
@@ -139,6 +158,16 @@ def ingest_folder(
         if f.suffix.lower() not in MEDIA_EXTENSIONS:
             continue
         rep.scanned += 1
+
+        # Skip a known-bad file until it changes (see _HASHFAIL_META_KEY).
+        key = str(f)
+        try:
+            mtime = str(f.stat().st_mtime_ns)
+        except OSError:
+            mtime = None
+        if mtime is not None and quarantine.get(key) == mtime:
+            rep.failed += 1
+            continue
 
         rel = f.relative_to(folder)
         subpath = rel.parent.as_posix()
@@ -168,9 +197,29 @@ def ingest_folder(
             log.exception("orphaned: register_file raised on %s", f)
             continue
 
+        # Maintain the quarantine: record a fresh hash failure; clear the marker
+        # once a previously-bad file succeeds (it was fixed/replaced).
+        if res.outcome is IngestOutcome.HASH_FAILED and mtime is not None:
+            quarantine[key] = mtime
+            q_dirty = True
+        elif key in quarantine:
+            del quarantine[key]
+            q_dirty = True
+
         setattr(rep, _OUTCOME_TALLY[res.outcome],
                 getattr(rep, _OUTCOME_TALLY[res.outcome]) + 1)
+
+    if q_dirty:
+        store.meta_set(_HASHFAIL_META_KEY, json.dumps(quarantine))
     return rep
+
+
+def _load_quarantine(store: ItemStore) -> dict[str, str]:
+    """The {path: mtime_ns} hash-failure quarantine, or {} if unset/corrupt."""
+    try:
+        return json.loads(store.meta_get(_HASHFAIL_META_KEY) or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
 
 
 def subfolder_of(chat_id: str, group_key: str | None) -> str:

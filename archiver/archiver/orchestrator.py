@@ -36,19 +36,29 @@ from .config import Config
 from .lock_reader import tiktok_lock_held
 from .platforms import Platform, AuthError, HealthStatus
 from .reconcile import (
-    reconcile_platform_root, reconcile_recordings, reconcile_user,
+    MEDIA_EXTENSIONS, reconcile_platform_root, reconcile_recordings,
+    reconcile_user,
 )
 
 from core import (
     ItemStore, DeletePolicy, DedupPolicy, DownloadPolicy, dedup_user,
-    cleanup_sidecars, validate_overrides as _validate_policies,
+    cleanup_sidecars, is_chat_id, validate_overrides as _validate_policies,
 )
 
 log = logging.getLogger(__name__)
 
+# Built-in download platforms. A top-level output_dir folder with one of these
+# names belongs to that extractor (its identity patterns + extractor archive),
+# so it is NEVER auto-adopted as a local platform — even when that platform is
+# currently disabled (no config block this run). Auto-adoption is only for
+# genuinely foreign folder names.
+_BUILTIN_PLATFORM_NAMES = frozenset({"x", "tiktok", "instagram"})
+
 
 def build_platforms(config: Config) -> list[Platform]:
-    """Instantiate every Platform whose config block is present."""
+    """Instantiate every download Platform whose config block is present, plus
+    every user-managed local folder — both explicitly registered ones and any
+    auto-discovered under output_dir."""
     platforms: list[Platform] = []
     if config.x:
         from .platforms import XPlatform
@@ -59,12 +69,55 @@ def build_platforms(config: Config) -> list[Platform]:
     if config.instagram:
         from .platforms import InstagramPlatform
         platforms.append(InstagramPlatform(config))
-    # User-managed folders treated as platforms (no download).
-    if config.local_platforms:
+    # User-managed folders treated as no-download platforms.
+    local_names = _local_platform_names(config)
+    if local_names:
         from .platforms import LocalPlatform
-        for name in config.local_platforms:
+        for name in local_names:
             platforms.append(LocalPlatform(config, name))
     return platforms
+
+
+def _local_platform_names(config: Config) -> list[str]:
+    """Ordered-unique local-platform names: explicit (`archiver local add`)
+    first, then auto-discovered top-level output_dir folders.
+
+    Auto-discovery is the zero-config form of the same idea LocalPlatform
+    already applies to its users ("make a folder, it's a user") — here, "make
+    a folder, it's a no-download platform." A top-level folder is adopted iff
+    it is a real directory that is NOT hidden, NOT a built-in platform name,
+    and NOT a chat_id route dir (those belong to the orphaned ingest pass).
+    Adopted folders reconcile + upload to the default chat unless a
+    TELEGRAM_CHAT_ID_<NAME> override is set, exactly like any platform."""
+    explicit: list[str] = []
+    seen: set[str] = set()
+    for n in config.local_platforms:
+        if n not in seen:
+            seen.add(n)
+            explicit.append(n)
+
+    discovered: list[str] = []
+    out = Path(config.output_dir)
+    if out.is_dir():
+        for d in sorted(out.iterdir()):
+            try:
+                if not d.is_dir():
+                    continue
+            except OSError:
+                continue
+            nm = d.name
+            if nm.startswith(".") or nm in seen:
+                continue
+            if nm in _BUILTIN_PLATFORM_NAMES or is_chat_id(nm):
+                continue
+            seen.add(nm)
+            discovered.append(nm)
+
+    if discovered:
+        log.info("auto-discovered %d local platform(s) under output_dir "
+                 "(no download, reconcile+upload): %s",
+                 len(discovered), ", ".join(discovered))
+    return explicit + discovered
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -98,6 +151,7 @@ class Archiver:
                 }
             }
 
+        self._warn_unmanaged_root_files()
         platforms = build_platforms(self.config)
         # Full platform-name set (before any --platform filter) so the orphaned
         # ingest pass knows which top-level dirs are platforms vs chat_id folders.
@@ -125,18 +179,28 @@ class Archiver:
             # (download-disabled ones included), so they're covered here.
             await self._reconcile_after_run(platforms, user_filter)
         else:
-            # No global sweep — but download-disabled platforms must STILL be
-            # reconciled+uploaded (that's their whole point), so do just those.
+            # No global sweep — but non-fetching platforms (DOWNLOAD_ENABLED=
+            # false, or any LocalPlatform) must STILL be reconciled+uploaded
+            # (that's their whole point), so do just those. This path also
+            # sweeps files dropped directly in the platform folder, not only
+            # those under a user subfolder.
             for platform in platforms:
-                if not self.download_policy.enabled_for(platform.name):
+                if not self._fetches(platform):
                     await self._reconcile_one_platform(platform, user_filter)
         self._maybe_ingest_orphaned(known_platform_names)
         return results
 
+    def _fetches(self, platform: Platform) -> bool:
+        """Does this platform download new media this run? False for a
+        LocalPlatform (fetches=False) or a built-in platform turned off via
+        DOWNLOAD_ENABLED=false. Non-fetching platforms skip the auth/health +
+        download steps and are handled by the reconcile-and-upload-only path."""
+        return platform.fetches and self.download_policy.enabled_for(platform.name)
+
     def _maybe_ingest_orphaned(self, known_platform_names: set[str]) -> None:
         """When the auto_ingest_orphaned policy is on, scan output_dir's
         chat_id-named folders and enqueue loose files — the automated form of
-        `archiver ingest`. Off by default; toggle via `archiver auto-ingest`."""
+        `archiver ingest`. On by default; toggle via `archiver auto-ingest`."""
         from core import AutoIngestPolicy, ingest_chat_id_dirs
 
         if not AutoIngestPolicy(self.config.policy_store).enabled():
@@ -162,11 +226,11 @@ class Archiver:
     ) -> None:
         """The per-platform / per-user loop."""
         for platform in platforms:
-            # Download disabled → skip fetch AND the auth/cookies health-check
+            # Not fetching → skip fetch AND the auth/cookies health-check
             # entirely. The folder is still reconciled + uploaded (always, in
             # run() above), just never downloaded — for hand-managed platforms
-            # like a manual Instagram backup.
-            if not self.download_policy.enabled_for(platform.name):
+            # like a manual Instagram backup or any user-managed local folder.
+            if not self._fetches(platform):
                 log.info("[%s] download disabled — reconcile/upload only",
                          platform.name)
                 continue
@@ -482,6 +546,31 @@ class Archiver:
         return await asyncio.to_thread(platform.attempt_recovery)
 
     # ── Pre-flight + disk pressure ────────────────────────────────────────────
+
+    def _warn_unmanaged_root_files(self) -> None:
+        """A media file sitting DIRECTLY in output_dir — not inside a platform,
+        local-platform, or chat_id folder — has no routing and is ingested by
+        nobody (folders become platforms; bare files can't). Surface it so it
+        isn't silently lost. The fix is to move it into a subfolder. One
+        aggregated line per run, not per file."""
+        out = Path(self.config.output_dir)
+        if not out.is_dir():
+            return
+        try:
+            loose = sorted(
+                p.name for p in out.iterdir()
+                if p.is_file() and p.suffix.lower() in MEDIA_EXTENSIONS
+            )
+        except OSError:
+            return
+        if loose:
+            shown = ", ".join(loose[:10]) + (" …" if len(loose) > 10 else "")
+            log.warning(
+                "%d media file(s) sit loose in output_dir root and are "
+                "unmanaged (not under a platform or chat_id folder): %s — move "
+                "each into a <platform>/<user>/ or <chat_id>/ subfolder to "
+                "archive it", len(loose), shown,
+            )
 
     def _verify_output_dir(self) -> bool:
         out = Path(self.config.output_dir)

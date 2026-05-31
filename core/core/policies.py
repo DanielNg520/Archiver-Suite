@@ -64,9 +64,16 @@ class DeletePolicy(BooleanPolicy):
 
 
 class RecorderDeletePolicy(BooleanPolicy):
-    """Delete recorded files after a successful Telegram upload."""
+    """Delete recorded files after a successful Telegram upload.
+
+    Default ON: recordings are large and, once delivered to Telegram, the
+    local copy is redundant. The dispatcher's maybe_delete gate still re-reads
+    status=='sent' before unlinking, so a file is only ever removed after a
+    confirmed upload. Set delete_after_upload_records=false in config.toml to
+    keep local copies. (The general delete_after_upload for VOD downloads stays
+    OFF by default — see DeletePolicy.)"""
     KEY     = "delete_after_upload_records"
-    DEFAULT = False
+    DEFAULT = True
 
     def should_delete_recording(self) -> bool:
         return self.is_enabled("tiktok", "_recorder")
@@ -156,11 +163,12 @@ class DownloadPolicy(BooleanPolicy):
 
 class AutoIngestPolicy(BooleanPolicy):
     """Whether `archiver start` also ingests chat_id (orphaned) folders each
-    cycle. Global toggle — drop loose files into output_dir/<chat_id>/… and,
-    when enabled, they're enqueued automatically instead of needing a manual
-    `archiver ingest`."""
+    cycle. Global toggle — drop loose files into output_dir/<chat_id>/… and
+    they're enqueued automatically instead of needing a manual `archiver
+    ingest`. Default ON: dropping a file in a chat_id folder should Just Work.
+    Set auto_ingest_orphaned=false in config.toml to require the manual step."""
     KEY     = "auto_ingest_orphaned"
-    DEFAULT = False
+    DEFAULT = True
 
     def enabled(self) -> bool:
         """Global-scope read (no platform/user dimension for this toggle)."""
