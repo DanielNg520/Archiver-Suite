@@ -37,6 +37,14 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
+# A liveness check runs inside the recorder's poll loop. It MUST fail fast,
+# never hang: a stalled TikTok request with no timeout freezes the whole loop
+# (the "recorder stops after running through the list" symptom — it's actually
+# blocked on one user's network call, not stopped). Bound every network await
+# so a hung check just reads as "not live" and polling continues.
+_CHECK_TIMEOUT_S = 30.0
+_CLOSE_TIMEOUT_S = 10.0
+
 
 class TikTokLivePlatform:
     """Satisfies the LivePlatform Protocol structurally (no inheritance)."""
@@ -110,7 +118,9 @@ class TikTokLivePlatform:
     async def _is_live_async(self, uid: str) -> bool:
         client = await self._make_client(uid)
         try:
-            live = await client.is_live()
+            # Bounded: a hung check times out (→ caught by is_live → "not live")
+            # instead of stalling the poll loop forever.
+            live = await asyncio.wait_for(client.is_live(), _CHECK_TIMEOUT_S)
             if live:
                 rid = getattr(client, "room_id", None)
                 if rid:
@@ -130,7 +140,8 @@ class TikTokLivePlatform:
             # client instance) — hence the KeyError('room_id') in the logs.
             # Query by unique_id instead: it hits the info_by_user/ endpoint,
             # needs no room_id, and returns the same payload shape.
-            info = await client.web.fetch_room_info(unique_id=uid)
+            info = await asyncio.wait_for(
+                client.web.fetch_room_info(unique_id=uid), _CHECK_TIMEOUT_S)
             url = _extract_hls_url(info)
             if not url:
                 raise RuntimeError(
@@ -149,12 +160,12 @@ class TikTokLivePlatform:
         this close the sessions leak file descriptors and connections; after
         enough polls (accelerated by the per-recording HANDOFF re-scan)
         is_live() starts failing, is caught as 'not live', and the recorder
-        appears to stop listening. Never raises — a close failure must not
-        kill the poll loop."""
+        appears to stop listening. Bounded + never raises — a slow or failing
+        close must not hang or kill the poll loop."""
         try:
-            await client.close()
+            await asyncio.wait_for(client.close(), _CLOSE_TIMEOUT_S)
         except Exception as e:  # noqa: BLE001 — best-effort cleanup
-            log.debug("tiktok: client close failed (ignored): %s", e)
+            log.debug("tiktok: client close failed/timed out (ignored): %s", e)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
