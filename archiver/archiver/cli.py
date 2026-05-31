@@ -193,13 +193,22 @@ def build_parser() -> argparse.ArgumentParser:
     s_reset = sub.add_parser("reset", help="Reset operations")
     reset_sub = s_reset.add_subparsers(dest="reset_cmd", required=True)
 
+    # --platform is free-form (NOT restricted to built-in platforms) so these
+    # also scope to source='orphaned' (platform='orphaned', user=<chat_id>) and
+    # local platforms. e.g. `reset uploads --platform orphaned --user -100123`.
     rf = reset_sub.add_parser("failed", help="Re-queue failed uploads")
-    rf.add_argument("--platform", choices=PLATFORM_CHOICES)
-    rf.add_argument("--user", metavar="USERNAME")
+    rf.add_argument("--platform", metavar="PLATFORM",
+                    help="x|tiktok|instagram, 'orphaned' (chat_id folders), or a "
+                         "local-platform name")
+    rf.add_argument("--user", metavar="USERNAME",
+                    help="username, or the chat_id for orphaned rows")
 
     ru = reset_sub.add_parser("uploads", help="Re-queue ALL uploads (no re-download)")
-    ru.add_argument("--platform", choices=PLATFORM_CHOICES)
-    ru.add_argument("--user", metavar="USERNAME")
+    ru.add_argument("--platform", metavar="PLATFORM",
+                    help="x|tiktok|instagram, 'orphaned' (chat_id folders), or a "
+                         "local-platform name")
+    ru.add_argument("--user", metavar="USERNAME",
+                    help="username, or the chat_id for orphaned rows")
 
     ruser = reset_sub.add_parser("user", help="Full wipe: re-download + re-upload")
     ruser.add_argument("--platform", choices=PLATFORM_CHOICES, required=True)
