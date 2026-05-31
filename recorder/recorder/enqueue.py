@@ -8,21 +8,26 @@ here anymore. Writing the item row IS the enqueue — the dispatcher claims
 it from the same `items` table on its next poll. The recorder no longer
 needs to know the dispatcher's schema; `core` owns it.
 
-source='recorder', priority=20 (the archiver enqueues at 10 and therefore
-drains first — a finished recording is less time-sensitive than a VOD
-backlog, since it's already safely captured to disk).
+source='recorder'. Priority defaults to 5 so recordings drain BEFORE the
+archiver's VOD backlog (archiver enqueues at 10; the dispatcher claims
+lowest-priority-number first). Recordings are also exempt from the platform
+min-batch gate, so each finished stream uploads immediately as a single file.
+Override with $RECORDER_UPLOAD_PRIORITY (lower = sooner).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from core import ItemStore
 
 log = logging.getLogger(__name__)
 
-RECORDER_PRIORITY = 20
+# Lower number drains first. Default 5 = ahead of archiver's 10. Env-tunable
+# so you can re-order without a code change (e.g. set to 25 to deprioritize).
+RECORDER_PRIORITY = int(os.environ.get("RECORDER_UPLOAD_PRIORITY", "5"))
 
 
 def _recorder_identifier(file_path: str) -> str:
