@@ -44,7 +44,7 @@ from . import identity, stability
 from .dedup import _pick_winner
 from .files import cleanup_sidecars
 from .hashing import full_hash
-from .store import ItemStore
+from .stores import ProducerStore
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class IngestResult:
 
 
 def register_file(
-    store:    ItemStore,
+    store:    ProducerStore,
     path:     Path,
     *,
     source:    str,
@@ -128,16 +128,13 @@ def register_file(
         # this identity between our checks and the insert. Treat as known.
         return IngestResult(IngestOutcome.ALREADY_KNOWN, content_hash=digest)
 
-    row = store.conn.execute(
-        "SELECT id FROM items WHERE file_path=?", (str(path),),
-    ).fetchone()
     return IngestResult(IngestOutcome.INSERTED,
-                        item_id=row["id"] if row else None,
+                        item_id=store.id_of(str(path)),
                         content_hash=digest)
 
 
 def _collapse(
-    store:  ItemStore,
+    store:  ProducerStore,
     incoming: Path,
     twin:   "object",   # core.models.Item; avoid import cycle in annotation
     digest: str,

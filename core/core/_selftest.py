@@ -174,6 +174,56 @@ def main() -> int:
     assert s.conn.execute("SELECT COUNT(*) c FROM items WHERE status='failed'").fetchone()["c"] == 0
     print(OK, "reset_failed → pending")
 
+    # ── Guarded transitions ──────────────────────────────────────────
+    # A lifecycle write from a disallowed state is a no-op (the WHERE-clause
+    # guard matches 0 rows), so a terminal row can never be silently rewritten
+    # by a stray call — the gap the state-machine-as-comment used to leave open.
+    s.add_item(source="archiver", platform="x", username="zed",
+               identifier="z1", file_path="/m/z1.mp4")
+    zid = s.id_of("/m/z1.mp4")
+    s.mark_sent(zid)                                   # pending → (guard) no-op
+    assert s.get(zid).status == "pending", s.get(zid).status
+    s.conn.execute("UPDATE items SET status='sent' WHERE id=?", (zid,))
+    s.conn.commit()
+    st = s.mark_failed(zid, error="late", max_retries=0)  # sent → no-op
+    assert st == "sent" and s.get(zid).status == "sent"
+    print(OK, "guarded transition: disallowed write is a no-op")
+
+    # ── Unit of Work (batch) ─────────────────────────────────────────
+    # A batch commits its inserts as a group; an exception rolls the in-flight
+    # (un-flushed) inserts back.
+    with s.batch():
+        s.add_item(source="archiver", platform="x", username="bat",
+                   identifier="b1", file_path="/m/b1.mp4")
+        s.add_item(source="archiver", platform="x", username="bat",
+                   identifier="b2", file_path="/m/b2.mp4")
+    assert s.id_of("/m/b1.mp4") and s.id_of("/m/b2.mp4")
+    try:
+        with s.batch():
+            s.add_item(source="archiver", platform="x", username="bat",
+                       identifier="b3", file_path="/m/b3.mp4")
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert s.id_of("/m/b3.mp4") is None, "rollback should drop the in-flight insert"
+    print(OK, "batch commits as a group and rolls back on error")
+
+    # Nested batch folds into the outer one: the inner must not commit on
+    # entry/exit, so an outer rollback still discards BOTH levels' writes.
+    try:
+        with s.batch():
+            s.add_item(source="archiver", platform="x", username="bat",
+                       identifier="n1", file_path="/m/n1.mp4")
+            with s.batch():
+                s.add_item(source="archiver", platform="x", username="bat",
+                           identifier="n2", file_path="/m/n2.mp4")
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert s.id_of("/m/n1.mp4") is None and s.id_of("/m/n2.mp4") is None, \
+        "nested batch must roll back both levels"
+    print(OK, "nested batch folds into outer; rollback discards both levels")
+
     # reset_user wipes rows + checkpoint.
     before = s.stats("x", "alice")["total"]
     deleted = s.reset_user("x", "alice")

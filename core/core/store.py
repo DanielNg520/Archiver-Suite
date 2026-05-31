@@ -47,6 +47,27 @@ class ClaimContentionError(RuntimeError):
         super().__init__(
             f"claim exhausted after {retries} retries under contention"
         )
+
+
+class IllegalTransition(RuntimeError):
+    """A lifecycle write was attempted from a status the state machine
+    doesn't allow it from (see core.models and _ALLOWED)."""
+
+
+# The status state machine as data, not prose. This is the executable form of
+# the diagram in core.models: the set of states a row may legally MOVE TO from
+# each current state via the automated lifecycle. 'sent'/'failed' are terminal
+# — they have no automated successor and are left only by an explicit admin
+# reset (reset_*/retry), which is deliberately NOT modelled here. Lifecycle
+# writers pass the allowed predecessor set as a SQL guard, so an out-of-state
+# row is never silently rewritten.
+_ALLOWED: dict[str, frozenset[str]] = {
+    "pending": frozenset({"sending"}),
+    "sending": frozenset({"sent", "failed", "pending"}),
+    "sent":    frozenset(),
+    "failed":  frozenset(),
+}
+
 _ERROR_CAP = 1000
 
 
@@ -77,12 +98,26 @@ class ItemStore:
     def __init__(self, conn: sqlite3.Connection | None = None,
                  *, db_path: str | None = None):
         self.conn = conn if conn is not None else schema.connect(db_path)
+        # Unit-of-Work state. _batch_depth>0 means an open batch() owns the
+        # transaction, so the autocommit methods defer their commit to it.
+        self._batch_depth = 0
+        self._batch_ops = 0
+        self._batch_flush_every = 0
 
     @classmethod
     def open(cls, db_path: str | None = None) -> "ItemStore":
         return cls(schema.connect(db_path))
 
     def close(self) -> None:
+        # PRAGMA optimize before closing a long-lived connection is SQLite's
+        # recommended discipline: it refreshes the stat tables the query
+        # planner uses (e.g. the partial pending/hash indexes), so the next
+        # process to open the DB plans against current statistics. Best-effort
+        # — never let housekeeping block a clean shutdown.
+        try:
+            self.conn.execute("PRAGMA optimize")
+        except sqlite3.Error:
+            pass
         self.conn.close()
 
     def __enter__(self) -> "ItemStore":
@@ -94,7 +129,15 @@ class ItemStore:
     @contextmanager
     def _immediate(self) -> Iterator[sqlite3.Cursor]:
         """BEGIN IMMEDIATE so the write lock is taken up front, making the
-        read-then-write inside a claim atomic against other writers."""
+        read-then-write inside a claim atomic against other writers.
+
+        Inside an open batch() the surrounding Unit-of-Work already owns the
+        transaction, so we neither BEGIN nor commit here — the write simply
+        joins the batch and is flushed with it. (Producers don't call claim
+        mid-batch; this is just so any nested write stays correct.)"""
+        if self._batch_depth:
+            yield self.conn.cursor()
+            return
         cur = self.conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
@@ -103,6 +146,83 @@ class ItemStore:
         except Exception:
             self.conn.rollback()
             raise
+
+    def _commit(self) -> None:
+        """Commit one autocommit-style write — UNLESS a batch() is open, in
+        which case the write is folded into the batch transaction and flushed
+        either every flush_every ops (to keep the cross-process write lock
+        short) or when the batch closes."""
+        if not self._batch_depth:
+            self.conn.commit()
+            return
+        self._batch_ops += 1
+        if self._batch_flush_every and self._batch_ops >= self._batch_flush_every:
+            self.conn.commit()
+            self._batch_ops = 0
+
+    @contextmanager
+    def batch(self, *, flush_every: int = 500) -> "Iterator[ItemStore]":
+        """Unit of Work: fold many small writes into few transactions.
+
+        Bulk producers (reconcile, bootstrap, orphaned ingest) call add_item
+        hundreds–thousands of times; one commit each is one fsync each. Under
+        a batch() those commits are deferred and flushed in groups of
+        flush_every, turning N transactions into ~N/flush_every. flush_every
+        is bounded ON PURPOSE: a single giant transaction would hold the
+        write lock for the whole scan and stall the dispatcher's claim; periodic
+        flushes keep each lock window short while still amortizing the syncs.
+
+        Re-entrant: only the outermost batch begins/commits. A nested batch()
+        folds into the outer one — it must NOT commit on entry/exit, or it would
+        prematurely flush (and thereby make un-rollback-able) the outer batch's
+        in-flight writes. On any exception the in-flight (un-flushed) writes roll
+        back; already-flushed groups are durable — the same resumable semantics
+        the backfill relies on."""
+        outer = self._batch_depth == 0
+        if outer:
+            self.conn.commit()             # outer only: start from a clean slate
+            self._batch_flush_every = max(1, flush_every)
+            self._batch_ops = 0
+        self._batch_depth += 1
+        try:
+            yield self
+            if outer:
+                self.conn.commit()
+                # A bulk batch can append a lot to the WAL; fold it back into
+                # the main DB now so the file doesn't stay bloated between the
+                # default auto-checkpoints. PASSIVE never blocks — it moves
+                # whatever frames it can and silently does nothing if a reader
+                # (e.g. ops) is mid-scan. Best-effort housekeeping only.
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except sqlite3.Error:
+                    pass
+        except Exception:
+            if outer:
+                self.conn.rollback()
+            raise
+        finally:
+            self._batch_depth -= 1
+            if outer:
+                self._batch_flush_every = 0
+                self._batch_ops = 0
+
+    def _guarded_set(self, cur, item_id: int, *, to: str,
+                     allowed_from: "frozenset[str] | set[str]",
+                     set_sql: str = "", params: tuple = ()) -> int:
+        """Apply a lifecycle status write guarded by the legal predecessor
+        set. The `AND status IN (...)` clause is what actually enforces the
+        state machine: a row not in `allowed_from` matches 0 rows and is left
+        untouched. Returns the affected row count so callers can detect (and
+        log) an unexpected out-of-state row. `set_sql`/`params` carry any extra
+        columns to write alongside status."""
+        marks = ",".join("?" * len(allowed_from))
+        cur.execute(
+            f"UPDATE items SET status=?{set_sql} "
+            f"WHERE id=? AND status IN ({marks})",
+            (to, *params, item_id, *allowed_from),
+        )
+        return cur.rowcount
 
     # ── Producer side (archiver / recorder) ───────────────────────────────
 
@@ -149,7 +269,7 @@ class ItemStore:
              upload_date, file_size_bytes, title, now_iso(),
              priority, caption, content_hash, chat_id, group_key),
         )
-        self.conn.commit()
+        self._commit()
         return cur.rowcount > 0
 
     def seen(self, platform: str, identifier: str) -> bool:
@@ -162,6 +282,15 @@ class ItemStore:
         return self.conn.execute(
             "SELECT 1 FROM items WHERE file_path=?", (file_path,),
         ).fetchone() is not None
+
+    def id_of(self, file_path: str) -> int | None:
+        """Row id for a path, or None. Lets a producer learn the id of the row
+        it just inserted without reaching into the connection directly (so the
+        ingest primitive can depend on the narrow ProducerStore role)."""
+        r = self.conn.execute(
+            "SELECT id FROM items WHERE file_path=?", (file_path,),
+        ).fetchone()
+        return r["id"] if r else None
 
     def find_by_content_hash(self, content_hash: str) -> Item | None:
         """First existing row sharing these exact bytes, or None. Drives
@@ -356,14 +485,16 @@ class ItemStore:
         return []
 
     def mark_sent(self, item_id: int, *, tg_message_id: int | None = None) -> None:
+        """sending → sent. Guarded on 'sending': a row that isn't in flight
+        (already terminal, or reset out from under us) is never overwritten."""
         with self._immediate() as cur:
-            cur.execute(
-                """UPDATE items
-                      SET status='sent', sent_at=?, last_error=NULL,
-                          tg_message_id=?
-                    WHERE id=?""",
-                (now_iso(), tg_message_id, item_id),
+            n = self._guarded_set(
+                cur, item_id, to="sent", allowed_from={"sending"},
+                set_sql=", sent_at=?, last_error=NULL, tg_message_id=?",
+                params=(now_iso(), tg_message_id),
             )
+        if n == 0:
+            log.warning("mark_sent: id=%d not in 'sending' — no-op", item_id)
 
     def sent_twin(self, content_hash: str | None, exclude_id: int) -> Item | None:
         """A different row with the SAME bytes already delivered, or None.
@@ -385,25 +516,29 @@ class ItemStore:
         (delivered by its twin) so the dispatcher won't re-send. The reason is
         kept in last_error for auditability; tg_message_id stays NULL (nothing
         was actually sent). The dispatcher deletes the redundant on-disk copy
-        unconditionally after calling this."""
+        unconditionally after calling this. Guarded on 'sending' (the row was
+        just claimed) so a dedup verdict can't resurrect a terminal row."""
         with self._immediate() as cur:
-            cur.execute(
-                """UPDATE items
-                      SET status='sent', sent_at=?, claimed_at=NULL,
-                          last_error=?
-                    WHERE id=?""",
-                (now_iso(), f"deduped: bytes already sent by id={twin_id}",
-                 item_id),
+            n = self._guarded_set(
+                cur, item_id, to="sent", allowed_from={"sending"},
+                set_sql=", sent_at=?, claimed_at=NULL, last_error=?",
+                params=(now_iso(),
+                        f"deduped: bytes already sent by id={twin_id}"),
             )
+        if n == 0:
+            log.warning("mark_deduplicated: id=%d not in 'sending' — no-op",
+                        item_id)
 
     def mark_failed(self, item_id: int, *, error: str, max_retries: int) -> str:
         """Record a failed attempt. attempts was already incremented at
         claim, so attempts>=max_retries means we've used the budget →
         'failed' (terminal). Otherwise → 'pending' for another go.
-        Returns the resulting status."""
+        Returns the resulting status. Guarded on 'sending' (the only state a
+        send outcome can legally arrive from) — a stray failure for an already
+        terminal/reset row is logged and ignored, never written through."""
         with self._immediate() as cur:
             r = cur.execute(
-                "SELECT attempts FROM items WHERE id=?", (item_id,),
+                "SELECT attempts, status FROM items WHERE id=?", (item_id,),
             ).fetchone()
             if r is None:
                 log.warning("mark_failed: id=%d not found", item_id)
@@ -411,26 +546,31 @@ class ItemStore:
             new_status = (Status.FAILED.value
                           if r["attempts"] >= max_retries
                           else Status.PENDING.value)
-            cur.execute(
-                """UPDATE items
-                      SET status=?, last_error=?, claimed_at=NULL
-                    WHERE id=?""",
-                (new_status, (error or "")[:_ERROR_CAP], item_id),
+            n = self._guarded_set(
+                cur, item_id, to=new_status, allowed_from={"sending"},
+                set_sql=", last_error=?, claimed_at=NULL",
+                params=((error or "")[:_ERROR_CAP],),
             )
+            if n == 0:
+                log.warning("mark_failed: id=%d not in 'sending' (was %s) — no-op",
+                            item_id, r["status"])
+                return r["status"]
             return new_status
 
     def requeue(self, item_id: int, *, reason: str | None = None) -> None:
         """sending → pending WITHOUT burning a retry (FloodWait: we waited
         the server-requested time; the request itself wasn't a failure).
-        Decrement attempts to undo the claim's increment."""
+        Decrement attempts to undo the claim's increment. Guarded on
+        'sending': only an in-flight send can be requeued."""
         with self._immediate() as cur:
-            cur.execute(
-                """UPDATE items
-                      SET status='pending', claimed_at=NULL,
-                          attempts=MAX(0, attempts-1), last_error=?
-                    WHERE id=?""",
-                (reason, item_id),
+            n = self._guarded_set(
+                cur, item_id, to="pending", allowed_from={"sending"},
+                set_sql=", claimed_at=NULL, attempts=MAX(0, attempts-1), "
+                        "last_error=?",
+                params=(reason,),
             )
+        if n == 0:
+            log.warning("requeue: id=%d not in 'sending' — no-op", item_id)
 
     def reset_stuck_sending(self, older_than_minutes: int = 10) -> int:
         """Startup watchdog: revert items stuck in 'sending' (a previous
@@ -569,7 +709,7 @@ class ItemStore:
                    sent_at=NULL, last_error=NULL WHERE id=?""",
             (item_id,),
         )
-        self.conn.commit()
+        self._commit()
         return cur.rowcount > 0
 
     def cancel(self, item_id: int) -> bool:
@@ -579,7 +719,7 @@ class ItemStore:
                    WHERE id=? AND status IN ('pending','sending')""",
             (item_id,),
         )
-        self.conn.commit()
+        self._commit()
         return cur.rowcount > 0
 
     # ── Reset operations (one write each — no second DB to also reset) ─────
@@ -607,7 +747,7 @@ class ItemStore:
         if username:
             sql += " AND username=?"; params.append(username)
         cur = self.conn.execute(sql, params)
-        self.conn.commit()
+        self._commit()
         return cur.rowcount
 
     def reset_user(self, platform: str, username: str) -> int:
@@ -622,7 +762,7 @@ class ItemStore:
             "DELETE FROM checkpoints WHERE platform=? AND username=?",
             (platform, username),
         )
-        self.conn.commit()
+        self._commit()
         return cur.rowcount
 
     # ── Checkpoints ────────────────────────────────────────────────────────
@@ -635,7 +775,7 @@ class ItemStore:
                DO UPDATE SET last_run_utc=excluded.last_run_utc""",
             (platform, username, when.strftime("%Y-%m-%dT%H:%M:%SZ")),
         )
-        self.conn.commit()
+        self._commit()
 
     def set_date_floor(self, platform: str, username: str,
                        floor: str | None) -> None:
@@ -646,7 +786,7 @@ class ItemStore:
                DO UPDATE SET date_floor=excluded.date_floor""",
             (platform, username, floor),
         )
-        self.conn.commit()
+        self._commit()
 
     def get_checkpoint(self, platform: str, username: str) -> sqlite3.Row | None:
         return self.conn.execute(
@@ -673,7 +813,7 @@ class ItemStore:
             "DELETE FROM checkpoints WHERE platform=? AND username=?",
             (platform, username),
         )
-        self.conn.commit()
+        self._commit()
 
     # ── Circuit breaker ──────────────────────────────────────────────────
 
@@ -701,7 +841,7 @@ class ItemStore:
                  SET tripped_until_utc=excluded.tripped_until_utc""",
             (platform, until.strftime("%Y-%m-%dT%H:%M:%SZ")),
         )
-        self.conn.commit()
+        self._commit()
 
     def reset_circuit(self, platform: str) -> None:
         self.conn.execute(
@@ -710,7 +850,7 @@ class ItemStore:
                 WHERE platform=?""",
             (platform,),
         )
-        self.conn.commit()
+        self._commit()
 
     def circuit_state(self, platform: str) -> sqlite3.Row | None:
         return self.conn.execute(
@@ -744,4 +884,4 @@ class ItemStore:
                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
             (key, value),
         )
-        self.conn.commit()
+        self._commit()

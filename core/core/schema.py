@@ -123,6 +123,21 @@ CREATE TABLE IF NOT EXISTS metadata (
 # header and participates in the transaction.
 SCHEMA_VERSION = 2
 
+
+class SchemaVersionError(RuntimeError):
+    """The DB was written by a NEWER build than this binary understands
+    (its user_version exceeds SCHEMA_VERSION). Fail loud at connect rather
+    than operate blindly on a schema with columns/semantics we don't know —
+    the one real hazard of a multi-binary install where the pieces can be
+    upgraded out of lockstep."""
+
+    def __init__(self, found: int, known: int) -> None:
+        self.found, self.known = found, known
+        super().__init__(
+            f"suite.db schema is v{found} but this build only knows v{known}. "
+            f"Upgrade this component (pipx upgrade) — do not downgrade the DB."
+        )
+
 _MIGRATIONS: list[tuple[int, list[str]]] = [
     (1, [
         # Redesign columns: per-file content hash (global dedup), explicit
@@ -155,6 +170,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
     try:
         current = conn.execute("PRAGMA user_version").fetchone()[0]
+        # Forward-only: a DB newer than this binary is a hard stop. Migrations
+        # never go backward, so silently proceeding would run new-schema rows
+        # through old-schema code. Raise INSIDE the lock, before any write.
+        if current > SCHEMA_VERSION:
+            conn.rollback()
+            raise SchemaVersionError(current, SCHEMA_VERSION)
         for version, statements in _MIGRATIONS:
             if current >= version:
                 continue
@@ -195,6 +216,20 @@ def connect(path: str | os.PathLike | None = None,
     conn.execute("PRAGMA busy_timeout=10000")
     _retry_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"))
     conn.execute("PRAGMA foreign_keys=ON")
+    # Throughput tuning. synchronous=NORMAL is the canonical WAL setting: a
+    # commit no longer fsyncs on every transaction (the default FULL does),
+    # so the many small commits the producers make — one per add_item, per
+    # checkpoint — stop paying a disk-sync each. The only durability cost vs
+    # FULL is that an OS-level crash/power-loss can lose the LAST committed
+    # transaction; it can NEVER corrupt the DB under WAL. Every write here is
+    # reconstructable on the next run (re-download / re-reconcile), so that
+    # trade is right for this workload. temp_store=MEMORY keeps sort/temp
+    # B-trees (large reconcile scans) off disk; cache_size=-65536 gives the
+    # page cache 64 MB; mmap_size maps up to 256 MB for read-heavy scans.
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA cache_size=-65536")
+    conn.execute("PRAGMA mmap_size=268435456")
     if init:
         _retry_locked(lambda: conn.executescript(ITEMS_DDL))
         conn.commit()

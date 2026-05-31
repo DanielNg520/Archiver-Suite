@@ -1,0 +1,91 @@
+"""
+core.stores
+───────────
+Role interfaces over the one ItemStore.
+
+ItemStore is a single concrete class that intentionally holds the WHOLE data
+API (producer inserts, the dispatcher's delivery state machine, checkpoints,
+the circuit breaker, admin resets). That keeps the schema and the state machine
+defined exactly once — which is the design's whole point — but it also means
+every process that imports ItemStore gets every method, including ones it has
+no business calling: nothing structural stopped the archiver from calling
+mark_sent, or the dispatcher from moving a download checkpoint.
+
+These Protocols are the Interface-Segregation fix WITHOUT splitting the class.
+They are structural (PEP 544) views of the same object: ItemStore already
+satisfies all of them, so there is zero runtime change and nothing to wire up.
+A call site that only produces annotates its dependency as ProducerStore; the
+type checker then rejects a stray `store.mark_sent(...)` there. The ownership
+split the README describes stops being a convention and becomes type-enforced
+at the seams that matter:
+
+    register_file / reconcile   depend on ProducerStore   (can't mark_sent)
+    dispatcher.drain_forever    depends on QueueStore      (can't set_date_floor)
+
+Admin CLIs legitimately need the full surface, so they keep using ItemStore
+directly — segregating *them* would be dishonest narrowing, not safety.
+
+Nothing here imports ItemStore; the dependency points the other way (callers
+depend on the narrow Protocol, ItemStore happens to implement it), which is the
+Dependency-Inversion shape these interfaces are for.
+"""
+
+from __future__ import annotations
+
+from contextlib import AbstractContextManager
+from typing import Protocol, runtime_checkable
+
+from .models import Item
+
+
+@runtime_checkable
+class ProducerStore(Protocol):
+    """What a producer (archiver download/reconcile, recorder, orphaned
+    ingest) is allowed to touch: insert pending rows, ask whether bytes/paths
+    are already known, and batch those inserts. No delivery-state methods."""
+
+    def add_item(self, **kwargs) -> bool: ...
+    def seen(self, platform: str, identifier: str) -> bool: ...
+    def has_file_path(self, file_path: str) -> bool: ...
+    def id_of(self, file_path: str) -> int | None: ...
+    def find_by_content_hash(self, content_hash: str) -> Item | None: ...
+    def relink_file(self, item_id: int, new_file_path: str) -> None: ...
+    def max_upload_date(self, platform: str, username: str) -> str | None: ...
+    def batch(self, *, flush_every: int = ...) -> AbstractContextManager["ProducerStore"]: ...
+
+
+@runtime_checkable
+class QueueStore(Protocol):
+    """What the dispatcher is allowed to touch: claim work and drive the
+    delivery state machine. No producer inserts, no download checkpoints —
+    the dispatcher holds zero archiver state."""
+
+    def claim_next(self) -> Item | None: ...
+    def claim_batch(self, max_items: int = ..., **kwargs) -> list[Item]: ...
+    def mark_sent(self, item_id: int, *, tg_message_id: int | None = ...) -> None: ...
+    def mark_failed(self, item_id: int, *, error: str, max_retries: int) -> str: ...
+    def mark_deduplicated(self, item_id: int, *, twin_id: int) -> None: ...
+    def sent_twin(self, content_hash: str | None, exclude_id: int) -> Item | None: ...
+    def requeue(self, item_id: int, *, reason: str | None = ...) -> None: ...
+    def reset_stuck_sending(self, older_than_minutes: int = ...) -> int: ...
+    def get(self, item_id: int) -> Item | None: ...
+    def status_of(self, file_path: str) -> str | None: ...
+
+
+@runtime_checkable
+class AdminStore(Protocol):
+    """What the operator-facing CLIs touch: inspect and forcibly re-drive the
+    queue. Deliberately broad — these are the admin tools, and their whole job
+    is to reach across the lifecycle (retry/cancel/reset). Kept as a named role
+    so the intent ('this is admin override, not normal flow') is explicit."""
+
+    def stats(self, platform: str | None = ..., username: str | None = ...) -> dict: ...
+    def counts_by_status(self) -> dict[str, int]: ...
+    def list_items(self, *, status: str | None = ..., limit: int = ...,
+                   offset: int = ...) -> list[Item]: ...
+    def get(self, item_id: int) -> Item | None: ...
+    def retry(self, item_id: int) -> bool: ...
+    def cancel(self, item_id: int) -> bool: ...
+    def reset_failed(self, platform: str | None, username: str | None) -> int: ...
+    def reset_uploads(self, platform: str | None, username: str | None) -> int: ...
+    def reset_user(self, platform: str, username: str) -> int: ...

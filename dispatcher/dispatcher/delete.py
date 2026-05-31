@@ -23,12 +23,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from core import ItemStore, Status, cleanup_sidecars, DeletePolicy, RecorderDeletePolicy
+from core import QueueStore, Status, cleanup_sidecars, DeletePolicy, RecorderDeletePolicy
 
 log = logging.getLogger(__name__)
 
 
-def maybe_delete(store: ItemStore, item_id: int, *,
+def maybe_delete(store: QueueStore, item_id: int, *,
                  delete_policy: DeletePolicy,
                  recorder_delete_policy: RecorderDeletePolicy) -> None:
     """Gated cleanup. Caller must have already called mark_sent(item_id)."""

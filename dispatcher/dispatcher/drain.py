@@ -24,7 +24,7 @@ import logging
 from pathlib import Path
 
 from core import (
-    ClaimContentionError, ItemStore, Item, DeletePolicy, RecorderDeletePolicy,
+    ClaimContentionError, QueueStore, Item, DeletePolicy, RecorderDeletePolicy,
     BatchPolicy, ORPHANED_SOURCE, subfolder_of, cleanup_sidecars,
 )
 from core.files import media_bucket
@@ -90,7 +90,7 @@ def album_caption_for(batch: list[Item]) -> str:
 
 async def drain_forever(
     config:        DispatcherConfig,
-    store:         ItemStore,
+    store:         QueueStore,
     send_strategy: SendStrategy,
     router:        TelegramRouter,
     delete_policy: DeletePolicy,

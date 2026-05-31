@@ -53,7 +53,7 @@ from core.hashing import full_hash
 _RECORDER_PRIORITY = int(os.environ.get("RECORDER_UPLOAD_PRIORITY", "5"))
 
 if TYPE_CHECKING:
-    from core import ItemStore
+    from core import ProducerStore
     from .platforms import Platform
 
 log = logging.getLogger(__name__)
@@ -101,7 +101,7 @@ class ReconcileReport:
 def reconcile_user(
     platform: "Platform",
     username: str,
-    db: "ItemStore",
+    db: "ProducerStore",
     output_dir: str,
     seed_extractor_archive: bool = True,
 ) -> ReconcileReport:
@@ -132,7 +132,7 @@ def reconcile_user(
 
 def reconcile_platform_root(
     platform: "Platform",
-    db: "ItemStore",
+    db: "ProducerStore",
     output_dir: str,
 ) -> ReconcileReport:
     """
@@ -160,7 +160,7 @@ def reconcile_platform_root(
 
 
 def reconcile_recordings(
-    db: "ItemStore",
+    db: "ProducerStore",
     records_dir: str | Path | None = None,
 ) -> list[ReconcileReport]:
     """
@@ -216,7 +216,7 @@ def _reconcile_dir(
     *,
     platform: "Platform | None",
     username: str,
-    db: "ItemStore",
+    db: "ProducerStore",
     scan_dir: Path,
     recursive: bool,
     seed_extractor_archive: bool,
@@ -234,92 +234,101 @@ def _reconcile_dir(
     new_archive_entries: list[str] = []
 
     files = scan_dir.rglob("*") if recursive else scan_dir.iterdir()
-    for f in sorted(files):
-        if not f.is_file():
-            continue
-        if f.suffix.lower() not in MEDIA_EXTENSIONS:
-            continue
-
-        report.scanned += 1
-
-        path_str = str(f)
-        # Fast path: file already known to DB → skip stability probe + identity.
-        if db.has_file_path(path_str):
-            report.already_known += 1
-            continue
-
-        # Stability probe BEFORE we commit to inserting. Costs at most
-        # ~1.5s per unstable file; near-zero for the common quiescent case.
-        if not stability.is_stable(f):
-            report.skipped_unstable += 1
-            continue
-
-        ident = identity.resolve(f)
-        identifier = identifier_for_path(f) if identifier_for_path else ident.identifier
-
-        try:
-            size = f.stat().st_size
-        except OSError:
-            log.warning("  reconcile: vanished mid-walk: %s", f)
-            continue
-
-        # Content-hash the new file — the move/rename-proof identity. Only NEW
-        # paths reach here (has_file_path fast-path above skipped known ones),
-        # so on a quiescent archive this hashes nothing.
-        digest = full_hash(f)
-
-        # Re-introduction guard: if these exact bytes already belong to an
-        # ALREADY-UPLOADED row (under a different path), this is a copy the user
-        # moved back in. Don't re-enqueue it — delete it from disk. (Same-path
-        # files never get here; the canonical sent file at its own path is
-        # untouched. Twins created before content_hash existed have NULL hashes
-        # and won't match — identity-collision still blocks re-upload, just
-        # without the disk cleanup.)
-        if digest is not None:
-            twin = db.find_by_content_hash(digest)
-            if (twin is not None
-                    and twin.status == "sent"
-                    and twin.file_path != path_str):
-                cleanup_sidecars(path_str)
-                report.deleted_dupes += 1
-                log.info("  reconcile: deleted re-introduced already-uploaded "
-                         "file %s (bytes already sent as id=%d)", f.name, twin.id)
+    # Unit of Work: fold the per-file inserts into batched transactions rather
+    # than one commit (one fsync) per add_item. A first-run reconcile of a
+    # large existing archive — thousands of files — is exactly the case this
+    # turns from O(files) syncs into O(files / flush_every). db.batch() flushes
+    # periodically so the dispatcher's claim never waits on one giant lock.
+    with db.batch():
+        for f in sorted(files):
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in MEDIA_EXTENSIONS:
                 continue
 
-        inserted = db.add_item(
-            source          = source,
-            platform        = report.platform,
-            username        = username,
-            identifier      = identifier,
-            file_path       = path_str,
-            upload_date     = ident.upload_date,
-            file_size_bytes = size,
-            title           = ident.title,
-            caption         = caption_for_path(f) if caption_for_path else None,
-            priority        = priority,
-            content_hash    = digest,
-        )
-        if inserted:
-            report.inserted += 1
-            if ident.is_manual:
-                report.manual_files += 1
-                log.info("  reconcile: + (manual) %s [%s]", f.name, ident.upload_date)
-            else:
-                log.info("  reconcile: + %s [%s]", f.name, ident.upload_date)
-            # Collect archive seed entries (manual files get None back)
-            entry = (
-                identity.archive_entry_for(platform.name, ident)
-                if platform is not None else None
+            report.scanned += 1
+
+            path_str = str(f)
+            # Fast path: file already known to DB → skip stability + identity.
+            if db.has_file_path(path_str):
+                report.already_known += 1
+                continue
+
+            # Stability probe BEFORE we commit to inserting. Costs at most
+            # ~1.5s per unstable file; near-zero for the common quiescent case.
+            if not stability.is_stable(f):
+                report.skipped_unstable += 1
+                continue
+
+            ident = identity.resolve(f)
+            identifier = (identifier_for_path(f) if identifier_for_path
+                          else ident.identifier)
+
+            try:
+                size = f.stat().st_size
+            except OSError:
+                log.warning("  reconcile: vanished mid-walk: %s", f)
+                continue
+
+            # Content-hash the new file — the move/rename-proof identity. Only
+            # NEW paths reach here (has_file_path fast-path skipped known ones),
+            # so on a quiescent archive this hashes nothing.
+            digest = full_hash(f)
+
+            # Re-introduction guard: if these exact bytes already belong to an
+            # ALREADY-UPLOADED row (under a different path), this is a copy the
+            # user moved back in. Don't re-enqueue it — delete it from disk.
+            # (Same-path files never get here; the canonical sent file at its
+            # own path is untouched. Twins created before content_hash existed
+            # have NULL hashes and won't match — identity-collision still blocks
+            # re-upload, just without the disk cleanup.)
+            if digest is not None:
+                twin = db.find_by_content_hash(digest)
+                if (twin is not None
+                        and twin.status == "sent"
+                        and twin.file_path != path_str):
+                    cleanup_sidecars(path_str)
+                    report.deleted_dupes += 1
+                    log.info("  reconcile: deleted re-introduced already-"
+                             "uploaded file %s (bytes already sent as id=%d)",
+                             f.name, twin.id)
+                    continue
+
+            inserted = db.add_item(
+                source          = source,
+                platform        = report.platform,
+                username        = username,
+                identifier      = identifier,
+                file_path       = path_str,
+                upload_date     = ident.upload_date,
+                file_size_bytes = size,
+                title           = ident.title,
+                caption         = caption_for_path(f) if caption_for_path else None,
+                priority        = priority,
+                content_hash    = digest,
             )
-            if entry:
-                new_archive_entries.append(entry)
-        else:
-            # add_item returned False — INSERT OR IGNORE hit a UNIQUE
-            # constraint (same (platform, identifier) or file_path already
-            # present, possibly under a different path). Rare; log + move on.
-            report.already_known += 1
-            log.debug("  reconcile: collision on %s id=%s",
-                      f.name, identifier)
+            if inserted:
+                report.inserted += 1
+                if ident.is_manual:
+                    report.manual_files += 1
+                    log.info("  reconcile: + (manual) %s [%s]",
+                             f.name, ident.upload_date)
+                else:
+                    log.info("  reconcile: + %s [%s]", f.name, ident.upload_date)
+                # Collect archive seed entries (manual files get None back)
+                entry = (
+                    identity.archive_entry_for(platform.name, ident)
+                    if platform is not None else None
+                )
+                if entry:
+                    new_archive_entries.append(entry)
+            else:
+                # add_item returned False — INSERT OR IGNORE hit a UNIQUE
+                # constraint (same (platform, identifier) or file_path already
+                # present, possibly under a different path). Rare; log + move on.
+                report.already_known += 1
+                log.debug("  reconcile: collision on %s id=%s",
+                          f.name, identifier)
 
     # Seed extractor archive — only for entries we actually added this
     # pass (we don't need to keep re-seeding already-known ones).
