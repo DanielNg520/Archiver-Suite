@@ -1,8 +1,10 @@
 """
 recorder.cli
 ────────────
-  recorder start                         foreground
+  recorder start                         foreground (watch the priority list)
   recorder start --daemon                fork; pid file at state_dir/pid
+  recorder record --user <u>             ONE-SHOT: if @u is live, record it
+                                         once and exit (no listening loop)
   recorder stop                          terminate via pid file
   recorder status                        state + queue depth + lock
   recorder config add --user <u>
@@ -55,6 +57,25 @@ def _setup_logging(verbose: bool) -> None:
 
 def _pid_path(config: RecorderConfig) -> Path:
     return Path(config.state_dir).expanduser() / "pid"
+
+
+def _recorder_running(pid_path: Path) -> bool:
+    """True iff the pid file names a live process. Distinguishes a dead/stale
+    pid (ProcessLookupError) from one alive but owned by another user
+    (PermissionError → still running)."""
+    if not pid_path.exists():
+        return False
+    try:
+        pid = int(pid_path.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 # ── start ─────────────────────────────────────────────────────────────────
@@ -121,6 +142,68 @@ def _daemonize(config: RecorderConfig) -> None:
     out = open(log_dir / "recorder.out.log", "a")
     os.dup2(out.fileno(), sys.stdout.fileno())
     os.dup2(out.fileno(), sys.stderr.fileno())
+
+
+# ── record (one-shot manual mode) ──────────────────────────────────────────
+
+def cmd_record(args: argparse.Namespace) -> int:
+    """Manual one-shot: check whether one username is live and, if so, record
+    that stream to the end, then exit. No listening loop, no priority list —
+    just this user, just once.
+
+    Exit codes: 0 recorded, 1 conflict/error, 3 user not live.
+    """
+    config = RecorderConfig.load()
+    username = args.user.lstrip("@")
+
+    # A running recorder owns the TikTok lockfile; a second one would stomp it
+    # (the lock is a soft signal file, not a mutex) and could double-record.
+    # Manual mode is for ad-hoc grabs when the service isn't running.
+    pid_path = _pid_path(config)
+    if _recorder_running(pid_path):
+        log.error("a recorder is already running (pid file %s). Manual record "
+                  "would conflict with its TikTok lock — `recorder stop` first, "
+                  "or add @%s to the list and let the service catch it.",
+                  pid_path, username)
+        return 1
+
+    from .capture import StreamCapture
+    from .enqueue import EnqueueClient
+    from .lock import TikTokLock
+    from .platforms.tiktok import TikTokLivePlatform
+    from .state import StateMachine
+
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(os.getpid()))
+
+    platform = TikTokLivePlatform(config.tiktok_cookies_file, config.state_dir)
+    capture  = StreamCapture(config.output_dir, config.tiktok_cookies_file)
+    enqueue_client = EnqueueClient(config.db_path)
+    lock = TikTokLock(config.lock_path, os.getpid())
+
+    def _enqueue(platform_name, username, file_path, caption):
+        enqueue_client.enqueue(
+            platform=platform_name, username=username,
+            file_path=file_path, caption=caption,
+        )
+
+    machine = StateMachine(config, platform, capture, _enqueue, lock)
+
+    def _on_signal(signum, _frame):
+        log.info("cli: signal %s — requesting stop", signum)
+        machine.request_stop()
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    try:
+        recorded = machine.record_once(username)
+    finally:
+        pid_path.unlink(missing_ok=True)
+    if recorded:
+        return 0
+    print(f"@{username} is not live — nothing recorded")
+    return 3
 
 
 # ── stop ──────────────────────────────────────────────────────────────────
@@ -264,6 +347,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p_start = sub.add_parser("start", help="run the recorder")
     p_start.add_argument("--daemon", action="store_true",
                          help="fork into background (pid file in state_dir)")
+    p_record = sub.add_parser(
+        "record",
+        help="one-shot: record a single user's live now, then exit (no loop)")
+    p_record.add_argument("--user", required=True,
+                          help="username to check and record once")
     sub.add_parser("stop", help="stop a running recorder via pid file")
     sub.add_parser("status", help="show state + lock + user list")
     core_cli.add_stats_parser(sub)   # shared `stats` noun (DB counts)
@@ -283,6 +371,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 _DISPATCH = {
     ("start", None):              cmd_start,
+    ("record", None):             cmd_record,
     ("stop", None):               cmd_stop,
     ("status", None):             cmd_status,
     ("stats", None):              cmd_stats,

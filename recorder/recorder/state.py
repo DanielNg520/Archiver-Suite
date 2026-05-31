@@ -124,6 +124,52 @@ class StateMachine:
         log.info("recorder: stop requested")
         self._stop.set()
 
+    def record_once(self, username: str) -> bool:
+        """Manual one-shot: if @username is live, record until the stream ends
+        (or a stop is requested), enqueue the file(s), and return — no LISTENING
+        loop, no priority re-scan, no uploader thread.
+
+        Reuses the same record + enqueue mechanics as the loop so behavior is
+        identical to a live capture; only the scheduling differs. Returns True
+        if a recording was produced, False if the user wasn't live (or the
+        stream couldn't be started). A Ctrl-C mid-recording still enqueues the
+        partial file (yt-dlp's --no-part keeps it usable)."""
+        username = username.lstrip("@")
+        if self._stop.is_set():
+            return False
+        try:
+            live = self.platform.is_live(username)
+        except Exception as e:
+            log.error("record-once: is_live(@%s) failed: %s", username, e)
+            return False
+        if not live:
+            log.info("record-once: @%s is not live right now — nothing to record",
+                     username)
+            return False
+
+        log.info("record-once: @%s is LIVE — recording until the stream ends "
+                 "(Ctrl-C to stop early)", username)
+        self._start_recording(username)
+        if self.state != RecorderState.RECORDING:
+            return False                    # stream_url/capture failed (logged)
+
+        # Blocks until the stream ends or stop fires; releases the lock and
+        # queues the finished file(s) onto _upload_q (same as the loop path).
+        self._wait_for_recording_done()
+
+        # No uploader thread in one-shot mode — drain synchronously so the
+        # process can exit once the file is registered.
+        drained = 0
+        while not self._upload_q.empty():
+            try:
+                self._enqueue_job(self._upload_q.get_nowait())
+                drained += 1
+            except queue.Empty:
+                break
+        log.info("record-once: done — %d file(s) enqueued for upload", drained)
+        self.state = RecorderState.STOPPED
+        return True
+
     # ── tick dispatch ─────────────────────────────────────────────────────
 
     def _tick(self) -> None:
@@ -216,13 +262,19 @@ class StateMachine:
                 job = self._upload_q.get(timeout=1.0)
             except queue.Empty:
                 continue
-            try:
-                caption = (f"@{job.username} · tiktok · live · "
-                           f"{job.file_path.stem}")
-                self.enqueue("tiktok", job.username, str(job.file_path), caption)
-            except Exception as e:
-                # Keep the file on disk; ops can re-enqueue via the
-                # dispatcher CLI. Losing the recording is the only
-                # unacceptable outcome, and we avoid it.
-                log.error("recorder: enqueue failed for %s: %s — file kept "
-                          "on disk for manual recovery", job.file_path, e)
+            self._enqueue_job(job)
+
+    def _enqueue_job(self, job: _Job) -> None:
+        """Register one finished recording in the shared queue. Shared by the
+        daemon uploader thread and the one-shot record_once drain so both build
+        the caption and handle failures identically."""
+        try:
+            caption = (f"@{job.username} · tiktok · live · "
+                       f"{job.file_path.stem}")
+            self.enqueue("tiktok", job.username, str(job.file_path), caption)
+        except Exception as e:
+            # Keep the file on disk; ops can re-enqueue via the dispatcher
+            # CLI. Losing the recording is the only unacceptable outcome,
+            # and we avoid it.
+            log.error("recorder: enqueue failed for %s: %s — file kept "
+                      "on disk for manual recovery", job.file_path, e)
