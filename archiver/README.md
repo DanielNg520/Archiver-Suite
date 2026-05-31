@@ -163,11 +163,30 @@ the defaults; add subcategories only if you accept the tradeoffs.
 ## Daily commands
 
 ```bash
-archiver run                                # everything, all platforms
+archiver start                              # run continuously (alias of `loop`)
+archiver start --once                       # single cycle (alias of `run`)
+archiver run                                # everything, all platforms (legacy verb)
 archiver run --platform instagram           # one platform
 archiver run --platform x --user alice      # one user
 
 archiver bootstrap                          # one-shot import (existing archive)
+archiver backfill                           # one-time: content-hash existing rows
+
+# Local platforms (hand-managed folders, no download)
+archiver local add mylibrary                # then drop files in output_dir/mylibrary/<user>/
+archiver local list ; archiver local remove mylibrary
+
+# Per-platform download toggle (off = reconcile/upload only, no cookies)
+archiver download set --platform instagram --enabled false
+archiver download                           # show resolved on/off per platform
+
+# chat_id (orphaned) folders → loose files to a specific chat
+archiver ingest                             # scan output_dir/<chat_id>/ folders
+archiver ingest --path "/any/dir" --chat -100123   # ingest an arbitrary folder
+archiver auto-ingest set --enabled true     # auto-ingest every cycle (default off)
+
+# Shared queue noun (same as dispatcher)
+archiver queue list --status failed ; archiver queue retry <id>
 
 archiver stats                              # totals + per-platform date_floor
 archiver stats --platform tiktok --user u

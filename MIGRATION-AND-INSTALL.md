@@ -37,10 +37,15 @@ shape for a shared contract: one definition, one version, zero drift.
 
 ## 2. Install (from the repo root)
 
-Install order **no longer matters** — `core` creates the schema
-idempotently the first time any process connects (`CREATE TABLE IF NOT
-EXISTS`). The old "install the dispatcher first because it owns the
-schema" rule is obsolete.
+> **Already installed and just want the current feature set?** This doc is the
+> *first* install + two-DB migration. To upgrade an existing working install,
+> see **UPGRADE.md**.
+
+Install order **no longer matters** — `core` creates the schema idempotently the
+first time any process connects, then applies any pending **versioned
+migrations** (`PRAGMA user_version`) in one transaction. Schema changes in later
+versions apply automatically on first open (additive, concurrency-safe). Current
+version: `core.schema.SCHEMA_VERSION`.
 
 ```
 pipx install ./dispatcher --python 3.13

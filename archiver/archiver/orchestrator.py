@@ -33,7 +33,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import Config
-from .dedup import dedup_user
 from .lock_reader import tiktok_lock_held
 from .platforms import Platform, AuthError, HealthStatus
 from .reconcile import (
@@ -41,8 +40,8 @@ from .reconcile import (
 )
 
 from core import (
-    ItemStore, DeletePolicy, DedupPolicy, cleanup_sidecars,
-    validate_overrides as _validate_policies,
+    ItemStore, DeletePolicy, DedupPolicy, DownloadPolicy, dedup_user,
+    cleanup_sidecars, validate_overrides as _validate_policies,
 )
 
 log = logging.getLogger(__name__)
@@ -60,6 +59,11 @@ def build_platforms(config: Config) -> list[Platform]:
     if config.instagram:
         from .platforms import InstagramPlatform
         platforms.append(InstagramPlatform(config))
+    # User-managed folders treated as platforms (no download).
+    if config.local_platforms:
+        from .platforms import LocalPlatform
+        for name in config.local_platforms:
+            platforms.append(LocalPlatform(config, name))
     return platforms
 
 
@@ -76,8 +80,9 @@ class Archiver:
         self.db     = db
         # Policies share the single PolicyStore on config. Adding another
         # policy in the future is one class + one line here.
-        self.delete_policy = DeletePolicy(config.policy_store)
-        self.dedup_policy  = DedupPolicy(config.policy_store)
+        self.delete_policy   = DeletePolicy(config.policy_store)
+        self.dedup_policy    = DedupPolicy(config.policy_store)
+        self.download_policy = DownloadPolicy(config.policy_store)
         # Per-platform tripped flag for THIS run. Resets each new Archiver.
         self._tripped: set[str] = set()
 
@@ -94,6 +99,9 @@ class Archiver:
             }
 
         platforms = build_platforms(self.config)
+        # Full platform-name set (before any --platform filter) so the orphaned
+        # ingest pass knows which top-level dirs are platforms vs chat_id folders.
+        known_platform_names = {p.name for p in platforms}
         if platform_filter:
             platforms = [p for p in platforms if p.name == platform_filter]
             if not platforms:
@@ -113,8 +121,37 @@ class Archiver:
         # enqueue handoff and no reconcile bridge — one table, one truth.
         await self._run_platforms(platforms, user_filter, run_time, results)
         if self.config.reconcile_after_run:
+            # Post-run sweep reconciles+uploads EVERY enabled platform
+            # (download-disabled ones included), so they're covered here.
             await self._reconcile_after_run(platforms, user_filter)
+        else:
+            # No global sweep — but download-disabled platforms must STILL be
+            # reconciled+uploaded (that's their whole point), so do just those.
+            for platform in platforms:
+                if not self.download_policy.enabled_for(platform.name):
+                    await self._reconcile_one_platform(platform, user_filter)
+        self._maybe_ingest_orphaned(known_platform_names)
         return results
+
+    def _maybe_ingest_orphaned(self, known_platform_names: set[str]) -> None:
+        """When the auto_ingest_orphaned policy is on, scan output_dir's
+        chat_id-named folders and enqueue loose files — the automated form of
+        `archiver ingest`. Off by default; toggle via `archiver auto-ingest`."""
+        from core import AutoIngestPolicy, ingest_chat_id_dirs
+
+        if not AutoIngestPolicy(self.config.policy_store).enabled():
+            return
+        reports = ingest_chat_id_dirs(
+            self.db, self.config.output_dir,
+            known_platforms=known_platform_names,
+        )
+        total = sum(r.inserted for r in reports)
+        if total:
+            log.info("auto-ingest: enqueued %d loose file(s) from chat_id folders",
+                     total)
+        for r in reports:
+            if not r.skipped_dir and (r.inserted or r.deduped):
+                log.info("  %s", r)
 
     async def _run_platforms(
         self,
@@ -125,6 +162,14 @@ class Archiver:
     ) -> None:
         """The per-platform / per-user loop."""
         for platform in platforms:
+            # Download disabled → skip fetch AND the auth/cookies health-check
+            # entirely. The folder is still reconciled + uploaded (always, in
+            # run() above), just never downloaded — for hand-managed platforms
+            # like a manual Instagram backup.
+            if not self.download_policy.enabled_for(platform.name):
+                log.info("[%s] download disabled — reconcile/upload only",
+                         platform.name)
+                continue
             if not await self._ensure_platform_healthy(platform):
                 self._tripped.add(platform.name)
                 log.error("Skipping platform %s — health check failed", platform.name)
@@ -198,35 +243,11 @@ class Archiver:
         total_bytes_freed = 0
 
         for platform in platforms:
-            if not user_filter:
-                root_report = await asyncio.to_thread(
-                    reconcile_platform_root,
-                    platform, self.db, self.config.output_dir,
-                )
-                if root_report.scanned or root_report.inserted:
-                    log.info("post-run reconcile: %s", root_report)
-                total_inserted += root_report.inserted
-
-            users = self._reconcile_users_for_platform(platform, user_filter)
-            for username in users:
-                user_dir = Path(self.config.output_dir) / platform.name / username
-                dedup_report = await asyncio.to_thread(
-                    dedup_user,
-                    platform.name, username, user_dir, self.db,
-                    dry_run=False,
-                )
-                if dedup_report.confirmed_groups:
-                    log.info("post-run dedup: %s", dedup_report)
-                total_deleted += dedup_report.deleted
-                total_bytes_freed += dedup_report.bytes_freed
-
-                report = await asyncio.to_thread(
-                    reconcile_user, platform, username, self.db,
-                    self.config.output_dir, True,
-                )
-                if report.inserted or report.seeded_archive:
-                    log.info("post-run reconcile: %s", report)
-                total_inserted += report.inserted
+            ins, dele, freed = await self._reconcile_one_platform(
+                platform, user_filter)
+            total_inserted += ins
+            total_deleted += dele
+            total_bytes_freed += freed
 
         if not user_filter:
             recording_reports = await asyncio.to_thread(
@@ -244,6 +265,48 @@ class Archiver:
             total_deleted,
             total_bytes_freed / (1024 * 1024),
         )
+
+    async def _reconcile_one_platform(
+        self,
+        platform: Platform,
+        user_filter: str | None,
+    ) -> tuple[int, int, int]:
+        """Walk one platform's folder and queue everything missing from the DB:
+        loose root files, then each user (configured ∪ disk-discovered) with a
+        content-dedup pass. Returns (inserted, deleted, bytes_freed). This is
+        the 'always upload everything' half — used both by the post-run sweep
+        and, for download-disabled platforms, unconditionally each run."""
+        inserted = deleted = bytes_freed = 0
+
+        if not user_filter:
+            root_report = await asyncio.to_thread(
+                reconcile_platform_root,
+                platform, self.db, self.config.output_dir,
+            )
+            if root_report.scanned or root_report.inserted:
+                log.info("reconcile: %s", root_report)
+            inserted += root_report.inserted
+
+        for username in self._reconcile_users_for_platform(platform, user_filter):
+            user_dir = Path(self.config.output_dir) / platform.name / username
+            dedup_report = await asyncio.to_thread(
+                dedup_user, platform.name, username, user_dir, self.db,
+                dry_run=False,
+            )
+            if dedup_report.confirmed_groups:
+                log.info("dedup: %s", dedup_report)
+            deleted += dedup_report.deleted
+            bytes_freed += dedup_report.bytes_freed
+
+            report = await asyncio.to_thread(
+                reconcile_user, platform, username, self.db,
+                self.config.output_dir, True,
+            )
+            if report.inserted or report.seeded_archive:
+                log.info("reconcile: %s", report)
+            inserted += report.inserted
+
+        return inserted, deleted, bytes_freed
 
     def _reconcile_users_for_platform(
         self,

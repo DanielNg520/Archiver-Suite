@@ -12,14 +12,29 @@ from .store import ClaimContentionError, ItemStore, now_iso
 from .policy_store import PolicyStore
 from .policies import (
     DeletePolicy, RecorderDeletePolicy, DedupPolicy, BooleanPolicy,
-    validate_overrides,
+    BatchPolicy, AutoIngestPolicy, DownloadPolicy, validate_overrides,
 )
 from .files import cleanup_sidecars
+from .dedup import dedup_user, DedupReport, DupGroup
+from .ingest import register_file, IngestResult, IngestOutcome
+from .routing import is_chat_id, CHAT_ID_RE
+from .orphaned import (
+    ingest_chat_id_dirs, ingest_folder, OrphanedReport, subfolder_of,
+    ORPHANED_SOURCE, ORPHANED_PLATFORM,
+)
+from .backfill import backfill_content_hashes, BackfillReport
 
 __all__ = [
     "Item", "Status", "TERMINAL",
     "connect", "db_path", "DEFAULT_DB_PATH",
     "ClaimContentionError", "ItemStore", "now_iso",
     "PolicyStore", "DeletePolicy", "RecorderDeletePolicy", "DedupPolicy",
-    "BooleanPolicy", "validate_overrides", "cleanup_sidecars",
+    "BooleanPolicy", "BatchPolicy", "AutoIngestPolicy", "DownloadPolicy",
+    "validate_overrides", "cleanup_sidecars",
+    "dedup_user", "DedupReport", "DupGroup",
+    "register_file", "IngestResult", "IngestOutcome",
+    "is_chat_id", "CHAT_ID_RE",
+    "ingest_chat_id_dirs", "ingest_folder", "OrphanedReport", "subfolder_of",
+    "ORPHANED_SOURCE", "ORPHANED_PLATFORM",
+    "backfill_content_hashes", "BackfillReport",
 ]

@@ -61,7 +61,9 @@ independence"; in practice that just meant the copies could drift against
 the one schema they all depend on. Process isolation comes from running
 separate processes — not from giving them disjoint code.)
 
-Install/upgrade/migration details: see **MIGRATION-AND-INSTALL.md**.
+First install + one-time data migration: **MIGRATION-AND-INSTALL.md**.
+Upgrading an existing install to the current version: **UPGRADE.md**.
+Day-to-day usage of every feature: **USER-GUIDE.md**.
 
 ---
 
@@ -214,6 +216,17 @@ recommended *staged* rollout (given prior kernel-panic history) are in
 | Doc | Covers |
 |-----|--------|
 | `README.md` (this file) | architecture, install order, layout |
+| `USER-GUIDE.md` | task-oriented daily use — every upload path + commands |
+| `UPGRADE.md` | upgrading an existing install to the current version |
+| `MIGRATION-AND-INSTALL.md` | first install + one-time two-DB → suite.db migration |
 | `AUTOMATION.md` | launchd setup, staged rollout, every automated piece |
+| `archiver/README.md` | archiver CLI, env vars, platforms |
 | `dispatcher/README.md` | dispatcher CLI, env vars, queue smoke test |
 | `ops/RUNBOOK.md` | failure recovery procedures |
+
+**What this version adds** (see USER-GUIDE.md / UPGRADE.md): global content-hash
+dedup (the same bytes never upload twice; re-introduced uploads are cleaned up),
+a min-batch policy (platform albums wait for 10 items / 7 days), chat_id
+"orphaned" folders for loose files, local (download-free) platforms, a
+per-platform download toggle, and a harmonized CLI (`start`/`--once`, shared
+`stats`/`queue`/`config`).

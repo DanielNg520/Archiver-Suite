@@ -28,7 +28,7 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Iterator
+from typing import Callable, Iterator
 
 from . import schema
 from .models import Item, Status
@@ -58,6 +58,17 @@ def now_iso() -> str:
     equals chronological order only when the encoding is identical.
     """
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _age_seconds(iso: str) -> float:
+    """Seconds since an item's discovered_at (now_iso format). Used by the
+    min-batch flush. A malformed/empty timestamp reads as age 0 (not stale),
+    so a bad row can never force a premature partial flush."""
+    try:
+        t = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return 0.0
+    return (datetime.now(timezone.utc) - t).total_seconds()
 
 
 class ItemStore:
@@ -108,6 +119,9 @@ class ItemStore:
         title:           str        = "",
         caption:         str | None = None,
         priority:        int        = 100,
+        content_hash:    str | None = None,
+        chat_id:         str | None = None,
+        group_key:       str | None = None,
     ) -> bool:
         """
         Register a downloaded/recorded file as a pending upload. This IS
@@ -117,16 +131,23 @@ class ItemStore:
         INSERT OR IGNORE on (platform, identifier): re-running a download
         before the dispatcher has sent won't create a duplicate. Returns
         True iff a row was actually inserted.
+
+        content_hash / chat_id / group_key are the redesign columns:
+          - content_hash → global dedup key (stamped by ingest)
+          - chat_id      → explicit Telegram destination (orphaned folders)
+          - group_key    → explicit album batch identity (else NULL → the
+                           dispatcher falls back to caption-based grouping)
         """
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO items
                  (source, platform, username, identifier, file_path,
                   upload_date, file_size_bytes, title, discovered_at,
-                  status, priority, caption, attempts)
-               VALUES (?,?,?,?,?,?,?,?,?, 'pending', ?, ?, 0)""",
+                  status, priority, caption, attempts,
+                  content_hash, chat_id, group_key)
+               VALUES (?,?,?,?,?,?,?,?,?, 'pending', ?, ?, 0, ?, ?, ?)""",
             (source, platform, username, identifier, file_path,
              upload_date, file_size_bytes, title, now_iso(),
-             priority, caption),
+             priority, caption, content_hash, chat_id, group_key),
         )
         self.conn.commit()
         return cur.rowcount > 0
@@ -141,6 +162,25 @@ class ItemStore:
         return self.conn.execute(
             "SELECT 1 FROM items WHERE file_path=?", (file_path,),
         ).fetchone() is not None
+
+    def find_by_content_hash(self, content_hash: str) -> Item | None:
+        """First existing row sharing these exact bytes, or None. Drives
+        ingest-time global dedup: if a row already holds this content_hash,
+        the incoming file is a duplicate and never gets a second row."""
+        r = self.conn.execute(
+            "SELECT * FROM items WHERE content_hash=? LIMIT 1", (content_hash,),
+        ).fetchone()
+        return Item.from_row(r) if r else None
+
+    def relink_file(self, item_id: int, new_file_path: str) -> None:
+        """Re-point an existing row at a different physical file (the dedup
+        ADOPT case: the incoming copy has a better/canonical name, so we keep
+        it and retire the old file, preserving the row's delivery history)."""
+        with self._immediate() as cur:
+            cur.execute(
+                "UPDATE items SET file_path=? WHERE id=?",
+                (new_file_path, item_id),
+            )
 
     # ── Dispatcher side: the state machine ────────────────────────────────
 
@@ -172,67 +212,72 @@ class ItemStore:
                     _CLAIM_RETRIES)
         raise ClaimContentionError(_CLAIM_RETRIES)
 
-    def claim_batch(self, max_items: int = ALBUM_MAX) -> list[Item]:
+    def claim_batch(
+        self,
+        max_items: int = ALBUM_MAX,
+        *,
+        min_batch:   "Callable[[sqlite3.Row], int] | None" = None,
+        flush_age_s: "Callable[[sqlite3.Row], float | None] | None" = None,
+    ) -> list[Item]:
         """Atomically claim a homogeneous group of pending items for one
-        album send. Returns [] when nothing is pending. Raises
-        ClaimContentionError when retries are exhausted under contention.
+        album send. Returns [] when nothing is pending (or nothing is yet
+        eligible — see the gate below). Raises ClaimContentionError when
+        retries are exhausted under contention.
 
         The group is defined by the highest-priority pending row (the
         "anchor") and everything sharing its (platform, username, source,
-        caption/group caption, media-bucket):
+        group_key/caption, media-bucket):
 
-          - source in the key  → an album is never mixed across producers
-            (archiver rows and recorder rows form separate batches), which
-            is the batch-purity guarantee, enforced at claim time with no
-            producer-side lock.
+          - source in the key  → an album is never mixed across producers.
           - media-bucket in the key → photos batch with photos, videos with
-            videos. The 'single' bucket (gifs/other) yields just the anchor,
-            so the drain loop sends those one at a time, exactly as before.
+            videos. The 'single' bucket (gifs/other) yields just the anchor.
 
-        All claimed rows flip pending→sending (attempts+1, claimed_at set) in
-        ONE transaction — same BEGIN IMMEDIATE / CAS discipline as claim_next,
-        so a crash mid-claim commits nothing and the watchdog has no partial
-        group to untangle. Bucket classification is derived from the file
-        extension (core.files.media_bucket), so there is no media_type column
-        and no migration.
+        BATCH-IDENTITY: grouping keys on COALESCE(group_key, caption, '') so a
+        producer's explicit group_key (orphaned subfolders) beats the displayed
+        caption text. When neither is set, falls back to caption (unchanged for
+        existing producers).
+
+        MINIMUM-BATCH GATE (optional): when `min_batch` is given, a group whose
+        in-bucket pending count is below min_batch(anchor) is DEFERRED — we scan
+        past it to the next eligible group and leave it pending to accumulate.
+        `flush_age_s(anchor)` is the escape hatch: a deferred group is claimed
+        anyway once its oldest item has waited that many seconds. 'single' items
+        bypass the gate. When neither callable is passed, the original cheap
+        LIMIT-1 path runs unchanged.
+
+        All claimed rows flip pending→sending in ONE transaction (BEGIN
+        IMMEDIATE / CAS discipline), so a crash mid-claim commits nothing.
         """
         if max_items < 1:
             return []
 
+        GROUP_DISC = "COALESCE(group_key, caption, '')"
+        gated = min_batch is not None or flush_age_s is not None
+
         for _ in range(_CLAIM_RETRIES):
             with self._immediate() as cur:
-                anchor = cur.execute(
-                    """SELECT id, platform, username, source, caption, file_path
-                         FROM items WHERE status='pending'
-                        ORDER BY priority ASC, discovered_at ASC LIMIT 1"""
-                ).fetchone()
-                if anchor is None:
-                    return []
-
-                bucket = media_bucket(anchor["file_path"])
-
-                if bucket == "single":
-                    chosen = [anchor]
+                if not gated:
+                    anchor = cur.execute(
+                        f"""SELECT id, platform, username, source, file_path,
+                                  {GROUP_DISC} AS group_disc
+                             FROM items WHERE status='pending'
+                            ORDER BY priority ASC, discovered_at ASC LIMIT 1"""
+                    ).fetchone()
+                    if anchor is None:
+                        return []
+                    chosen = self._gather_group(cur, anchor, GROUP_DISC, max_items)
                 else:
-                    candidates = cur.execute(
-                        """SELECT * FROM items
-                            WHERE status='pending'
-                              AND platform=? AND username=? AND source=?
-                              AND COALESCE(caption, '')=?
-                            ORDER BY priority ASC, discovered_at ASC""",
-                        (
-                            anchor["platform"],
-                            anchor["username"],
-                            anchor["source"],
-                            anchor["caption"] or "",
-                        ),
+                    pending = cur.execute(
+                        f"""SELECT id, platform, username, source, file_path,
+                                  discovered_at, {GROUP_DISC} AS group_disc
+                             FROM items WHERE status='pending'
+                            ORDER BY priority ASC, discovered_at ASC"""
                     ).fetchall()
-                    chosen = []
-                    for row in candidates:
-                        if media_bucket(row["file_path"]) == bucket:
-                            chosen.append(row)
-                        if len(chosen) >= max_items:
-                            break
+                    chosen = self._select_eligible_group(
+                        cur, pending, GROUP_DISC, max_items, min_batch, flush_age_s,
+                    )
+                    if not chosen:
+                        return []
 
                 ids = [r["id"] for r in chosen]
                 placeholders = ",".join("?" * len(ids))
@@ -253,6 +298,63 @@ class ItemStore:
                     _CLAIM_RETRIES)
         raise ClaimContentionError(_CLAIM_RETRIES)
 
+    def _gather_group(self, cur, anchor, group_disc_sql: str,
+                      max_items: int) -> list:
+        """The anchor's album: all same-bucket pending rows sharing its
+        (platform, username, source, group_disc), capped at max_items. A
+        'single'-bucket anchor yields just itself (gifs/other never album)."""
+        bucket = media_bucket(anchor["file_path"])
+        if bucket == "single":
+            return [anchor]
+        candidates = cur.execute(
+            f"""SELECT * FROM items
+                 WHERE status='pending'
+                   AND platform=? AND username=? AND source=?
+                   AND {group_disc_sql}=?
+                 ORDER BY priority ASC, discovered_at ASC""",
+            (anchor["platform"], anchor["username"], anchor["source"],
+             anchor["group_disc"]),
+        ).fetchall()
+        chosen = []
+        for row in candidates:
+            if media_bucket(row["file_path"]) == bucket:
+                chosen.append(row)
+            if len(chosen) >= max_items:
+                break
+        return chosen
+
+    def _select_eligible_group(
+        self, cur, pending, group_disc_sql: str, max_items: int,
+        min_batch, flush_age_s,
+    ) -> list:
+        """Scan pending rows (already priority-ordered) and return the first
+        group that clears the min-batch gate; [] if none is ready yet.
+
+        A non-'single' group is eligible when it has >= min_batch(anchor)
+        in-bucket items, OR its oldest item has aged past flush_age_s(anchor)
+        (the anti-starvation flush). Under-threshold groups are deferred and
+        skipped so a lower-priority ready group can still drain."""
+        deferred: set = set()
+        for anchor in pending:
+            bucket = media_bucket(anchor["file_path"])
+            gkey = (anchor["platform"], anchor["username"], anchor["source"],
+                    anchor["group_disc"], bucket)
+            if gkey in deferred:
+                continue
+            if bucket == "single":
+                return [anchor]          # singles bypass the gate
+            group = self._gather_group(cur, anchor, group_disc_sql, max_items)
+            required = min_batch(anchor) if min_batch is not None else 1
+            if len(group) >= required:
+                return group
+            age_limit = flush_age_s(anchor) if flush_age_s is not None else None
+            if age_limit and age_limit > 0:
+                oldest = min(r["discovered_at"] for r in group)
+                if _age_seconds(oldest) >= age_limit:
+                    return group
+            deferred.add(gkey)
+        return []
+
     def mark_sent(self, item_id: int, *, tg_message_id: int | None = None) -> None:
         with self._immediate() as cur:
             cur.execute(
@@ -261,6 +363,37 @@ class ItemStore:
                           tg_message_id=?
                     WHERE id=?""",
                 (now_iso(), tg_message_id, item_id),
+            )
+
+    def sent_twin(self, content_hash: str | None, exclude_id: int) -> Item | None:
+        """A different row with the SAME bytes already delivered, or None.
+        Powers the dispatcher's global-dedup guarantee — an O(log n) hit on
+        the partial idx_items_hash_sent index, never a re-scan. NULL hash
+        (rows enqueued without ingest) never matches, so they're never
+        wrongly suppressed."""
+        if not content_hash:
+            return None
+        r = self.conn.execute(
+            """SELECT * FROM items
+                WHERE content_hash=? AND status='sent' AND id<>? LIMIT 1""",
+            (content_hash, exclude_id),
+        ).fetchone()
+        return Item.from_row(r) if r else None
+
+    def mark_deduplicated(self, item_id: int, *, twin_id: int) -> None:
+        """Suppress a row whose bytes were already sent: record it as 'sent'
+        (delivered by its twin) so the dispatcher won't re-send. The reason is
+        kept in last_error for auditability; tg_message_id stays NULL (nothing
+        was actually sent). The dispatcher deletes the redundant on-disk copy
+        unconditionally after calling this."""
+        with self._immediate() as cur:
+            cur.execute(
+                """UPDATE items
+                      SET status='sent', sent_at=?, claimed_at=NULL,
+                          last_error=?
+                    WHERE id=?""",
+                (now_iso(), f"deduped: bytes already sent by id={twin_id}",
+                 item_id),
             )
 
     def mark_failed(self, item_id: int, *, error: str, max_retries: int) -> str:

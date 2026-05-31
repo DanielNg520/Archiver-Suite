@@ -28,7 +28,8 @@ import signal
 import sys
 from pathlib import Path
 
-from core import ItemStore, DeletePolicy, RecorderDeletePolicy
+from core import ItemStore, DeletePolicy, RecorderDeletePolicy, BatchPolicy
+from core import cli as core_cli
 
 from .config import DispatcherConfig
 from .drain import drain_forever
@@ -58,6 +59,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
     router        = TelegramRouter(default_chat_id=config.default_chat_id)
     delete_policy = DeletePolicy(config.policy_store)
     recorder_delete_policy = RecorderDeletePolicy(config.policy_store)
+    batch_policy  = BatchPolicy(config.policy_store)
 
     stop_event = asyncio.Event()
 
@@ -86,6 +88,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
                 router=router,
                 delete_policy=delete_policy,
                 recorder_delete_policy=recorder_delete_policy,
+                batch_policy=batch_policy,
                 stop_event=stop_event,
             )
         finally:
@@ -185,6 +188,25 @@ def cmd_queue_cancel(args: argparse.Namespace) -> int:
         store.close()
 
 
+# ── Subcommand: stats (shared noun — DB counts, distinct from `status`) ───
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    config = DispatcherConfig.load(require_telegram=False)
+    store = ItemStore.open(config.db_path)
+    try:
+        return core_cli.handle_stats(store, args)
+    finally:
+        store.close()
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    """Settings get/set/unset/list via the shared PolicyStore handler.
+    args.config_command (set|get|unset|list) → core_cli's config_cmd."""
+    args.config_cmd = args.config_command
+    config = DispatcherConfig.load(require_telegram=False)
+    return core_cli.handle_config(config.policy_store, args)
+
+
 # ── Subcommand: config show ───────────────────────────────────────────────
 
 def cmd_config_show(args: argparse.Namespace) -> int:
@@ -217,6 +239,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("start", help="run drain loop in foreground")
     sub.add_parser("status", help="show queue counts + top pending")
+    core_cli.add_stats_parser(sub)   # shared `stats` noun (DB counts)
 
     p_queue = sub.add_parser("queue", help="queue operations")
     queue_sub = p_queue.add_subparsers(dest="queue_command", required=True)
@@ -240,16 +263,35 @@ def _build_parser() -> argparse.ArgumentParser:
     config_sub = p_config.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("show", help="dump effective config")
 
+    # Settings get/set/unset/list via PolicyStore (config.toml). How the
+    # min-batch policy is tuned, e.g.:
+    #   dispatcher config set min_batch_size 10 --platform x
+    def _scope(sp):
+        sp.add_argument("--platform")
+        sp.add_argument("--user", dest="username", metavar="USERNAME")
+    c_get = config_sub.add_parser("get", help="show a key's effective value")
+    c_get.add_argument("key"); _scope(c_get)
+    c_set = config_sub.add_parser("set", help="set a key at the given scope")
+    c_set.add_argument("key"); c_set.add_argument("value"); _scope(c_set)
+    c_unset = config_sub.add_parser("unset", help="remove a key at the given scope")
+    c_unset.add_argument("key"); _scope(c_unset)
+    config_sub.add_parser("list", help="list all scoped overrides")
+
     return parser
 
 
 _DISPATCHERS = {
     ("start", None):                cmd_start,
     ("status", None):               cmd_status,
+    ("stats", None):                cmd_stats,
     ("queue", "list"):              cmd_queue_list,
     ("queue", "retry"):             cmd_queue_retry,
     ("queue", "cancel"):            cmd_queue_cancel,
     ("config", "show"):             cmd_config_show,
+    ("config", "get"):              cmd_config,
+    ("config", "set"):              cmd_config,
+    ("config", "unset"):            cmd_config,
+    ("config", "list"):             cmd_config,
 }
 
 

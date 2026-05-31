@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 
+from .files import ALBUM_MAX
 from .policy_store import PolicyStore
 
 log = logging.getLogger(__name__)
@@ -78,6 +79,97 @@ class DedupPolicy(BooleanPolicy):
 
     def should_dedup(self, platform: str, username: str) -> bool:
         return self.is_enabled(platform, username)
+
+
+class BatchPolicy:
+    """Minimum-album-size gate for PLATFORM (archiver) uploads.
+
+    The dispatcher holds a platform user's pending items and only sends an
+    album once `min_batch_size` of them have accumulated in the same group +
+    media bucket — so you get full albums instead of a trickle of singletons.
+    Default 10 (== ALBUM_MAX, a full Telegram album).
+
+    To stop a tail of <size items lingering forever (a user with 7 photos and
+    no new downloads), `max_wait_hours` flushes a partial batch once its oldest
+    item has waited that long. Default 7 days (168h).
+
+    Resolution is hierarchical (user → platform → global) via PolicyStore, so
+    you can tune per-user. Set min_batch_size=1 to disable the gate entirely
+    (restores the old send-whatever-is-pending behavior). This policy is an
+    int/float pair, not a BooleanPolicy, so it doesn't subclass it.
+    """
+    SIZE_KEY       = "min_batch_size"
+    WAIT_KEY       = "min_batch_max_wait_h"
+    DEFAULT_SIZE   = 10
+    DEFAULT_WAIT_H = 168.0   # 7 days
+
+    def __init__(self, store: PolicyStore):
+        self._store = store
+
+    def min_batch_size(self, platform: str, username: str) -> int:
+        """Required items before a platform album is sent. Clamped to
+        [1, ALBUM_MAX] — a threshold above the album cap is unreachable."""
+        v = self._store.get(self.SIZE_KEY, platform=platform, username=username,
+                            default=self.DEFAULT_SIZE)
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            log.warning("policy %s: non-int %r for %s/%s — using %d",
+                        self.SIZE_KEY, v, platform, username, self.DEFAULT_SIZE)
+            n = self.DEFAULT_SIZE
+        return max(1, min(n, ALBUM_MAX))
+
+    def max_wait_hours(self, platform: str, username: str) -> float:
+        """Hours an under-size batch may wait before it's flushed anyway.
+        0 disables flushing (strict: only ever send full batches)."""
+        v = self._store.get(self.WAIT_KEY, platform=platform, username=username,
+                            default=self.DEFAULT_WAIT_H)
+        try:
+            h = float(v)
+        except (TypeError, ValueError):
+            log.warning("policy %s: non-float %r for %s/%s — using %.1f",
+                        self.WAIT_KEY, v, platform, username, self.DEFAULT_WAIT_H)
+            h = self.DEFAULT_WAIT_H
+        return max(0.0, h)
+
+
+class DownloadPolicy(BooleanPolicy):
+    """Whether the archiver FETCHES new media for a platform (default on).
+
+    Turn it OFF to treat a built-in platform as reconcile-and-upload-only: you
+    manage its files by hand (e.g. a manual Instagram backup), and each run
+    still walks the folder and uploads everything — configured users,
+    disk-discovered users, and loose root files — but downloads nothing and
+    needs no auth/cookies. Resolved at platform scope (user dimension unused).
+    """
+    KEY     = "download_enabled"
+    DEFAULT = True
+
+    def enabled_for(self, platform: str) -> bool:
+        value = self._store.get(self.KEY, platform=platform, default=self.DEFAULT)
+        if not isinstance(value, bool):
+            log.warning("policy %s: non-bool %r for %s — using %s",
+                        self.KEY, value, platform, self.DEFAULT)
+            return self.DEFAULT
+        return value
+
+
+class AutoIngestPolicy(BooleanPolicy):
+    """Whether `archiver start` also ingests chat_id (orphaned) folders each
+    cycle. Global toggle — drop loose files into output_dir/<chat_id>/… and,
+    when enabled, they're enqueued automatically instead of needing a manual
+    `archiver ingest`."""
+    KEY     = "auto_ingest_orphaned"
+    DEFAULT = False
+
+    def enabled(self) -> bool:
+        """Global-scope read (no platform/user dimension for this toggle)."""
+        value = self._store.get(self.KEY, default=self.DEFAULT)
+        if not isinstance(value, bool):
+            log.warning("policy %s: non-bool %r — using %s",
+                        self.KEY, value, self.DEFAULT)
+            return self.DEFAULT
+        return value
 
 
 # ── Validation ────────────────────────────────────────────────────────────────

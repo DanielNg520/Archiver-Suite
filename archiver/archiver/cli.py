@@ -49,6 +49,8 @@ from .reconcile import (
 )
 
 from core import ItemStore, DeletePolicy, RecorderDeletePolicy, DedupPolicy
+from core import AutoIngestPolicy, DownloadPolicy
+from core import cli as core_cli
 
 
 PLATFORM_CHOICES = ["x", "tiktok", "instagram"]
@@ -88,12 +90,92 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
 
-    # ── run ───
-    s_run = sub.add_parser("run", help="Normal archive cycle")
+    # ── start (harmonized verb: run the role; --once for a single cycle) ───
+    s_start = sub.add_parser(
+        "start", help="Run the archiver (continuous; --once for a single cycle)")
+    s_start.add_argument("--once", action="store_true",
+                         help="Run a single archive cycle and exit")
+    s_start.add_argument("--platform", choices=PLATFORM_CHOICES,
+                         help="Limit to one platform")
+    s_start.add_argument("--user", metavar="USERNAME",
+                         help="Limit to one username (no @)")
+    s_start.add_argument("--min", dest="min_sleep", type=float, default=7200)
+    s_start.add_argument("--max", dest="max_sleep", type=float, default=14400)
+    s_start.add_argument("--max-fails", type=int, default=5)
+
+    # ── run (alias: `start --once`) ───
+    s_run = sub.add_parser("run", help="Single archive cycle (alias: start --once)")
     s_run.add_argument("--platform", choices=PLATFORM_CHOICES,
                        help="Limit to one platform")
     s_run.add_argument("--user", metavar="USERNAME",
                        help="Limit to one username (no @)")
+
+    # ── queue (shared noun, identical across all three binaries) ───
+    core_cli.add_queue_parser(sub)
+
+    # ── ingest (chat_id / orphaned folders) ───
+    s_ingest = sub.add_parser(
+        "ingest",
+        help="Ingest loose files from chat_id-named folders under output_dir "
+             "(folder name = Telegram destination). Dedups + enqueues them.",
+    )
+    s_ingest.add_argument(
+        "--priority", type=int, default=100,
+        help="Queue priority for ingested files (default 100).")
+    s_ingest.add_argument(
+        "--path", metavar="DIR",
+        help="Ingest an arbitrary folder (not just chat_id dirs under "
+             "output_dir). Requires --chat.")
+    s_ingest.add_argument(
+        "--chat", metavar="CHAT_ID",
+        help="Destination chat_id for --path ingestion.")
+
+    # ── auto-ingest (toggle) ───
+    s_ai = sub.add_parser(
+        "auto-ingest",
+        help="Show/toggle automatic ingest of chat_id folders each "
+             "`archiver start` cycle. Default off.")
+    ai_sub = s_ai.add_subparsers(dest="ai_action", required=False, metavar="ACTION",
+                                 help="omit to print state; 'set'/'unset' to change")
+    ai_set = ai_sub.add_parser("set", help="Enable or disable auto-ingest")
+    ai_set.add_argument("--enabled", choices=["true", "false"], required=True)
+    ai_sub.add_parser("unset", help="Remove the setting (back to default: off)")
+
+    # ── local (user-managed folders treated as platforms, no download) ───
+    s_local = sub.add_parser(
+        "local",
+        help="Manage user-managed folders treated as platforms (reconciled + "
+             "uploaded with platform semantics, but no download).")
+    local_sub = s_local.add_subparsers(dest="local_cmd", required=True)
+    la = local_sub.add_parser("add", help="Register a folder name as a local platform")
+    la.add_argument("name")
+    lr = local_sub.add_parser("remove", help="Unregister a local platform (files kept)")
+    lr.add_argument("name")
+    local_sub.add_parser("list", help="List local platforms")
+
+    # ── download (per-platform fetch on/off) ───
+    s_dl = sub.add_parser(
+        "download",
+        help="Show or toggle whether a platform DOWNLOADS (default on). Off = "
+             "reconcile + upload the folder only, no fetch, no cookies needed.")
+    s_dl.add_argument("--platform", choices=PLATFORM_CHOICES)
+    dl_sub = s_dl.add_subparsers(dest="download_action", required=False, metavar="ACTION",
+                                 help="omit to print resolution; 'set'/'unset' to change")
+    dl_set = dl_sub.add_parser("set", help="Enable/disable download for a platform")
+    dl_set.add_argument("--platform", choices=PLATFORM_CHOICES, required=True,
+                        help="Required — avoids accidentally toggling ALL platforms.")
+    dl_set.add_argument("--enabled", choices=["true", "false"], required=True)
+    dl_unset = dl_sub.add_parser("unset", help="Remove the override (back to default: on)")
+    dl_unset.add_argument("--platform", choices=PLATFORM_CHOICES, required=True,
+                          help="Required — avoids accidentally toggling ALL platforms.")
+
+    # ── backfill ───
+    s_backfill = sub.add_parser(
+        "backfill",
+        help="One-time: compute content_hash for existing rows that lack one "
+             "(makes move/rename dedup retroactive). Resumable; reads each file.")
+    s_backfill.add_argument("--batch-commit", type=int, default=500,
+                            help="Rows per DB commit (default 500).")
 
     # ── bootstrap ───
     s_boot = sub.add_parser(
@@ -298,6 +380,150 @@ def build_parser() -> argparse.ArgumentParser:
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
+def cmd_start(args, config: Config, db: ItemStore) -> int:
+    """Harmonized run verb: continuous by default, single cycle with --once.
+    Delegates to the existing run/loop implementations."""
+    if getattr(args, "once", False):
+        return cmd_run(args, config, db)
+    return cmd_loop(args, config, db)
+
+
+def cmd_queue(args, config: Config, db: ItemStore) -> int:
+    """Shared queue noun — same implementation as recorder/dispatcher."""
+    return core_cli.handle_queue(db, args)
+
+
+def cmd_ingest(args, config: Config, db: ItemStore) -> int:
+    """Ingest loose files and enqueue them as source='orphaned' rows (deduped).
+    Default: scan output_dir's chat_id folders. --path DIR --chat CHAT_ID:
+    ingest an arbitrary folder to an explicit chat (same dedup guarantee)."""
+    from core import ingest_chat_id_dirs, ingest_folder, is_chat_id
+
+    if args.path:
+        if not args.chat:
+            log.error("ingest --path requires --chat <chat_id>")
+            return 2
+        if not is_chat_id(args.chat):
+            log.error("ingest --chat %r is not a valid chat_id", args.chat)
+            return 2
+        folder = Path(args.path).expanduser()
+        if not folder.is_dir():
+            log.error("ingest --path %s is not a directory", folder)
+            return 2
+        rep = ingest_folder(db, folder, chat_id=args.chat, priority=args.priority)
+        print(rep)
+        return 0
+
+    reports = ingest_chat_id_dirs(
+        db, config.output_dir,
+        known_platforms = list(PLATFORM_CHOICES) + list(config.local_platforms),
+        priority        = args.priority,
+    )
+    if not reports:
+        print("No chat_id folders found under", config.output_dir)
+        return 0
+    total_inserted = 0
+    for rep in reports:
+        print(rep)
+        total_inserted += rep.inserted
+    log.info("ingest: %d file(s) newly enqueued across %d folder(s)",
+             total_inserted, len(reports))
+    return 0
+
+
+def cmd_auto_ingest(args, config: Config, db: ItemStore) -> int:
+    """Show/toggle the global auto_ingest_orphaned policy."""
+    store  = config.policy_store
+    policy = AutoIngestPolicy(store)
+    action = getattr(args, "ai_action", None)
+    if action == "set":
+        value = args.enabled == "true"
+        store.set(policy.KEY, value)
+        log.info("auto-ingest set: global → %s (key=%s)", value, policy.KEY)
+        log.info("Takes effect on the next `archiver start` cycle.")
+        return 0
+    if action == "unset":
+        removed = store.unset(policy.KEY)
+        log.info("auto-ingest unset: %s",
+                 "removed (back to default: off)" if removed else "was not set")
+        return 0
+    value, source = store.explain(policy.KEY, default=policy.DEFAULT)
+    log.info("auto-ingest (key=%s): %s  (from %s)", policy.KEY, value, source)
+    return 0
+
+
+def cmd_local(args, config: Config, db: ItemStore) -> int:
+    """Manage the list of user-managed 'local' platforms (no download)."""
+    from core import is_chat_id
+
+    store   = config.policy_store
+    current = list(store.get("local_platforms", default=[]) or [])
+    action  = args.local_cmd
+
+    if action == "add":
+        name = args.name.strip().lower()
+        if not name or "/" in name or name.startswith("."):
+            log.error("local add: invalid folder name %r", args.name)
+            return 2
+        if name in PLATFORM_CHOICES:
+            log.error("local add: '%s' is a built-in platform", name)
+            return 2
+        if is_chat_id(name):
+            log.error("local add: '%s' looks like a chat_id — that's an "
+                      "orphaned destination, not a local platform", name)
+            return 2
+        if name in current:
+            print(f"'{name}' is already a local platform")
+            return 0
+        current.append(name)
+        store.set("local_platforms", sorted(current))
+        plat_dir = Path(config.output_dir) / name
+        print(f"Added local platform '{name}'.")
+        print(f"  Put files under: {plat_dir}/<username>/")
+        print(f"  Route with env/config TELEGRAM_CHAT_ID_{name.upper()}[_<USER>].")
+        return 0
+    if action == "remove":
+        name = args.name.strip().lower()
+        if name not in current:
+            print(f"'{name}' is not a local platform")
+            return 1
+        current.remove(name)
+        store.set("local_platforms", sorted(current))
+        print(f"Removed local platform '{name}' (files on disk untouched).")
+        return 0
+    # list
+    if current:
+        for n in current:
+            print(n)
+    else:
+        print("(no local platforms — add one with `archiver local add <name>`)")
+    return 0
+
+
+def cmd_download(args, config: Config, db: ItemStore) -> int:
+    return _cmd_boolpolicy(
+        args, config, DownloadPolicy,
+        action_attr = "download_action",
+        value_attr  = "enabled",
+        cmd_label   = "download",
+    )
+
+
+def cmd_backfill(args, config: Config, db: ItemStore) -> int:
+    """Fill content_hash for pre-existing rows so move/rename dedup and the
+    re-introduction guard apply retroactively. Reads every NULL-hash file."""
+    from core import backfill_content_hashes
+
+    def _progress(done: int, total: int) -> None:
+        print(f"  backfill: {done}/{total}", end="\r", flush=True)
+
+    report = backfill_content_hashes(
+        db, batch_commit=args.batch_commit, progress=_progress)
+    print()
+    print(report)
+    return 0
+
+
 def cmd_run(args, config: Config, db: ItemStore) -> int:
     arch = Archiver(config, db)
     results = asyncio.run(arch.run(
@@ -425,7 +651,7 @@ def cmd_reset(args, config: Config, db: ItemStore) -> int:
 
 
 def cmd_reconcile(args, config: Config, db: ItemStore) -> int:
-    from .dedup import dedup_user
+    from core import dedup_user
 
     platforms = build_platforms(config)
     if args.platform:
@@ -490,7 +716,7 @@ def cmd_dedup(args, config: Config, db: ItemStore) -> int:
     controls the post-download auto-trigger. This command always runs
     when invoked.
     """
-    from .dedup import dedup_user
+    from core import dedup_user
 
     dry_run = not args.yes
     if dry_run:
@@ -1214,7 +1440,8 @@ def main() -> int:
 
     config_only = args.cmd in {
         "config", "platform", "run-settings", "migrate", "policy",
-        "dedup-policy", "stats",
+        "dedup-policy", "stats", "ingest", "queue", "backfill", "auto-ingest",
+        "local", "download",
     }
     if args.cmd == "reset" and args.reset_cmd in {"failed", "user"}:
         config_only = True
@@ -1240,7 +1467,14 @@ def main() -> int:
     db = ItemStore.open(config.db_path)
     try:
         dispatch = {
+            "start":        cmd_start,
             "run":          cmd_run,
+            "queue":        cmd_queue,
+            "ingest":       cmd_ingest,
+            "auto-ingest":  cmd_auto_ingest,
+            "local":        cmd_local,
+            "download":     cmd_download,
+            "backfill":     cmd_backfill,
             "bootstrap":    cmd_bootstrap,
             "reset":        cmd_reset,
             "reconcile":    cmd_reconcile,

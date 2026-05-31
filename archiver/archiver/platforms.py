@@ -117,6 +117,56 @@ class Platform(abc.ABC):
         ...
 
 
+class LocalPlatform(Platform):
+    """
+    A user-managed folder treated like a platform — but with NO download.
+
+    Files live under {output_dir}/{name}/{username}/ and are managed by hand
+    (you drop them in). Each immediate subfolder is a "username". Every cycle,
+    reconcile walks them and enqueues new files exactly as for a real platform,
+    so they inherit the full pipeline: platform-style captions ("@user · name"),
+    routing (TELEGRAM_CHAT_ID_<NAME>_<USER> / config), the min-batch gate, and
+    the delete-after-upload policy. Only the fetch step is skipped.
+
+    No auth (always healthy) and no extractor archive (manual files have no
+    upstream id to seed).
+    """
+
+    def __init__(self, config: "Config", name: str):
+        super().__init__(config)
+        self.name = name   # per-instance, unlike the built-in platforms
+
+    @property
+    def users(self) -> tuple[str, ...]:
+        """Auto-discovered: each non-hidden subfolder of {output_dir}/{name}/
+        is a username. No registration step — make a folder, it's a user."""
+        root = Path(self.config.output_dir) / self.name
+        if not root.is_dir():
+            return ()
+        return tuple(sorted(
+            d.name for d in root.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ))
+
+    def health_check(self) -> HealthStatus:
+        return HealthStatus.ok()           # nothing to authenticate
+
+    def attempt_recovery(self) -> bool:
+        return True
+
+    def download(self, username: str, db: "ItemStore") -> int:
+        return 0                            # user-managed; reconcile enqueues
+
+    def archive_path(self, username: str) -> Path:
+        # Unused (seed_archive is a no-op) but the interface requires a path.
+        d = Path(self.config.state_dir) / "local" / self.name
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{username}.txt"
+
+    def seed_archive(self, username: str, entries: Iterable[str]) -> int:
+        return 0                            # no extractor → nothing to seed
+
+
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
 def _snapshot_media_files(root: Path) -> set[Path]:
@@ -773,7 +823,8 @@ def _register_new_files(
     identity resolver so we use the SAME identifier logic as reconcile.
     Returns count of NEW files registered.
     """
-    from . import identity
+    from core import identity
+    from core.hashing import full_hash
 
     after = _snapshot_media_files(user_dir)
     new_files = sorted(after - before)
@@ -802,6 +853,10 @@ def _register_new_files(
             file_size_bytes = size,
             title           = ident.title,
             priority        = 10,
+            # Stamp the content hash so the dispatcher's global dedup guarantee
+            # covers platform downloads too. The file was just written, so it's
+            # warm in cache — the hash is cheap.
+            content_hash    = full_hash(f),
         )
         if inserted:
             added += 1

@@ -1,6 +1,6 @@
 """
-archiver.stability
-──────────────────
+core.stability
+──────────────
 "Is this file safe to process, or still being written?"
 
 A reconcile pass that runs WHILE an extractor is downloading (think:

@@ -105,6 +105,70 @@ CREATE TABLE IF NOT EXISTS metadata (
 """
 
 
+# ── Versioned migrations ──────────────────────────────────────────────────────
+#
+# ITEMS_DDL above is the IMMUTABLE base schema (PRAGMA user_version 0). It is
+# never edited again. Every later change is an ordered, forward-only migration
+# keyed by target version, applied once and recorded in PRAGMA user_version.
+#
+# Why not just edit ITEMS_DDL? CREATE TABLE IF NOT EXISTS silently no-ops on an
+# existing DB, so a new column added to the DDL would reach fresh installs but
+# never existing ones — exactly the drift this runner removes. A fresh DB starts
+# at user_version 0 (base DDL), then runs the same migrations an existing DB
+# does, so both arrive at SCHEMA_VERSION by the identical path.
+#
+# Each migration is (target_version, [statements]). Statements run one at a time
+# (not executescript) so the whole upgrade is ONE transaction that rolls back
+# cleanly on failure — including the user_version bump, which lives in the DB
+# header and participates in the transaction.
+SCHEMA_VERSION = 2
+
+_MIGRATIONS: list[tuple[int, list[str]]] = [
+    (1, [
+        # Redesign columns: per-file content hash (global dedup), explicit
+        # Telegram destination (chat_id-named folders), and explicit album
+        # batch identity (decouples grouping from per-file caption text).
+        "ALTER TABLE items ADD COLUMN content_hash TEXT",
+        "ALTER TABLE items ADD COLUMN chat_id      TEXT",
+        "ALTER TABLE items ADD COLUMN group_key    TEXT",
+        # O(log n) "have these exact bytes already shipped?" lookup for the
+        # dispatcher's dedup guarantee. Partial index → only sent rows, the
+        # only ones that can suppress a new send.
+        "CREATE INDEX IF NOT EXISTS idx_items_hash_sent "
+        "    ON items (content_hash) WHERE status='sent'",
+    ]),
+    (2, [
+        # Producer-side ingest/reconcile paths ask "have these bytes ever
+        # appeared?" across all statuses, not just sent rows. Keep that lookup
+        # indexed for large archives while preserving NULL-friendly storage.
+        "CREATE INDEX IF NOT EXISTS idx_items_hash "
+        "    ON items (content_hash) WHERE content_hash IS NOT NULL",
+    ]),
+]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Bring `conn` up to SCHEMA_VERSION. Safe under concurrent openers:
+    BEGIN IMMEDIATE serializes would-be migrators, and the re-read of
+    user_version inside the lock means a process that lost the race sees the
+    bumped version and applies nothing (no duplicate-column crash)."""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        current = conn.execute("PRAGMA user_version").fetchone()[0]
+        for version, statements in _MIGRATIONS:
+            if current >= version:
+                continue
+            for stmt in statements:
+                conn.execute(stmt)
+            # PRAGMA can't be parameterized; version is our own trusted int.
+            conn.execute(f"PRAGMA user_version = {version}")
+            current = version
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def _retry_locked(fn, *, attempts: int = 5):
     for i in range(attempts):
         try:
@@ -134,4 +198,5 @@ def connect(path: str | os.PathLike | None = None,
     if init:
         _retry_locked(lambda: conn.executescript(ITEMS_DDL))
         conn.commit()
+        _retry_locked(lambda: _apply_migrations(conn))
     return conn

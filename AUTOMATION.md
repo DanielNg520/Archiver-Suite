@@ -250,9 +250,28 @@ recorder config priority --user tiktoker --rank 1
 
 # Delete-after-upload (dispatcher honors this)
 archiver policy set --delete true --platform tiktok
+
+# Local platforms (hand-managed folders, no download)
+archiver local add mylibrary
+
+# Per-platform download toggle (off = reconcile/upload only)
+archiver download set --platform instagram --enabled false
+
+# Auto-ingest chat_id folders each cycle (default off)
+archiver auto-ingest set --enabled true
+
+# Upload batching (dispatcher; restart it to apply)
+dispatcher config set min_batch_size 10
 ```
 
-Config changes are read on the next cycle/poll — no reload required.
+Archiver-side settings (users, local platforms, auto-ingest, download toggle,
+delete *policy*) are read on the next cycle — no reload. The **dispatcher**
+reads its policies (delete, min-batch) at startup, so `ops restart dispatcher`
+after changing those.
+
+> **Note on batching:** with the default `min_batch_size = 10`, platform albums
+> are held until 10 files accumulate (or 7 days). Set `min_batch_size 1` to send
+> immediately. Recorder and chat_id uploads are never held.
 
 ---
 

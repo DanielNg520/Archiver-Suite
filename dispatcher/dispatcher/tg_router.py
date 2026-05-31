@@ -26,6 +26,8 @@ from typing import Any
 
 from telethon.tl.types import PeerChannel, PeerChat, PeerUser
 
+from core import is_chat_id
+
 log = logging.getLogger(__name__)
 
 
@@ -63,10 +65,35 @@ def _is_tiktok_live(platform: str, source: str | None) -> bool:
     return platform.lower() == "tiktok" and (source or "").lower() == "recorder"
 
 
+class RouteError(ValueError):
+    """The item carries a chat_id that isn't a valid Telegram destination.
+    Raised so the drain loop can fail the batch cleanly instead of throwing
+    deep inside the send."""
+
+
 @dataclass(frozen=True)
 class TelegramRouter:
     """Immutable resolver. Built once at dispatcher startup."""
     default_chat_id: str
+
+    # ── Item-aware entry point (explicit chat_id wins) ────────────────────
+    def chat_id_for_item(self, item) -> str:
+        """Resolve the destination for one item. An explicit chat_id on the
+        row (orphaned files, whose folder name IS the destination) overrides
+        the platform/user env resolution entirely. Validated here so a
+        fat-fingered folder name fails fast and loud, not mid-send."""
+        if item.chat_id:
+            cid = item.chat_id.strip()
+            if not is_chat_id(cid):
+                raise RouteError(
+                    f"item id={item.id}: chat_id {item.chat_id!r} is not a "
+                    f"valid Telegram destination"
+                )
+            return cid
+        return self.chat_id_for(item.platform, item.username, source=item.source)
+
+    def peer_for_item(self, item):
+        return _resolve_peer(self.chat_id_for_item(item))
 
     def chat_id_for(
         self,

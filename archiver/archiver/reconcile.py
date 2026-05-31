@@ -7,10 +7,10 @@ download pass doesn't try to re-fetch already-present content.
 
 This replaces the simple `db.reconcile()` of v1 in three ways:
 
-  1. Uses `archiver.stability.is_stable()` to skip half-written files
+  1. Uses `core.stability.is_stable()` to skip half-written files
      instead of registering them as broken pending uploads.
 
-  2. Uses `archiver.identity.resolve()` for every file, so:
+  2. Uses `core.identity.resolve()` for every file, so:
        - sidecar JSONs (when present) drive the identifier/date/title
        - manual files (no sidecar, no filename pattern) still get a
          stable hash-based identifier and an mtime-based date
@@ -42,7 +42,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from . import identity, stability
+from core import identity, stability, cleanup_sidecars
+from core.hashing import full_hash
 
 if TYPE_CHECKING:
     from core import ItemStore
@@ -74,16 +75,18 @@ class ReconcileReport:
     already_known:   int = 0
     manual_files:    int = 0   # subset of `inserted` with is_manual=True
     seeded_archive:  int = 0
+    deleted_dupes:   int = 0   # re-introduced files whose bytes were already sent
     max_upload_date: str | None = None
     archive_entries: list[str] = field(default_factory=list)
 
     def __str__(self) -> str:
         manual_note = f" ({self.manual_files} manual)" if self.manual_files else ""
         seed_note = f", seeded {self.seeded_archive}" if self.seeded_archive else ""
+        dup_note = f", deleted {self.deleted_dupes} dup" if self.deleted_dupes else ""
         return (
             f"[{self.platform}] @{self.username}: scanned {self.scanned}, "
             f"+{self.inserted}{manual_note}, known {self.already_known}, "
-            f"unstable {self.skipped_unstable}{seed_note}, "
+            f"unstable {self.skipped_unstable}{seed_note}{dup_note}, "
             f"floor={self.max_upload_date or '-'}"
         )
 
@@ -253,6 +256,29 @@ def _reconcile_dir(
             log.warning("  reconcile: vanished mid-walk: %s", f)
             continue
 
+        # Content-hash the new file — the move/rename-proof identity. Only NEW
+        # paths reach here (has_file_path fast-path above skipped known ones),
+        # so on a quiescent archive this hashes nothing.
+        digest = full_hash(f)
+
+        # Re-introduction guard: if these exact bytes already belong to an
+        # ALREADY-UPLOADED row (under a different path), this is a copy the user
+        # moved back in. Don't re-enqueue it — delete it from disk. (Same-path
+        # files never get here; the canonical sent file at its own path is
+        # untouched. Twins created before content_hash existed have NULL hashes
+        # and won't match — identity-collision still blocks re-upload, just
+        # without the disk cleanup.)
+        if digest is not None:
+            twin = db.find_by_content_hash(digest)
+            if (twin is not None
+                    and twin.status == "sent"
+                    and twin.file_path != path_str):
+                cleanup_sidecars(path_str)
+                report.deleted_dupes += 1
+                log.info("  reconcile: deleted re-introduced already-uploaded "
+                         "file %s (bytes already sent as id=%d)", f.name, twin.id)
+                continue
+
         inserted = db.add_item(
             source          = source,
             platform        = report.platform,
@@ -264,6 +290,7 @@ def _reconcile_dir(
             title           = ident.title,
             caption         = caption_for_path(f) if caption_for_path else None,
             priority        = priority,
+            content_hash    = digest,
         )
         if inserted:
             report.inserted += 1

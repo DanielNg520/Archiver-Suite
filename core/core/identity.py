@@ -1,7 +1,13 @@
 """
-archiver.identity
-─────────────────
+core.identity
+─────────────
 Resolve `(identifier, upload_date, title)` for any media file on disk.
+
+Lives in `core` (not archiver) because every producer — the archiver
+downloader, the reconcile pass, and the loose/orphaned-file ingestor —
+must resolve identity by the IDENTICAL logic, or the same file gets two
+different identifiers and the UNIQUE(platform, identifier) constraint
+silently rejects one, masking a duplicate-row bug.
 
 The resolver is a Chain of Responsibility: try the most-trusted source
 first, fall through on failure. Output is always a complete

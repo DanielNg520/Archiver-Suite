@@ -187,6 +187,32 @@ let it drain normally.
 
 ---
 
+## Uploads look "stuck" but nothing is failing (min-batch holding)
+
+Symptom: `dispatcher stats` shows `pending` flat, none going to `failed`,
+dispatcher healthy. Usually the **min-batch gate**: platform albums are held
+until `min_batch_size` (default 10) files accumulate, or `min_batch_max_wait_h`
+(default 168h = 7 days) elapses.
+
+```
+dispatcher config set min_batch_size 1          # send whatever's pending now
+ops restart dispatcher                          # policies read at startup
+```
+
+Recorder (live) and chat_id (orphaned) rows are exempt and never held — if those
+aren't draining, it's a real problem (session/route), not batching.
+
+---
+
+## A file vanished without uploading (dedup suppression)
+
+If a file you dropped in is gone with no new Telegram message, and its **bytes
+were already sent**, this is by design: the dispatcher suppresses the duplicate
+and deletes it. The log shows `suppressed as duplicate of id=…`. Only the
+redundant copy is removed; the originally-sent file is untouched.
+
+---
+
 ## Disk filling up
 
 `ops health` shows the free-space figure. If it's getting tight:

@@ -53,12 +53,36 @@ auth code interactively and write a session file at
 
 ```
 dispatcher start                 # foreground drain loop
-dispatcher status                # queue counts + top pending
+dispatcher status                # process/queue health
+dispatcher stats                 # DB counts (pending/sending/sent/failed)
 dispatcher queue list --status pending --limit 100
 dispatcher queue retry <id>      # failed/sent -> pending
 dispatcher queue cancel <id>     # pending/sending -> failed
-dispatcher config show
+dispatcher config show           # effective .env + paths
+dispatcher config get  <key> [--platform P] [--user U]
+dispatcher config set  <key> <value> [--platform P] [--user U]
+dispatcher config unset <key> [--platform P] [--user U]
+dispatcher config list           # all scoped overrides
 ```
+
+### Queue-shaping behaviors (in the drain loop)
+
+- **Global content dedup.** Each claimed row is checked against an indexed
+  `content_hash`; if those bytes were already `sent`, the row is suppressed and
+  the redundant file is **deleted unconditionally** (independent of
+  `delete_after_upload`). Cleans up re-introduced already-uploaded files.
+- **Minimum-batch gate** (platform / `source=archiver` only). An album is held
+  until `min_batch_size` items (default 10) accumulate in the same
+  user+media-bucket; a partial flushes after `min_batch_max_wait_h` (default
+  168 = 7 days). Recorder and orphaned rows are exempt.
+  ```
+  dispatcher config set min_batch_size 10        # or 1 to disable
+  dispatcher config set min_batch_max_wait_h 168 --platform x
+  ```
+- **chat_id routing.** Rows from `output_dir/<chat_id>/…` carry an explicit
+  `chat_id` and route there; an unresolvable chat_id fails the batch cleanly.
+
+Policies are read at startup — **restart the dispatcher** after changing them.
 
 ## Smoke test (no archiver involvement)
 

@@ -74,6 +74,11 @@ class Item:
     sent_at:         str | None
     last_error:      str | None
     tg_message_id:   int | None
+    # Redesign columns (schema v1). Defaulted so callers that build an Item
+    # without them (and pre-backfill rows) stay valid.
+    content_hash:    str | None = None   # full SHA-256; global dedup key
+    chat_id:         str | None = None   # explicit Telegram dest (chat_id folders)
+    group_key:       str | None = None   # explicit album batch identity
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> "Item":

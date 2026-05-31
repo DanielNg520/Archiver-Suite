@@ -39,13 +39,16 @@ NOTE on frozen + PolicyStore:
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from core import PolicyStore, db_path as _core_db_path
+from core import PolicyStore, DownloadPolicy, db_path as _core_db_path
+
+log = logging.getLogger(__name__)
 
 load_dotenv(Path.home() / ".config" / "archiver-suite" / ".env")
 
@@ -63,6 +66,34 @@ def _req(key: str) -> str:
 
 def _opt(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
+
+
+def _load_local_platforms(store: PolicyStore) -> tuple[str, ...]:
+    """Read + VALIDATE the global `local_platforms` list from config.toml.
+
+    config.toml is hand-editable, and the value is consumed as
+    `for name in local_platforms`. If someone writes a bare string
+    (`local_platforms = "foo"`), Python would iterate its CHARACTERS into
+    phantom platforms — so coerce a lone string to a single-element list,
+    reject non-lists, and drop non-string / blank entries with a warning.
+    Returns a clean, lowercased, de-duplicated, ordered tuple."""
+    raw = store.get("local_platforms", default=[])
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        log.warning("config: local_platforms must be a list of strings, got "
+                    "%r — ignoring", raw)
+        return ()
+    names: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item.strip():
+            log.warning("config: local_platforms entry %r is not a non-empty "
+                        "string — skipping", item)
+            continue
+        name = item.strip().lower()
+        if name not in names:
+            names.append(name)
+    return tuple(names)
 
 
 # NOTE: The archiver no longer holds any Telegram configuration. Post-cutover
@@ -83,12 +114,16 @@ class XConfig:
     twid:       str
 
     @classmethod
-    def from_store(cls, store: PolicyStore) -> "XConfig":
+    def from_store(cls, store: PolicyStore, *, require_auth: bool = True) -> "XConfig":
+        # When download is disabled for this platform the orchestrator skips
+        # fetch + health-check, so auth is never used — don't demand it at load
+        # (lets you run a download-off X as reconcile/upload-only, no creds).
+        get = _req if require_auth else (lambda k: _opt(k, ""))
         return cls(
             users      = store.list_users("x"),
-            auth_token = _req("X_AUTH_TOKEN"),
-            ct0        = _req("X_CT0"),
-            twid       = _req("X_TWID"),
+            auth_token = get("X_AUTH_TOKEN"),
+            ct0        = get("X_CT0"),
+            twid       = get("X_TWID"),
         )
 
 
@@ -102,7 +137,9 @@ class TikTokConfig:
     cookie_refresh_days: float
 
     @classmethod
-    def from_store(cls, store: PolicyStore) -> "TikTokConfig":
+    def from_store(cls, store: PolicyStore, *, require_auth: bool = True) -> "TikTokConfig":
+        # TikTok reads cookies lazily (via _opt), so there's nothing to require
+        # at load; require_auth is accepted for a uniform call site.
         return cls(
             users               = store.list_users("tiktok"),
             cookies_file        = _opt("TIKTOK_COOKIES_FILE", "./cookies/tiktok.txt"),
@@ -139,7 +176,9 @@ class InstagramConfig:
                 )
 
     @classmethod
-    def from_store(cls, store: PolicyStore) -> "InstagramConfig":
+    def from_store(cls, store: PolicyStore, *, require_auth: bool = True) -> "InstagramConfig":
+        # Instagram reads cookies lazily (via _opt), so there's nothing to
+        # require at load; require_auth is accepted for a uniform call site.
         return cls(
             users               = store.list_users("instagram"),
             cookies_file        = _opt("INSTAGRAM_COOKIES_FILE", "./cookies/instagram.txt"),
@@ -174,6 +213,9 @@ class Config:
 
     enabled_platforms: frozenset[str] = field(default_factory=frozenset)
     reconcile_after_run: bool = False
+    # User-managed folders treated as platforms (no download). Names only;
+    # users are auto-discovered from {output_dir}/{name}/* subfolders.
+    local_platforms: tuple[str, ...] = ()
 
     @classmethod
     def load(cls, *, load_platform_configs: bool = True,
@@ -189,24 +231,30 @@ class Config:
         )
 
         # 3. Build per-platform config blocks only for enabled platforms
-        #    with at least one configured user in config.toml.
+        #    with at least one configured user in config.toml. A platform whose
+        #    download is disabled (DownloadPolicy) is built WITHOUT requiring
+        #    auth — it'll be reconcile/upload-only, no credentials needed.
+        dlp = DownloadPolicy(store)
         x_cfg = tt_cfg = ig_cfg = None
         if load_platform_configs:
             if "x" in enabled and store.list_users("x"):
-                x_cfg = XConfig.from_store(store)
+                x_cfg = XConfig.from_store(store, require_auth=dlp.enabled_for("x"))
 
             if "tiktok" in enabled and store.list_users("tiktok"):
-                tt_cfg = TikTokConfig.from_store(store)
+                tt_cfg = TikTokConfig.from_store(store, require_auth=dlp.enabled_for("tiktok"))
 
             if "instagram" in enabled and store.list_users("instagram"):
-                ig_cfg = InstagramConfig.from_store(store)
+                ig_cfg = InstagramConfig.from_store(store, require_auth=dlp.enabled_for("instagram"))
 
-        if require_platforms and not (x_cfg or tt_cfg or ig_cfg):
+        local_platforms = _load_local_platforms(store)
+
+        if require_platforms and not (x_cfg or tt_cfg or ig_cfg or local_platforms):
             raise RuntimeError(
                 "No platforms configured. Add users via "
                 "`archiver config add --platform <x|tiktok|instagram> "
-                "--user <name>`, and ensure ENABLED_PLATFORMS includes "
-                f"that platform in .env. (config.toml: {store.path})"
+                "--user <name>`, or add a user-managed folder via "
+                "`archiver local add <name>`, and ensure ENABLED_PLATFORMS "
+                f"includes that platform in .env. (config.toml: {store.path})"
             )
 
         return cls(
@@ -223,4 +271,5 @@ class Config:
             enabled_platforms = enabled,
             reconcile_after_run = _opt("RECONCILE_AFTER_RUN", "false").lower()
                                   in {"1", "true", "yes", "on"},
+            local_platforms   = local_platforms,
         )

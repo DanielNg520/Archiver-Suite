@@ -1,7 +1,12 @@
 """
-archiver.dedup
-──────────────
+core.dedup
+──────────
 Content-hash duplicate detection for one user's media directory.
+
+Lives in `core` (not archiver) because loose/orphaned files — dropped into
+chat_id-named folders that belong to no platform — are never visited by the
+archiver's per-(platform, user) loop. Dedup is a property of the SHARED store,
+so every producer's output runs through the same funnel.
 
 ALGORITHM: three-stage funnel.
   Stage 1: group all media files by exact byte size. Discard singletons.
@@ -56,7 +61,6 @@ DISK-DELETE SAFETY:
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import re
 from collections import defaultdict
@@ -64,8 +68,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Iterator
 
+from .hashing import partial_hash, full_hash, PARTIAL_HASH_BYTES
+
 if TYPE_CHECKING:
-    from core import ItemStore
+    from .store import ItemStore
 
 log = logging.getLogger(__name__)
 
@@ -84,17 +90,9 @@ _CANONICAL_RE = re.compile(
     r"^(?P<date>\d{8})_(?P<ident>.+?)(?:_(?P<num>\d+))?$"
 )
 
-# Partial-hash window. 64 KB is the sweet spot for media files:
-#   - Big enough that MP4 ftyp/moov boxes, JPEG SOI+APP segments, and
-#     PNG IHDR chunks have all started — different content diverges
-#     well within 64 KB.
-#   - Small enough that a million-file scan reads <60 GB total at this
-#     stage, vs. terabytes for full hashing every candidate.
-_PARTIAL_HASH_BYTES = 64 * 1024
-
-# Streaming chunk for full hash. 1 MB balances syscall overhead vs.
-# memory pressure. Standard choice for streaming hash patterns.
-_FULL_HASH_CHUNK = 1024 * 1024
+# Hash window/chunk constants and the hash primitives now live in core.hashing
+# (one definition, shared with ingest's content_hash stamping). This module
+# owns only the FUNNEL that arranges those primitives into a cheap-first scan.
 
 
 # ── Result types ──────────────────────────────────────────────────────────────
@@ -181,31 +179,8 @@ def _group_by_size(paths: Iterable[Path]) -> dict[int, list[Path]]:
 
 
 # ── Stage 2 & 3: hashing ──────────────────────────────────────────────────────
-
-def _hash_prefix(path: Path, n_bytes: int) -> str | None:
-    """SHA-256 of first n_bytes. Returns None on read failure."""
-    h = hashlib.sha256()
-    try:
-        with path.open("rb") as f:
-            h.update(f.read(n_bytes))
-    except OSError as e:
-        log.warning("dedup: partial-read failed on %s: %s", path, e)
-        return None
-    return h.hexdigest()
-
-
-def _hash_full(path: Path) -> str | None:
-    """Streaming full SHA-256. Returns None on read failure."""
-    h = hashlib.sha256()
-    try:
-        with path.open("rb") as f:
-            while chunk := f.read(_FULL_HASH_CHUNK):
-                h.update(chunk)
-    except OSError as e:
-        log.warning("dedup: full-read failed on %s: %s", path, e)
-        return None
-    return h.hexdigest()
-
+# Hash primitives are core.hashing.{partial_hash, full_hash}; this funnel just
+# arranges them cheap-first.
 
 def _funnel(paths: list[Path]) -> dict[str, list[Path]]:
     """
@@ -214,7 +189,7 @@ def _funnel(paths: list[Path]) -> dict[str, list[Path]]:
     """
     partial: dict[str, list[Path]] = defaultdict(list)
     for p in paths:
-        digest = _hash_prefix(p, _PARTIAL_HASH_BYTES)
+        digest = partial_hash(p, PARTIAL_HASH_BYTES)
         if digest is not None:
             partial[digest].append(p)
 
@@ -223,7 +198,7 @@ def _funnel(paths: list[Path]) -> dict[str, list[Path]]:
         if len(survivors) < 2:
             continue
         for p in survivors:
-            digest = _hash_full(p)
+            digest = full_hash(p)
             if digest is not None:
                 full[digest].append(p)
 
@@ -268,11 +243,18 @@ def _pick_winner(
         has_row     = ts is not None
         ts_for_sort = ts if ts is not None else "\uffff"
         # Negate the "higher is better" fields to put them first in asc sort.
+        # str(p) is the FINAL, total-order tiebreak: the orphaned/loose case
+        # routinely has TWO random-named copies with no sidecar, no row, and
+        # no timestamp (every prior field ties). Without it the survivor would
+        # depend on filesystem iteration order — non-deterministic across runs,
+        # so a re-scan could keep a DIFFERENT file and re-create the duplicate
+        # we just deleted. The absolute path is unique and stable.
         return (
             0 if canon else 1,
             0 if sidecar else 1,
             0 if has_row else 1,
             ts_for_sort,
+            str(p),
         )
 
     ranked = sorted(paths, key=sort_key)

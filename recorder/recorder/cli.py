@@ -26,9 +26,23 @@ from pathlib import Path
 
 import tomli_w
 
+from core import ItemStore
+from core import cli as core_cli
+
 from .config import CONFIG_TOML, RecorderConfig
 
 log = logging.getLogger(__name__)
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    """Shared `stats` noun — counts from the one suite DB, identical output to
+    archiver/dispatcher `stats`."""
+    config = RecorderConfig.load()
+    store = ItemStore.open(config.db_path)
+    try:
+        return core_cli.handle_stats(store, args)
+    finally:
+        store.close()
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -252,6 +266,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="fork into background (pid file in state_dir)")
     sub.add_parser("stop", help="stop a running recorder via pid file")
     sub.add_parser("status", help="show state + lock + user list")
+    core_cli.add_stats_parser(sub)   # shared `stats` noun (DB counts)
 
     p_cfg = sub.add_parser("config", help="manage the user list")
     cfg_sub = p_cfg.add_subparsers(dest="config_command", required=True)
@@ -270,6 +285,7 @@ _DISPATCH = {
     ("start", None):              cmd_start,
     ("stop", None):               cmd_stop,
     ("status", None):             cmd_status,
+    ("stats", None):              cmd_stats,
     ("config", "add"):            cmd_config_add,
     ("config", "remove"):         cmd_config_remove,
     ("config", "list"):           cmd_config_list,
