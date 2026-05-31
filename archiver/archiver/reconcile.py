@@ -36,6 +36,7 @@ checkpoint based on the discovered MAX(upload_date).
 from __future__ import annotations
 
 import logging
+import os
 import re
 import tomllib
 from dataclasses import dataclass, field
@@ -44,6 +45,12 @@ from typing import TYPE_CHECKING, Callable
 
 from core import identity, stability, cleanup_sidecars
 from core.hashing import full_hash
+
+# Upload priority for re-registered recordings. MUST match the recorder's live
+# enqueue (recorder.enqueue.RECORDER_PRIORITY) so a reconciled recording and a
+# freshly-recorded one drain in the same order. Default 5 = ahead of the
+# archiver's VOD backlog (10); override with $RECORDER_UPLOAD_PRIORITY.
+_RECORDER_PRIORITY = int(os.environ.get("RECORDER_UPLOAD_PRIORITY", "5"))
 
 if TYPE_CHECKING:
     from core import ItemStore
@@ -182,7 +189,7 @@ def reconcile_recordings(
             source="recorder",
             caption_for_path=lambda path: _recording_caption("_root", path),
             identifier_for_path=_recorder_identifier,
-            priority=20,
+            priority=_RECORDER_PRIORITY,
         ))
 
     for user_dir in sorted(p for p in root.iterdir() if p.is_dir()):
@@ -200,7 +207,7 @@ def reconcile_recordings(
                 _recording_caption(user, path)
             ),
             identifier_for_path=_recorder_identifier,
-            priority=20,
+            priority=_RECORDER_PRIORITY,
         ))
     return reports
 
