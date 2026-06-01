@@ -43,10 +43,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils as tg_utils
 from telethon.errors import FloodWaitError
+from telethon.tl import types as tg_types
+
+from core.files import media_bucket
+
+from .media_meta import probe_video
 
 log = logging.getLogger(__name__)
+
+
+def _video_attributes(file_path: str):
+    """Explicit [DocumentAttributeVideo] for a video, or None.
+
+    Telethon can't infer video dimensions without the optional `hachoir`
+    dependency (absent here), so it would otherwise attach a 1×1 / 0-duration
+    placeholder and Telegram would render the clip at a bogus resolution. We
+    probe the real display geometry with ffprobe and hand Telethon a correct
+    attribute, which get_attributes() merges in (overriding the placeholder).
+    None → not a video, or probe failed; caller uploads as-is."""
+    meta = probe_video(file_path)
+    if meta is None:
+        return None
+    return [tg_types.DocumentAttributeVideo(
+        duration=meta.duration, w=meta.width, h=meta.height,
+        supports_streaming=True,
+    )]
 
 
 # ── Result shape ──────────────────────────────────────────────────────────
@@ -166,9 +189,12 @@ class TelethonSendStrategy(SendStrategy):
                 error=f"parent dir unreachable: {Path(file_path).parent}",
             )
 
+        attributes = _video_attributes(file_path)
+
         async def _do():
             await self._client.send_file(
                 peer, file_path, caption=caption, supports_streaming=True,
+                attributes=attributes,
             )
         return await self._send_with_retries(_do, what=Path(file_path).name)
 
@@ -198,12 +224,49 @@ class TelethonSendStrategy(SendStrategy):
         # caption only on the first item; rest None.
         captions: list[str | None] = [caption] + [None] * (len(file_paths) - 1)
 
+        # Photo albums are sent the original way (paths): Telethon resizes
+        # photos and the 1×1 placeholder bug is video-only, so there's nothing
+        # to fix and no reason to bypass its photo handling. Video albums need
+        # the custom path — see _build_album_item. Albums are homogeneous
+        # (drain groups by media bucket), so the anchor's bucket decides.
+        is_video_album = media_bucket(file_paths[0]) == "video"
+
         async def _do():
+            if is_video_album:
+                # Telethon's album path (_send_album) doesn't forward an
+                # `attributes=` argument, so bare paths would give every video
+                # the same 1×1 placeholder. Pre-build each item as InputMedia
+                # with explicit attributes — the only way to get correct
+                # per-video geometry in a multi-item album.
+                payload = [await self._build_album_item(fp) for fp in file_paths]
+            else:
+                payload = file_paths
             await self._client.send_file(
-                peer, file_paths, caption=captions, supports_streaming=True,
+                peer, payload, caption=captions, supports_streaming=True,
             )
         return await self._send_with_retries(
             _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
+        )
+
+    async def _build_album_item(self, file_path: str):
+        """Upload one video and wrap it as an InputMediaUploadedDocument for an
+        album send, injecting explicit display geometry when we have it.
+
+        Only called for video albums (see send_album). Telethon's _send_album
+        accepts pre-built InputMedia and preserves the baked-in attributes,
+        which is how we get per-item dimensions the path-list album API can't
+        express. If the probe failed for this file, we still upload it as a
+        video document — just without the explicit attribute (status quo for
+        that one file), never as a photo."""
+        assert self._client is not None
+        handle = await self._client.upload_file(file_path)
+        attrs, mime = tg_utils.get_attributes(
+            file_path,
+            attributes=_video_attributes(file_path),  # None → no override
+            supports_streaming=True,
+        )
+        return tg_types.InputMediaUploadedDocument(
+            file=handle, mime_type=mime, attributes=attrs,
         )
 
     async def _send_with_retries(self, send_fn, *, what: str) -> SendResult:
