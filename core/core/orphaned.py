@@ -155,6 +155,11 @@ def ingest_folder(
                 continue
         except OSError:
             continue
+        # Skip dotfiles — chiefly macOS AppleDouble sidecars (._name) on
+        # exFAT/FAT volumes: they pass the extension filter but are metadata
+        # stubs, not media. Matches dedup.py's convention.
+        if f.name.startswith("."):
+            continue
         if f.suffix.lower() not in MEDIA_EXTENSIONS:
             continue
         rep.scanned += 1

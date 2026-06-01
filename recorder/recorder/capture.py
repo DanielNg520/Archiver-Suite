@@ -182,6 +182,13 @@ class StreamCapture:
         for p in self._run_dir.iterdir():
             if not p.is_file():
                 continue
+            # Skip dotfiles — chiefly macOS AppleDouble companions (._name)
+            # the OS auto-creates next to every file on exFAT/FAT volumes.
+            # They carry the recording's extension but are 4KB metadata stubs,
+            # not recordings; enqueuing them spawns phantom rows that vanish
+            # (→ "file missing on disk") or upload as junk.
+            if p.name.startswith("."):
+                continue
             if p.suffix in (".part", ".ytdl", ".temp", ".log"):
                 continue
             try:
