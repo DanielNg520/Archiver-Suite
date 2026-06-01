@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
+import time
 from pathlib import Path
 
 from core import (
@@ -35,6 +37,11 @@ from .delete import maybe_delete
 from .send import SendStrategy
 
 log = logging.getLogger(__name__)
+
+# How often the drain loop re-runs failed-row retention GC. The retention
+# WINDOW is config.failed_retention_days; this is just how often we check.
+# A few times a day is ample — failed rows accrue slowly and pruning is cheap.
+_PRUNE_EVERY_S = 6 * 3600
 
 
 def is_tiktok_live(item: Item) -> bool:
@@ -120,16 +127,37 @@ async def drain_forever(
     # Startup watchdog: revert rows left 'sending' by a crashed predecessor.
     store.reset_stuck_sending(older_than_minutes=config.stuck_claim_min)
 
+    # Retention GC cadence. last_prune=0 makes the first loop iteration run it
+    # immediately (covering startup), then again every _PRUNE_EVERY_S.
+    last_prune = 0.0
+
     while True:
         if stop_event is not None and stop_event.is_set():
             log.info("drain: stop requested, exiting cleanly")
             return
+
+        now = time.monotonic()
+        if now - last_prune >= _PRUNE_EVERY_S:
+            try:
+                store.prune_failed(config.failed_retention_days)
+            except Exception as exc:
+                # Retention is housekeeping — never let it kill the daemon.
+                log.exception("drain: retention prune raised: %s", exc)
+            last_prune = now
 
         try:
             batch = store.claim_batch(
                 min_batch=_min_batch, flush_age_s=_flush_age_s)
         except ClaimContentionError as exc:
             log.warning("drain: %s — backing off", exc)
+            await asyncio.sleep(config.poll_interval_s)
+            continue
+        except sqlite3.OperationalError as exc:
+            # Last-resort net: claim retries the write lock past busy_timeout
+            # (core.store._begin_immediate), so reaching here means contention
+            # outlasted even that. A transient lock must never kill the daemon —
+            # back off and poll again rather than letting it propagate to exit.
+            log.warning("drain: claim hit a locked DB (%s) — backing off", exc)
             await asyncio.sleep(config.poll_interval_s)
             continue
         if not batch:

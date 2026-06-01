@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import subprocess
 import threading
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -45,6 +46,65 @@ from .lock import TikTokLock
 from .platforms.base import LivePlatform
 
 log = logging.getLogger(__name__)
+
+_VIDEO_SUFFIXES = frozenset({".mp4", ".ts", ".mkv", ".webm", ".flv", ".m4v"})
+
+
+def _remux_for_telegram(src: Path) -> Path:
+    """Remux src to a progressive MP4 with moov atom at the front.
+
+    HLS live streams recorded with --hls-use-mpegts land as MPEG-TS content
+    (no valid MP4 moov structure), and even .mp4-extension files from ffmpeg's
+    HLS downloader are often fragmented/streaming-layout. Telegram can't play
+    either format inline. A -c copy remux to +faststart MP4 takes seconds
+    (no re-encode, just container surgery) and fixes both cases.
+
+    Returns the path to upload — remuxed on success, unchanged src on failure.
+    Never raises; a failed remux falls back to the original so no recording
+    is ever lost."""
+    if src.suffix.lower() not in _VIDEO_SUFFIXES:
+        return src
+
+    # If src is already .mp4 we can't overwrite it while ffmpeg reads it,
+    # so write to a temp name and rename over it after.
+    if src.suffix.lower() == ".mp4":
+        tmp = src.with_name(src.stem + "._tmp.mp4")
+        final = src
+    else:
+        tmp = src.with_suffix(".mp4")
+        final = tmp
+
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(src), "-c", "copy",
+        "-movflags", "+faststart",
+        str(tmp),
+    ]
+    try:
+        result = subprocess.run(cmd, timeout=600, capture_output=True)
+        if result.returncode != 0:
+            stderr = result.stderr.decode(errors="replace").strip()
+            raise RuntimeError(f"ffmpeg rc={result.returncode}: {stderr}")
+    except (subprocess.TimeoutExpired, OSError, RuntimeError) as e:
+        log.warning("remux: %s: failed (%s) — uploading original", src.name, e)
+        tmp.unlink(missing_ok=True)
+        return src
+
+    try:
+        src.unlink()
+    except OSError as e:
+        log.debug("remux: could not remove source %s: %s", src.name, e)
+
+    if tmp != final:
+        try:
+            tmp.rename(final)
+        except OSError as e:
+            log.warning("remux: rename %s → %s failed: %s — using tmp path",
+                        tmp.name, final.name, e)
+            return tmp
+
+    log.info("remux: %s → %s (telegram-ready mp4)", src.name, final.name)
+    return final
 
 
 class RecorderState(Enum):
@@ -269,9 +329,10 @@ class StateMachine:
         daemon uploader thread and the one-shot record_once drain so both build
         the caption and handle failures identically."""
         try:
+            upload_path = _remux_for_telegram(job.file_path)
             caption = (f"@{job.username} · tiktok · live · "
-                       f"{job.file_path.stem}")
-            self.enqueue("tiktok", job.username, str(job.file_path), caption)
+                       f"{upload_path.stem}")
+            self.enqueue("tiktok", job.username, str(upload_path), caption)
         except Exception as e:
             # Keep the file on disk; ops can re-enqueue via the dispatcher
             # CLI. Losing the recording is the only unacceptable outcome,

@@ -93,6 +93,27 @@ def find_profile_by_name(name: str) -> Path:
 
 # ── Cookie extraction ─────────────────────────────────────────────────────────
 
+def _expiry_seconds(expiry) -> int:
+    """Normalize a cookie expiry to whole seconds since the epoch.
+
+    The Netscape cookies.txt format (consumed by yt-dlp/ffmpeg/curl) expects
+    seconds, but some browser stores keep this field in milliseconds. Anything
+    larger than a plausible second-granularity timestamp (~year 2286) is
+    treated as milliseconds and scaled down. A missing/zero value (session
+    cookie) is preserved as 0.
+    """
+    try:
+        v = int(expiry)
+    except (TypeError, ValueError):
+        return 0
+    if v <= 0:
+        return 0
+    # 10-digit seconds top out around year 2286 (1e10); ms timestamps are 13.
+    while v > 9_999_999_999:
+        v //= 1000
+    return v
+
+
 def _read_cookies(profile_path: Path, domain_filter: str) -> list[dict]:
     """
     Read cookies whose host matches domain_filter (e.g. 'tiktok.com').
@@ -137,7 +158,7 @@ def _read_cookies(profile_path: Path, domain_filter: str) -> list[dict]:
             "subdomains": "TRUE",
             "path":   row["path"],
             "secure": "TRUE" if row["isSecure"] else "FALSE",
-            "expiry": str(row["expiry"]),
+            "expiry": str(_expiry_seconds(row["expiry"])),
             "name":   row["name"],
             "value":  row["value"],
         })

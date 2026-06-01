@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Iterator
@@ -37,6 +38,14 @@ from .files import media_bucket, ALBUM_MAX
 log = logging.getLogger(__name__)
 
 _CLAIM_RETRIES = 5
+
+# busy_timeout (schema.connect) already blocks-and-retries inside SQLite for
+# brief writer contention. But a bulk producer can hold the single WAL writer
+# lock past that window, and a momentary lock must never kill a long-running
+# daemon. So acquiring the write lock backs off and retries beyond busy_timeout
+# rather than letting OperationalError('database is locked') escape. A failed
+# BEGIN leaves no open transaction, so each retry is clean.
+_BEGIN_RETRIES = 6
 
 
 class ClaimContentionError(RuntimeError):
@@ -139,13 +148,31 @@ class ItemStore:
             yield self.conn.cursor()
             return
         cur = self.conn.cursor()
-        cur.execute("BEGIN IMMEDIATE")
+        self._begin_immediate(cur)
         try:
             yield cur
             self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
+
+    def _begin_immediate(self, cur: sqlite3.Cursor) -> None:
+        """Take the WAL write lock up front, tolerating transient cross-process
+        contention. A producer holding the writer lock past busy_timeout would
+        otherwise surface as OperationalError('database is locked') and, with no
+        retry here, propagate out of claim_* and crash the dispatcher. Retrying
+        with backoff turns that momentary lock into a brief wait. Only 'locked'
+        errors retry; any other OperationalError is re-raised immediately."""
+        for i in range(_BEGIN_RETRIES):
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or i == _BEGIN_RETRIES - 1:
+                    raise
+                log.warning("write lock contended, retrying (%d/%d)",
+                            i + 1, _BEGIN_RETRIES)
+                time.sleep(0.2 * (2 ** i))
 
     def _commit(self) -> None:
         """Commit one autocommit-style write — UNLESS a batch() is open, in
@@ -595,6 +622,40 @@ class ItemStore:
         if n:
             log.warning("watchdog: reset %d stuck-sending item(s) older than %dm",
                         n, older_than_minutes)
+        return n
+
+    def prune_failed(self, older_than_days: float) -> int:
+        """Retention GC: delete terminal 'failed' rows older than the window.
+        Returns rows deleted. older_than_days <= 0 disables (returns 0).
+
+        A 'failed' row is inert — the drain loop only ever claims 'pending' —
+        but it otherwise lives forever, so this caps unbounded growth (e.g. the
+        tombstones left by files deleted off disk and never restored).
+
+        Anchored on discovered_at: there is no failed_at column (adding one
+        would bump the schema version and force every component to upgrade in
+        lockstep). For the common case — a missing file that fails on its first
+        claim — discovered_at ≈ the failure time; more generally 'in the system
+        N+ days and still undelivered' is exactly what we want to collect.
+
+        TRADE-OFF: pruning a row drops the tombstone that stopped a reconcile
+        sweep from re-enqueuing that exact path/identity. With a multi-day
+        window that's intended — by then the file is genuinely gone — and if it
+        does reappear, re-queuing it is the correct behavior anyway."""
+        if older_than_days <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(days=older_than_days)
+                  ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with self._immediate() as cur:
+            cur.execute(
+                "DELETE FROM items WHERE status='failed' AND discovered_at < ?",
+                (cutoff,),
+            )
+            n = cur.rowcount
+        if n:
+            log.info("retention: pruned %d failed row(s) older than %.1f day(s)",
+                     n, older_than_days)
         return n
 
     def get(self, item_id: int) -> Item | None:

@@ -77,6 +77,10 @@ class DispatcherConfig:
     max_flood_wait_s:   int   = 600
     inter_album_sleep:  float = 2.0
     stuck_claim_min:    int   = 10    # watchdog threshold
+    # Retention: auto-delete terminal 'failed' rows older than this many days
+    # (e.g. tombstones for files deleted off disk and never restored). 0
+    # disables. Tune via FAILED_RETENTION_DAYS in ~/.config/dispatcher/.env.
+    failed_retention_days: float = 7.0
 
     @classmethod
     def load(cls, *, require_telegram: bool = True) -> "DispatcherConfig":
@@ -101,6 +105,7 @@ class DispatcherConfig:
             max_flood_wait_s  = int(_opt("MAX_FLOOD_WAIT_S", "600")),
             inter_album_sleep = float(_opt("INTER_ALBUM_SLEEP", "2.0")),
             stuck_claim_min   = int(_opt("STUCK_CLAIM_MIN", "10")),
+            failed_retention_days = float(_opt("FAILED_RETENTION_DAYS", "7")),
         )
 
     def config_toml_path(self) -> Path:
