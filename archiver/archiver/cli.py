@@ -838,7 +838,8 @@ def _cmd_boolpolicy(
 
     if action == "set":
         platform = args.platform
-        username = args.user.lstrip("@") if args.user else None
+        user = getattr(args, "user", None)
+        username = user.lstrip("@") if user else None
         if username and not platform:
             log.error("%s set: --user requires --platform", cmd_label)
             return 2
@@ -854,7 +855,8 @@ def _cmd_boolpolicy(
 
     if action == "unset":
         platform = args.platform
-        username = args.user.lstrip("@") if args.user else None
+        user = getattr(args, "user", None)
+        username = user.lstrip("@") if user else None
         if username and not platform:
             log.error("%s unset: --user requires --platform", cmd_label)
             return 2
