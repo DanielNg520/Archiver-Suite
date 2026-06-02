@@ -39,16 +39,18 @@ from __future__ import annotations
 import abc
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, utils as tg_utils
-from telethon.errors import FloodWaitError
+from telethon.errors import FloodWaitError, ImageProcessFailedError
 from telethon.tl import types as tg_types
 
 from core.files import media_bucket
 
+from . import image_fix
 from .media_meta import probe_video
 
 log = logging.getLogger(__name__)
@@ -81,10 +83,16 @@ class SendResult:
       ok=True                  -> success
       ok=False, flood_wait_s=N -> server-side rate limit; requeue
       ok=False, error="..."    -> real failure; count an attempt
+
+    image_process_failed flags the specific case where Telegram rejected the
+    file(s) during photo processing (IMAGE_PROCESS_FAILED). It's deterministic,
+    so the retry envelope returns immediately and the caller normalizes the
+    image(s) with image_fix before a single re-send rather than burning retries.
     """
-    ok:            bool
-    error:         str | None = None
-    flood_wait_s:  int | None = None
+    ok:                   bool
+    error:                str | None = None
+    flood_wait_s:         int | None = None
+    image_process_failed: bool = False
 
 
 # ── Strategy ABC ──────────────────────────────────────────────────────────
@@ -196,7 +204,29 @@ class TelethonSendStrategy(SendStrategy):
                 peer, file_path, caption=caption, supports_streaming=True,
                 attributes=attributes,
             )
-        return await self._send_with_retries(_do, what=Path(file_path).name)
+        result = await self._send_with_retries(_do, what=Path(file_path).name)
+        if result.ok or not result.image_process_failed:
+            return result
+
+        # Telegram refused to process this image as a photo. Normalize it with
+        # ffmpeg and re-send once; on conversion failure keep the original
+        # result so the drain loop counts the attempt.
+        safe = await asyncio.to_thread(image_fix.make_safe_photo, file_path)
+        if not safe:
+            return result
+        try:
+            async def _do_retry():
+                await self._client.send_file(
+                    peer, safe, caption=caption, supports_streaming=True,
+                )
+            return await self._send_with_retries(
+                _do_retry, what=f"{Path(file_path).name} (converted)",
+            )
+        finally:
+            try:
+                os.unlink(safe)
+            except OSError:
+                pass
 
     async def send_album(
         self,
@@ -230,23 +260,101 @@ class TelethonSendStrategy(SendStrategy):
         # the custom path — see _build_album_item. Albums are homogeneous
         # (drain groups by media bucket), so the anchor's bucket decides.
         is_video_album = media_bucket(file_paths[0]) == "video"
+        if not is_video_album:
+            return await self._send_photo_album(peer, file_paths, captions)
 
         async def _do():
-            if is_video_album:
-                # Telethon's album path (_send_album) doesn't forward an
-                # `attributes=` argument, so bare paths would give every video
-                # the same 1×1 placeholder. Pre-build each item as InputMedia
-                # with explicit attributes — the only way to get correct
-                # per-video geometry in a multi-item album.
-                payload = [await self._build_album_item(fp) for fp in file_paths]
-            else:
-                payload = file_paths
+            # Telethon's album path (_send_album) doesn't forward an
+            # `attributes=` argument, so bare paths would give every video
+            # the same 1×1 placeholder. Pre-build each item as InputMedia
+            # with explicit attributes — the only way to get correct
+            # per-video geometry in a multi-item album.
+            payload = [await self._build_album_item(fp) for fp in file_paths]
             await self._client.send_file(
                 peer, payload, caption=captions, supports_streaming=True,
             )
         return await self._send_with_retries(
             _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
         )
+
+    async def _send_photo_album(
+        self,
+        peer: Any,
+        file_paths: list[str],
+        captions: list[str | None],
+    ) -> SendResult:
+        """Send a photo album, normalizing any image Telegram would reject.
+
+        Two-phase:
+          1. Preflight — probe each file and isolate the ones that violate
+             Telegram's photo limits, re-encoding only those to a safe JPEG
+             (image_fix). Good files are sent untouched. The whole batch still
+             goes out together as one album.
+          2. Fallback — if the album is STILL rejected (an odd encoding that
+             passed the dimension/size preflight), re-encode every remaining
+             original and retry the album once. After that we give up and let
+             the drain loop mark the batch failed.
+
+        Temp files from any conversion are always cleaned up.
+        """
+        temps: list[str] = []
+        try:
+            prepared: list[str] = []
+            for fp in file_paths:
+                verdict = await asyncio.to_thread(image_fix.photo_needs_fix, fp)
+                if verdict is True:
+                    safe = await asyncio.to_thread(image_fix.make_safe_photo, fp)
+                    if safe:
+                        temps.append(safe)
+                        prepared.append(safe)
+                    else:
+                        prepared.append(fp)  # conversion failed → best effort
+                else:
+                    # False (safe) or None (extreme aspect ratio we can't fix
+                    # into a clean photo) → send the original as-is.
+                    prepared.append(fp)
+
+            what = f"album[{len(prepared)}] {Path(file_paths[0]).name}…"
+
+            async def _do():
+                await self._client.send_file(
+                    peer, prepared, caption=captions, supports_streaming=True,
+                )
+            result = await self._send_with_retries(_do, what=what)
+            if result.ok or not result.image_process_failed:
+                return result
+
+            # Preflight passed but Telegram still rejected something — convert
+            # every not-yet-converted original and retry the album once.
+            log.warning(
+                "image_fix: %s still rejected after preflight — converting "
+                "remaining originals and retrying", what,
+            )
+            retry_paths: list[str] = []
+            for orig, prep in zip(file_paths, prepared):
+                if prep in temps:        # already a converted temp
+                    retry_paths.append(prep)
+                    continue
+                safe = await asyncio.to_thread(image_fix.make_safe_photo, orig)
+                if safe:
+                    temps.append(safe)
+                    retry_paths.append(safe)
+                else:
+                    retry_paths.append(orig)
+
+            async def _do_retry():
+                await self._client.send_file(
+                    peer, retry_paths, caption=captions, supports_streaming=True,
+                )
+            return await self._send_with_retries(
+                _do_retry, what=f"{what} (converted)",
+            )
+        finally:
+            for t in temps:
+                try:
+                    os.unlink(t)
+                except OSError:
+                    pass
 
     async def _build_album_item(self, file_path: str):
         """Upload one video and wrap it as an InputMediaUploadedDocument for an
@@ -293,6 +401,20 @@ class TelethonSendStrategy(SendStrategy):
                 log.warning("telethon: FloodWait %ds (%s) — sleeping", wait_s, what)
                 await asyncio.sleep(wait_s)
                 continue   # do NOT count as an attempt
+
+            except ImageProcessFailedError as e:
+                # Deterministic: the server can't process this image as a
+                # photo, so retrying the identical send is pointless. Surface
+                # it so the caller can normalize the file and re-send once.
+                log.warning(
+                    "telethon: image rejected (%s): %s — normalizing & retrying",
+                    what, e,
+                )
+                return SendResult(
+                    ok=False,
+                    error=f"{type(e).__name__}: {e}",
+                    image_process_failed=True,
+                )
 
             except (ConnectionError, OSError) as e:
                 attempts += 1
