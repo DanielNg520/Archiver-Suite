@@ -875,7 +875,8 @@ def _cmd_boolpolicy(
     log.info("  default for %s: %s", policy.KEY, default_value)
     log.info("")
 
-    user_filter = args.user.lstrip("@") if args.user else None
+    user = getattr(args, "user", None)
+    user_filter = user.lstrip("@") if user else None
     rows = 0
     platforms = [args.platform] if args.platform else PLATFORM_CHOICES
     for platform in platforms:
