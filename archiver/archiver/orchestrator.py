@@ -157,6 +157,10 @@ class Archiver:
             }
 
         self._warn_unmanaged_root_files()
+        # Filesystem normalization FIRST: move output_dir/unsorted/ files into
+        # their <platform>/<username>/ home so the fetch/reconcile/ingest phases
+        # below see them in place (policy-gated, default off).
+        self._maybe_sort_unsorted()
         platforms = build_platforms(self.config)
         # Full platform-name set (before any --platform filter) so the orphaned
         # ingest pass knows which top-level dirs are platforms vs chat_id folders.
@@ -201,6 +205,22 @@ class Archiver:
         DOWNLOAD_ENABLED=false. Non-fetching platforms skip the auth/health +
         download steps and are handled by the reconcile-and-upload-only path."""
         return platform.fetches and self.download_policy.enabled_for(platform.name)
+
+    def _maybe_sort_unsorted(self) -> None:
+        """When the sort_unsorted policy is on, sweep output_dir/unsorted/ and
+        move username_timestamp-named files into <platform>/<username>/ — the
+        automated form of `archiver sort`. Default off; toggle via
+        `archiver auto-sort`. Pure filesystem move, no DB writes."""
+        from core import SortPolicy, sort_unsorted
+
+        policy = SortPolicy(self.config.policy_store)
+        if not policy.enabled():
+            return
+        rep = sort_unsorted(self.config.output_dir,
+                            platform=policy.target_platform())
+        if rep.moved or rep.skipped_no_username or rep.skipped_collision \
+                or rep.errors:
+            log.info("auto-sort: %s", rep)
 
     def _maybe_ingest_orphaned(self, known_platform_names: set[str]) -> None:
         """When the auto_ingest_orphaned policy is on, scan output_dir's

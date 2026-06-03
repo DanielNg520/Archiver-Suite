@@ -199,6 +199,39 @@ class AutoIngestPolicy(BooleanPolicy):
         return value
 
 
+class SortPolicy(BooleanPolicy):
+    """Whether `archiver start` first sorts output_dir/unsorted/ each cycle —
+    moving username_timestamp-named files into <platform>/<username>/ before the
+    fetch/reconcile/ingest phases see them. Global toggle, default OFF (the sort
+    only runs when you opt in; `archiver sort` works on demand regardless).
+
+    The destination platform for the sweep is a companion string key (default
+    'instagram'), since unsorted filenames carry the username but not which
+    platform folder they belong under. Set with `archiver auto-sort set`."""
+    KEY              = "sort_unsorted"
+    DEFAULT          = False
+    PLATFORM_KEY     = "sort_unsorted_platform"
+    DEFAULT_PLATFORM = "instagram"
+
+    def enabled(self) -> bool:
+        """Global-scope read (no platform/user dimension for this toggle)."""
+        value = self._store.get(self.KEY, default=self.DEFAULT)
+        if not isinstance(value, bool):
+            log.warning("policy %s: non-bool %r — using %s",
+                        self.KEY, value, self.DEFAULT)
+            return self.DEFAULT
+        return value
+
+    def target_platform(self) -> str:
+        """Destination platform folder for the auto-sort sweep."""
+        value = self._store.get(self.PLATFORM_KEY, default=self.DEFAULT_PLATFORM)
+        if not isinstance(value, str) or not value.strip():
+            log.warning("policy %s: non-string %r — using %s",
+                        self.PLATFORM_KEY, value, self.DEFAULT_PLATFORM)
+            return self.DEFAULT_PLATFORM
+        return value.strip()
+
+
 # ── Validation ────────────────────────────────────────────────────────────────
 
 def validate_overrides(

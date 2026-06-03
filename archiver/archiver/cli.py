@@ -50,6 +50,7 @@ from .reconcile import (
 
 from core import ItemStore, DeletePolicy, RecorderDeletePolicy, DedupPolicy
 from core import AutoIngestPolicy, DownloadPolicy, ProtectionPolicy, DeletionGuard
+from core import SortPolicy
 from core import cli as core_cli
 
 
@@ -140,6 +141,36 @@ def build_parser() -> argparse.ArgumentParser:
     ai_set = ai_sub.add_parser("set", help="Enable or disable auto-ingest")
     ai_set.add_argument("--enabled", choices=["true", "false"], required=True)
     ai_sub.add_parser("unset", help="Remove the setting (back to default: off)")
+
+    # ── sort (route output_dir/unsorted/ into <platform>/<username>/) ───
+    s_sort = sub.add_parser(
+        "sort",
+        help="Move files from output_dir/unsorted/ into <platform>/<username>/ "
+             "by parsing username_timestamp filenames. Then they upload like "
+             "any platform file.")
+    s_sort.add_argument(
+        "--platform", default="instagram",
+        help="Destination platform folder (default instagram).")
+    s_sort.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview the moves without changing anything on disk.")
+    s_sort.add_argument(
+        "--unsorted-name", default="unsorted", metavar="NAME",
+        help="Source folder name under output_dir (default 'unsorted').")
+
+    # ── auto-sort (toggle) ───
+    s_au = sub.add_parser(
+        "auto-sort",
+        help="Show/toggle automatic sort of output_dir/unsorted/ each "
+             "`archiver start` cycle. Default off.")
+    au_sub = s_au.add_subparsers(dest="as_action", required=False, metavar="ACTION",
+                                 help="omit to print state; 'set'/'unset' to change")
+    au_set = au_sub.add_parser("set", help="Enable or disable auto-sort")
+    au_set.add_argument("--enabled", choices=["true", "false"], required=True)
+    au_set.add_argument(
+        "--platform", default=None,
+        help="Destination platform for auto-sort (default instagram).")
+    au_sub.add_parser("unset", help="Remove the setting (back to default: off)")
 
     # ── local (user-managed folders treated as platforms, no download) ───
     s_local = sub.add_parser(
@@ -501,6 +532,50 @@ def cmd_auto_ingest(args, config: Config, db: ItemStore) -> int:
         return 0
     value, source = store.explain(policy.KEY, default=policy.DEFAULT)
     log.info("auto-ingest (key=%s): %s  (from %s)", policy.KEY, value, source)
+    return 0
+
+
+def cmd_sort(args, config: Config, db: ItemStore) -> int:
+    """Move loose files from output_dir/unsorted/ into <platform>/<username>/,
+    parsing the username out of username_timestamp_… filenames. Pure filesystem
+    move — the normal reconcile/upload path picks the files up afterward."""
+    from core import sort_unsorted
+
+    rep = sort_unsorted(
+        config.output_dir,
+        platform         = args.platform,
+        dry_run          = args.dry_run,
+        unsorted_dirname = args.unsorted_name,
+    )
+    print(rep)
+    for err in rep.errors:
+        print("  error:", err)
+    return 0
+
+
+def cmd_auto_sort(args, config: Config, db: ItemStore) -> int:
+    """Show/toggle the global sort_unsorted policy (and its target platform)."""
+    store  = config.policy_store
+    policy = SortPolicy(store)
+    action = getattr(args, "as_action", None)
+    if action == "set":
+        value = args.enabled == "true"
+        store.set(policy.KEY, value)
+        if args.platform:
+            store.set(policy.PLATFORM_KEY, args.platform.strip())
+        log.info("auto-sort set: global → %s, platform=%s (key=%s)",
+                 value, policy.target_platform(), policy.KEY)
+        log.info("Takes effect on the next `archiver start` cycle.")
+        return 0
+    if action == "unset":
+        removed = store.unset(policy.KEY)
+        store.unset(policy.PLATFORM_KEY)
+        log.info("auto-sort unset: %s",
+                 "removed (back to default: off)" if removed else "was not set")
+        return 0
+    value, source = store.explain(policy.KEY, default=policy.DEFAULT)
+    log.info("auto-sort (key=%s): %s  (from %s); target platform=%s",
+             policy.KEY, value, source, policy.target_platform())
     return 0
 
 
@@ -1576,7 +1651,7 @@ def main() -> int:
     config_only = args.cmd in {
         "config", "platform", "run-settings", "migrate", "policy",
         "dedup-policy", "safebrake", "purge-sent", "stats", "ingest", "queue",
-        "backfill", "auto-ingest", "local", "download",
+        "backfill", "auto-ingest", "local", "download", "sort", "auto-sort",
     }
     if args.cmd == "reset" and args.reset_cmd in {"failed", "user"}:
         config_only = True
@@ -1607,6 +1682,8 @@ def main() -> int:
             "queue":        cmd_queue,
             "ingest":       cmd_ingest,
             "auto-ingest":  cmd_auto_ingest,
+            "sort":         cmd_sort,
+            "auto-sort":    cmd_auto_sort,
             "local":        cmd_local,
             "download":     cmd_download,
             "backfill":     cmd_backfill,

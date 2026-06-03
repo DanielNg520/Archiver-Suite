@@ -14,7 +14,7 @@ from .policy_store import PolicyStore
 from .policies import (
     DeletePolicy, RecorderDeletePolicy, DedupPolicy, BooleanPolicy,
     BatchPolicy, AutoIngestPolicy, DownloadPolicy, ProtectionPolicy,
-    validate_overrides,
+    SortPolicy, validate_overrides,
 )
 from .files import cleanup_sidecars
 from .deletion import DeletionGuard
@@ -26,6 +26,7 @@ from .orphaned import (
     ORPHANED_SOURCE, ORPHANED_PLATFORM,
 )
 from .backfill import backfill_content_hashes, BackfillReport
+from .sorter import sort_unsorted, SortReport, extract_username
 
 __all__ = [
     "Item", "Status", "TERMINAL",
@@ -34,7 +35,7 @@ __all__ = [
     "ProducerStore", "QueueStore", "AdminStore",
     "PolicyStore", "DeletePolicy", "RecorderDeletePolicy", "DedupPolicy",
     "BooleanPolicy", "BatchPolicy", "AutoIngestPolicy", "DownloadPolicy",
-    "ProtectionPolicy", "validate_overrides", "cleanup_sidecars",
+    "ProtectionPolicy", "SortPolicy", "validate_overrides", "cleanup_sidecars",
     "DeletionGuard",
     "dedup_user", "DedupReport", "DupGroup",
     "register_file", "IngestResult", "IngestOutcome",
@@ -42,4 +43,5 @@ __all__ = [
     "ingest_chat_id_dirs", "ingest_folder", "OrphanedReport", "subfolder_of",
     "ORPHANED_SOURCE", "ORPHANED_PLATFORM",
     "backfill_content_hashes", "BackfillReport",
+    "sort_unsorted", "SortReport", "extract_username",
 ]

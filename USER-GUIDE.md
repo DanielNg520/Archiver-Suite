@@ -53,6 +53,28 @@ archiver local remove mylibrary    # files on disk kept
 ```
 Each subfolder is a username; routed via `TELEGRAM_CHAT_ID_MYLIBRARY[_<USER>]`.
 
+## Sorting `unsorted/` into platform/user folders
+
+Files named `<username>_<unixtimestamp>_…` dumped into `output_dir/unsorted/`
+can be auto-filed into `output_dir/<platform>/<username>/` (created if absent):
+
+```
+output_dir/unsorted/1stagram_0406_1780186897_3915641126.mp4
+    → output_dir/instagram/1stagram_0406/1stagram_0406_1780186897_3915641126.mp4
+```
+
+The username is everything before the first 10-digit Unix timestamp segment, so
+usernames may contain digits and underscores. A file with no recognizable
+timestamp is left in `unsorted/` and logged — never guessed. Sidecars
+(`.json` / `.info.json`) travel with their media; existing files are never
+overwritten. After sorting, the normal reconcile/upload path takes over.
+
+```bash
+archiver sort                                    # default platform: instagram
+archiver sort --platform tiktok --dry-run        # preview, change nothing
+archiver auto-sort set --enabled true --platform instagram  # run each cycle
+```
+
 ## Loose files → a specific chat (chat_id folders)
 
 ```

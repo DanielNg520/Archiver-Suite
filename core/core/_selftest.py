@@ -88,6 +88,44 @@ def build_legacy(tmp: Path):
     return adb_p, ddb_p
 
 
+def _selftest_sorter(tmp: Path) -> None:
+    """core.sorter: username parse + the move/collision/dry-run contract."""
+    from core.sorter import sort_unsorted, extract_username
+
+    # username = segments before the first 17/18-led 10-digit Unix timestamp.
+    assert extract_username("1stagram_0406_1780186897_3915641126") == "1stagram_0406"
+    assert extract_username("bob_1780186897") == "bob"
+    assert extract_username("1780186897_only") is None          # timestamp leads
+    assert extract_username("no_timestamp") is None
+    assert extract_username("x_1234567890") is None             # not 17/18-led
+    print(OK, "sorter: username extraction")
+
+    out = tmp / "sortroot"
+    uns = out / "unsorted"
+    uns.mkdir(parents=True)
+    (uns / "1stagram_0406_1780186897_3915641126.mp4").write_bytes(b"v")
+    (uns / "1stagram_0406_1780186897_3915641126.mp4.json").write_bytes(b"{}")
+    (uns / "garbage.mp4").write_bytes(b"g")           # no timestamp → stays put
+    (uns / "._appledouble_1780186897.mp4").write_bytes(b"d")  # dotfile → ignored
+
+    dry = sort_unsorted(out, platform="instagram", dry_run=True)
+    assert dry.moved == 1 and dry.skipped_no_username == 1, dry
+    assert not (out / "instagram").exists(), "dry-run must not touch disk"
+
+    rep = sort_unsorted(out, platform="instagram")
+    dst = out / "instagram" / "1stagram_0406" / "1stagram_0406_1780186897_3915641126.mp4"
+    assert rep.moved == 1 and rep.created_dirs == 1 and rep.skipped_no_username == 1, rep
+    assert dst.exists() and (dst.parent / (dst.name + ".json")).exists(), "sidecar follows"
+    assert (uns / "garbage.mp4").exists(), "unparseable file left in place"
+
+    # Re-running with the same source name present at dst → collision, no clobber.
+    (uns / "1stagram_0406_1780186897_3915641126.mp4").write_bytes(b"new")
+    rep2 = sort_unsorted(out, platform="instagram")
+    assert rep2.skipped_collision == 1 and rep2.moved == 0, rep2
+    assert dst.read_bytes() == b"v", "collision must not overwrite"
+    print(OK, "sorter: move + sidecar + dry-run + collision contract")
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp())
     adb, ddb = build_legacy(tmp)
@@ -231,6 +269,8 @@ def main() -> int:
     assert s.get_checkpoint("x", "alice") is None
     print(OK, "reset_user wipes rows + checkpoint")
     s.close()
+
+    _selftest_sorter(tmp)
 
     print("\nALL PASS")
     return 0
