@@ -9,6 +9,10 @@ dependencies = [
     "yt-dlp>=2026.1.1",
     "python-dotenv>=1.0.0",
     "tomli-w>=1.0.0",
+    # Headless-browser fallback for age-restricted lives whose pull URL the
+    # webcast API refuses to an unsigned request (recorder.platforms.
+    # tiktok_browser). Needs a one-time `python -m playwright install chromium`.
+    "playwright>=1.50",
 ]
 
 [project.scripts]

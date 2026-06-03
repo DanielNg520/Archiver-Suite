@@ -131,6 +131,9 @@ class TikTokLivePlatform:
             await self._safe_close(client)
 
     async def _stream_url_async(self, uid: str) -> str:
+        # Import lazily so this module imports without TikTokLive installed.
+        from TikTokLive.client.errors import AgeRestrictedError
+
         client = await self._make_client(uid)
         try:
             # fetch_room_info() resolves the room from EITHER a room_id or a
@@ -149,8 +152,24 @@ class TikTokLivePlatform:
                     f"TikTok response shape may have changed"
                 )
             return url
+        except AgeRestrictedError:
+            # 18+ stream: the unsigned webcast API won't return room info
+            # (status_code 4003110). Fall back to driving a logged-in headless
+            # browser, which lets TikTok's own JS sign the pull-URL request —
+            # exactly what playback in a real browser does. See tiktok_browser.
+            log.info(
+                "tiktok: @%s is age-restricted — webcast API blocked, "
+                "trying headless-browser fallback", uid)
+            return await self._stream_url_via_browser(uid)
         finally:
             await self._safe_close(client)
+
+    async def _stream_url_via_browser(self, uid: str) -> str:
+        from .tiktok_browser import resolve_stream_url_via_browser
+        # The resolver runs its own Playwright loop; we're already on an event
+        # loop here, so run it in a thread to avoid nesting asyncio.run().
+        return await asyncio.to_thread(
+            resolve_stream_url_via_browser, uid, self._cookies_file)
 
     @staticmethod
     async def _safe_close(client) -> None:
