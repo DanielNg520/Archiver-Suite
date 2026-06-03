@@ -28,7 +28,9 @@ import signal
 import sys
 from pathlib import Path
 
-from core import ItemStore, DeletePolicy, RecorderDeletePolicy, BatchPolicy
+from core import (
+    ItemStore, DeletePolicy, RecorderDeletePolicy, BatchPolicy, DeletionGuard,
+)
 from core import cli as core_cli
 
 from .config import DispatcherConfig
@@ -60,6 +62,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
     delete_policy = DeletePolicy(config.policy_store)
     recorder_delete_policy = RecorderDeletePolicy(config.policy_store)
     batch_policy  = BatchPolicy(config.policy_store)
+    guard         = DeletionGuard(config.policy_store)
 
     stop_event = asyncio.Event()
 
@@ -89,6 +92,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
                 delete_policy=delete_policy,
                 recorder_delete_policy=recorder_delete_policy,
                 batch_policy=batch_policy,
+                guard=guard,
                 stop_event=stop_event,
             )
         finally:

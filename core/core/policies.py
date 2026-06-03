@@ -79,6 +79,25 @@ class RecorderDeletePolicy(BooleanPolicy):
         return self.is_enabled("tiktok", "_recorder")
 
 
+class ProtectionPolicy(BooleanPolicy):
+    """Safebrake: when enabled for a (platform, user) scope, NOTHING may delete
+    that scope's files. It overrides every deletion path in the suite —
+    delete-after-upload (DeletePolicy / RecorderDeletePolicy), dispatcher
+    dedup-suppression of an already-delivered copy, reconcile's re-introduction
+    cleanup, the disk-full emergency purge, and the `purge-sent` command all
+    consult it (via core.DeletionGuard) before unlinking.
+
+    Resolved hierarchically (user → platform → global) like every other policy,
+    so you can shield a single user or an entire platform. Default OFF — the
+    safebrake is opt-in; absent it, the normal delete policies decide. Set with
+    `archiver safebrake set --platform X [--user Y] --on true`."""
+    KEY     = "protect_from_deletion"
+    DEFAULT = False
+
+    def is_protected(self, platform: str, username: str) -> bool:
+        return self.is_enabled(platform, username)
+
+
 class DedupPolicy(BooleanPolicy):
     """Whether to run content-hash dedup after a successful download."""
     KEY     = "dedup_after_download"

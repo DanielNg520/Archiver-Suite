@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from core import identity, stability, cleanup_sidecars
+from core import identity, stability, cleanup_sidecars, DeletionGuard
 from core.hashing import full_hash
 
 # Upload priority for re-registered recordings. MUST match the recorder's live
@@ -104,6 +104,7 @@ def reconcile_user(
     db: "ProducerStore",
     output_dir: str,
     seed_extractor_archive: bool = True,
+    guard: "DeletionGuard | None" = None,
 ) -> ReconcileReport:
     """
     Walk {output_dir}/{platform.name}/{username}/ (RECURSIVE — picks up
@@ -127,6 +128,7 @@ def reconcile_user(
         recursive=True,
         seed_extractor_archive=seed_extractor_archive,
         report=report,
+        guard=guard,
     )
 
 
@@ -134,6 +136,7 @@ def reconcile_platform_root(
     platform: "Platform",
     db: "ProducerStore",
     output_dir: str,
+    guard: "DeletionGuard | None" = None,
 ) -> ReconcileReport:
     """
     Reconcile media files directly inside {output_dir}/{platform.name}/.
@@ -156,12 +159,14 @@ def reconcile_platform_root(
         report=report,
         source="archiver",
         caption_for_path=lambda path: captions.get(path),
+        guard=guard,
     )
 
 
 def reconcile_recordings(
     db: "ProducerStore",
     records_dir: str | Path | None = None,
+    guard: "DeletionGuard | None" = None,
 ) -> list[ReconcileReport]:
     """
     Reconcile TikTok recorder output into the shared upload queue.
@@ -190,6 +195,7 @@ def reconcile_recordings(
             caption_for_path=lambda path: _recording_caption("_root", path),
             identifier_for_path=_recorder_identifier,
             priority=_RECORDER_PRIORITY,
+            guard=guard,
         ))
 
     for user_dir in sorted(p for p in root.iterdir() if p.is_dir()):
@@ -208,6 +214,7 @@ def reconcile_recordings(
             ),
             identifier_for_path=_recorder_identifier,
             priority=_RECORDER_PRIORITY,
+            guard=guard,
         ))
     return reports
 
@@ -225,6 +232,7 @@ def _reconcile_dir(
     caption_for_path: Callable[[Path], str | None] | None = None,
     identifier_for_path: Callable[[Path], str] | None = None,
     priority: int = 10,
+    guard: "DeletionGuard | None" = None,
 ) -> ReconcileReport:
     if not scan_dir.exists():
         return report
@@ -295,10 +303,25 @@ def _reconcile_dir(
             if (twin is not None
                     and twin.status == "sent"
                     and twin.file_path != path_str):
-                cleanup_sidecars(path_str)
-                report.deleted_dupes += 1
-                log.info("  reconcile: deleted re-introduced already-"
-                         "uploaded file %s (bytes already sent as id=%d)",
+                # Re-introduced copy of already-sent bytes → delete it, UNLESS
+                # the safebrake shields this scope. A guard=None caller (older
+                # paths, tests) keeps the original unconditional behavior.
+                if guard is None:
+                    cleanup_sidecars(path_str)
+                    removed = True
+                else:
+                    removed = guard.delete(report.platform, username, path_str,
+                                           reason="reconcile-reintroduced-dup")
+                if removed:
+                    report.deleted_dupes += 1
+                    log.info("  reconcile: deleted re-introduced already-"
+                             "uploaded file %s (bytes already sent as id=%d)",
+                             f.name, twin.id)
+                    continue
+                # Protected: leave the file AND don't re-enqueue it (its bytes
+                # are already delivered under twin.id) — fall through to skip.
+                log.info("  reconcile: kept re-introduced dup %s (safebrake; "
+                         "already sent as id=%d, not re-enqueued)",
                          f.name, twin.id)
                 continue
 

@@ -41,8 +41,9 @@ from .reconcile import (
 )
 
 from core import (
-    ItemStore, DeletePolicy, DedupPolicy, DownloadPolicy, dedup_user,
-    cleanup_sidecars, is_chat_id, validate_overrides as _validate_policies,
+    ItemStore, DeletePolicy, DedupPolicy, DownloadPolicy, DeletionGuard,
+    dedup_user, cleanup_sidecars, is_chat_id,
+    validate_overrides as _validate_policies,
 )
 
 log = logging.getLogger(__name__)
@@ -136,6 +137,10 @@ class Archiver:
         self.delete_policy   = DeletePolicy(config.policy_store)
         self.dedup_policy    = DedupPolicy(config.policy_store)
         self.download_policy = DownloadPolicy(config.policy_store)
+        # The safebrake. Threaded into every disk-deletion path (reconcile
+        # re-introduction cleanup, disk-full purge) so a protected scope is
+        # never touched, regardless of which path would have deleted it.
+        self.deletion_guard  = DeletionGuard(config.policy_store)
         # Per-platform tripped flag for THIS run. Resets each new Archiver.
         self._tripped: set[str] = set()
 
@@ -315,7 +320,7 @@ class Archiver:
 
         if not user_filter:
             recording_reports = await asyncio.to_thread(
-                reconcile_recordings, self.db,
+                reconcile_recordings, self.db, None, self.deletion_guard,
             )
             for report in recording_reports:
                 if report.scanned or report.inserted:
@@ -346,6 +351,7 @@ class Archiver:
             root_report = await asyncio.to_thread(
                 reconcile_platform_root,
                 platform, self.db, self.config.output_dir,
+                self.deletion_guard,
             )
             if root_report.scanned or root_report.inserted:
                 log.info("reconcile: %s", root_report)
@@ -364,7 +370,7 @@ class Archiver:
 
             report = await asyncio.to_thread(
                 reconcile_user, platform, username, self.db,
-                self.config.output_dir, True,
+                self.config.output_dir, True, self.deletion_guard,
             )
             if report.inserted or report.seeded_archive:
                 log.info("reconcile: %s", report)
@@ -445,7 +451,7 @@ class Archiver:
         # 4a. Reconcile disk → DB (Reconcile v2: stability + identity)
         report = await asyncio.to_thread(
             reconcile_user, platform, username, self.db,
-            self.config.output_dir, True,
+            self.config.output_dir, True, self.deletion_guard,
         )
         if report.inserted:
             log.info("  Reconciled: %s", report)
@@ -596,16 +602,19 @@ class Archiver:
 
     def _purge_sent_files(self, platform: str, username: str) -> int:
         """Force-delete files with status='sent' (disk-full path).
-        Bypasses DeletePolicy intentionally — the rows are already sent."""
+        Bypasses DeletePolicy intentionally — the rows are already sent — but
+        STILL honors the safebrake: a protected scope keeps its files even when
+        the disk is full (the guard skips and logs)."""
         freed = 0
         for fp in self.db.sent_file_paths(platform, username):
             path = Path(fp)
             try:
-                if path.exists():
-                    freed += path.stat().st_size
-                cleanup_sidecars(fp)
+                size = path.stat().st_size if path.exists() else 0
             except OSError:
-                pass
+                size = 0
+            if self.deletion_guard.delete(platform, username, fp,
+                                          reason="disk-full-purge"):
+                freed += size
         log.info("  Purged %.1f MB of already-sent files", freed / 1_048_576)
         return freed
 
@@ -631,6 +640,7 @@ async def bootstrap(config: Config, db: ItemStore,
     if platform_filter:
         platforms = [p for p in platforms if p.name == platform_filter]
 
+    guard = DeletionGuard(config.policy_store)
     summary: dict = {}
     for platform in platforms:
         users = platform.users
@@ -640,6 +650,7 @@ async def bootstrap(config: Config, db: ItemStore,
         for username in users:
             report = await asyncio.to_thread(
                 reconcile_user, platform, username, db, config.output_dir, True,
+                guard,
             )
             # Bootstrap also writes the date_floor checkpoint. The reconcile
             # function already computed report.max_upload_date.

@@ -27,7 +27,7 @@ from pathlib import Path
 
 from core import (
     ClaimContentionError, QueueStore, Item, DeletePolicy, RecorderDeletePolicy,
-    BatchPolicy, ORPHANED_SOURCE, subfolder_of, cleanup_sidecars,
+    BatchPolicy, ORPHANED_SOURCE, subfolder_of, DeletionGuard,
 )
 from core.files import media_bucket
 from .tg_router import TelegramRouter, RouteError
@@ -103,6 +103,7 @@ async def drain_forever(
     delete_policy: DeletePolicy,
     recorder_delete_policy: RecorderDeletePolicy,
     batch_policy:  BatchPolicy,
+    guard:         DeletionGuard,
     *,
     stop_event:    asyncio.Event | None = None,
 ) -> None:
@@ -201,12 +202,18 @@ async def drain_forever(
                 twin_id = twin.id if twin is not None else None
             if twin_id is not None:
                 store.mark_deduplicated(it.id, twin_id=twin_id)
+                # Normally a duplicate's redundant copy is deleted regardless of
+                # delete-after-upload (the bytes are already delivered). The
+                # safebrake still wins: a protected scope keeps even its dupes.
                 try:
-                    cleanup_sidecars(it.file_path)
+                    removed = guard.delete(it.platform, it.username, it.file_path,
+                                           reason="dedup-suppressed-duplicate")
                 except Exception as e:
                     log.exception("drain: id=%d dedup-cleanup raised: %s", it.id, e)
+                    removed = False
                 log.info("drain: id=%d suppressed as duplicate of id=%d (bytes "
-                         "already sent) — redundant copy deleted", it.id, twin_id)
+                         "already sent) — redundant copy %s", it.id, twin_id,
+                         "deleted" if removed else "kept (safebrake)")
                 continue
             if it.content_hash:
                 batch_hashes[it.content_hash] = it.id
@@ -264,6 +271,7 @@ async def drain_forever(
                         it.id,
                         delete_policy=delete_policy,
                         recorder_delete_policy=recorder_delete_policy,
+                        guard=guard,
                     )
                 except Exception as e:
                     log.exception("drain: id=%d cleanup raised: %s", it.id, e)

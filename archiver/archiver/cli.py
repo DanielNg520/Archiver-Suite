@@ -49,7 +49,7 @@ from .reconcile import (
 )
 
 from core import ItemStore, DeletePolicy, RecorderDeletePolicy, DedupPolicy
-from core import AutoIngestPolicy, DownloadPolicy
+from core import AutoIngestPolicy, DownloadPolicy, ProtectionPolicy, DeletionGuard
 from core import cli as core_cli
 
 
@@ -376,6 +376,49 @@ def build_parser() -> argparse.ArgumentParser:
     dp_unset.add_argument("--platform", choices=PLATFORM_CHOICES)
     dp_unset.add_argument("--user", metavar="USERNAME",
                             help="Per-user override. Requires --platform.")
+
+    # ── safebrake (protect-from-deletion policy) ───
+    s_sb = sub.add_parser(
+        "safebrake",
+        help="Shield a platform/user from ALL deletion (delete-after-upload, "
+             "dedup cleanup, disk-full purge, purge-sent). Show or edit per "
+             "(platform, user).",
+    )
+    s_sb.add_argument("--platform", choices=PLATFORM_CHOICES)
+    s_sb.add_argument("--user", metavar="USERNAME")
+    sb_sub = s_sb.add_subparsers(dest="safebrake_action", required=False,
+                                 metavar="ACTION",
+                                 help="omit to print resolution; "
+                                      "'set'/'unset' to mutate config.toml")
+    sb_set = sb_sub.add_parser("set",
+        help="Turn the safebrake on/off at global, per-platform, or per-user scope")
+    sb_set.add_argument("--platform", choices=PLATFORM_CHOICES)
+    sb_set.add_argument("--user", metavar="USERNAME",
+                        help="Per-user override. Requires --platform.")
+    sb_set.add_argument("--on", choices=["true", "false"], required=True,
+                        help="true = protect (never delete); false = unprotect")
+    sb_unset = sb_sub.add_parser("unset",
+        help="Remove the safebrake override at the given scope")
+    sb_unset.add_argument("--platform", choices=PLATFORM_CHOICES)
+    sb_unset.add_argument("--user", metavar="USERNAME",
+                          help="Per-user override. Requires --platform.")
+
+    # ── purge-sent (reclaim disk: delete on-disk copies of uploaded files) ───
+    s_purge = sub.add_parser(
+        "purge-sent",
+        help="Delete on-disk files whose rows are already status='sent'. "
+             "Honors the safebrake. Use --dry-run to preview first.",
+    )
+    s_purge.add_argument("--platform", help="Limit to one platform (free-form: "
+                         "matches recorder 'tiktok', orphaned chat-id, etc.)")
+    s_purge.add_argument("--user", dest="username", metavar="USERNAME",
+                         help="Limit to one user (requires --platform).")
+    s_purge.add_argument("--source", choices=["archiver", "recorder", "orphaned"],
+                         help="Limit to one producer source.")
+    s_purge.add_argument("--dry-run", action="store_true",
+                         help="Show what would be deleted; touch nothing.")
+    s_purge.add_argument("--yes", action="store_true",
+                         help="Skip the confirmation prompt (non-interactive).")
 
     # ── migrate ───
     sub.add_parser(
@@ -906,6 +949,86 @@ def cmd_dedup_policy(args, config: Config, db: ItemStore) -> int:
         value_attr  = "enabled",
         cmd_label   = "dedup-policy",
     )
+
+
+def cmd_safebrake(args, config: Config, db: ItemStore) -> int:
+    """The safebrake is just another BooleanPolicy (ProtectionPolicy), so its
+    set/unset/show flow is identical to delete-/dedup-policy."""
+    return _cmd_boolpolicy(
+        args, config, ProtectionPolicy,
+        action_attr = "safebrake_action",
+        value_attr  = "on",
+        cmd_label   = "safebrake",
+    )
+
+
+def cmd_purge_sent(args, config: Config, db: ItemStore) -> int:
+    """Delete on-disk copies of already-uploaded ('sent') files to reclaim
+    space. Re-runnable; only touches files still present on disk, and routes
+    every deletion through the DeletionGuard so safebraked scopes are skipped."""
+    username = args.username.lstrip("@") if args.username else None
+    if username and not args.platform:
+        log.error("purge-sent: --user requires --platform")
+        return 2
+
+    guard = DeletionGuard(config.policy_store)
+    items = db.sent_items(platform=args.platform, username=username,
+                          source=args.source)
+
+    # Partition before touching anything: present-on-disk vs already-gone, and
+    # which present ones the safebrake will shield.
+    present  = [it for it in items if Path(it.file_path).exists()]
+    missing  = len(items) - len(present)
+    targets  = [it for it in present
+                if not guard.is_protected(it.platform, it.username)]
+    shielded = len(present) - len(targets)
+
+    def _size(p: str) -> int:
+        try:
+            return Path(p).stat().st_size
+        except OSError:
+            return 0
+
+    target_bytes = sum(_size(it.file_path) for it in targets)
+    scope = _scope_label(args.platform, username)
+    src = f" source={args.source}" if args.source else ""
+    log.info("purge-sent %s%s: %d sent row(s) — on-disk=%d, already-gone=%d, "
+             "safebraked=%d, to-delete=%d (%.1f MB)",
+             scope, src, len(items), len(present), missing, shielded,
+             len(targets), target_bytes / 1_048_576)
+
+    if not targets:
+        log.info("purge-sent: nothing to delete.")
+        return 0
+
+    if args.dry_run:
+        for it in targets:
+            log.info("  would delete: id=%d %s/@%s %s",
+                     it.id, it.platform, it.username, it.file_path)
+        log.info("purge-sent: dry-run — no files were deleted.")
+        return 0
+
+    if not args.yes:
+        try:
+            reply = input(f"Delete {len(targets)} file(s) "
+                          f"({target_bytes / 1_048_576:.1f} MB)? [y/N] ")
+        except EOFError:
+            reply = ""
+        if reply.strip().lower() not in ("y", "yes"):
+            log.info("purge-sent: aborted (no confirmation).")
+            return 1
+
+    deleted = freed = 0
+    for it in targets:
+        size = _size(it.file_path)
+        if guard.delete(it.platform, it.username, it.file_path,
+                        reason="purge-sent"):
+            deleted += 1
+            freed += size
+    log.info("purge-sent: deleted %d file(s), freed %.1f MB%s",
+             deleted, freed / 1_048_576,
+             f" ({shielded} kept by safebrake)" if shielded else "")
+    return 0
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1452,8 +1575,8 @@ def main() -> int:
 
     config_only = args.cmd in {
         "config", "platform", "run-settings", "migrate", "policy",
-        "dedup-policy", "stats", "ingest", "queue", "backfill", "auto-ingest",
-        "local", "download",
+        "dedup-policy", "safebrake", "purge-sent", "stats", "ingest", "queue",
+        "backfill", "auto-ingest", "local", "download",
     }
     if args.cmd == "reset" and args.reset_cmd in {"failed", "user"}:
         config_only = True
@@ -1500,6 +1623,8 @@ def main() -> int:
             "run-settings": cmd_run_settings,
             "policy":       cmd_policy,
             "dedup-policy": cmd_dedup_policy,
+            "safebrake":    cmd_safebrake,
+            "purge-sent":   cmd_purge_sent,
             "migrate":      cmd_migrate,
         }
         return dispatch[args.cmd](args, config, db)

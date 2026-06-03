@@ -713,6 +713,31 @@ class ItemStore:
         ).fetchall()
         return [r["file_path"] for r in rows]
 
+    def sent_items(
+        self,
+        *,
+        platform: str | None = None,
+        username: str | None = None,
+        source:   str | None = None,
+    ) -> list[Item]:
+        """Every delivered ('sent') row, with optional scope filters. Backs the
+        `purge-sent` command (delete on-disk copies of already-uploaded files).
+        Built dynamically so a bare call returns the whole sent backlog while
+        any combination of platform/user/source narrows it."""
+        where = ["status='sent'"]
+        params: list = []
+        for col, val in (("platform", platform), ("username", username),
+                         ("source", source)):
+            if val is not None:
+                where.append(f"{col}=?")
+                params.append(val)
+        rows = self.conn.execute(
+            f"SELECT * FROM items WHERE {' AND '.join(where)} "
+            f"ORDER BY platform, username, id",
+            params,
+        ).fetchall()
+        return [Item.from_row(r) for r in rows]
+
     def stats(self, platform: str | None = None,
               username: str | None = None) -> dict:
         """Aggregate counts. Both filters optional: pass neither for a

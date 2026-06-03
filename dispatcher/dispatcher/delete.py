@@ -8,14 +8,19 @@ SAFETY CONTRACT (order is the point of the module):
     (1) SendStrategy.send returned ok=True
     (2) ItemStore.mark_sent committed status='sent'
     (3) DeletePolicy.should_delete(platform, username) is True
+    (4) the DeletionGuard safebrake does NOT shield (platform, username)
 
-  drain.py owns step (1)->(2)->maybe_delete. This module owns (3) + unlink.
+  drain.py owns step (1)->(2)->maybe_delete. This module owns (3)+(4)+unlink.
 
   Defense-in-depth: maybe_delete RE-READS the row and refuses to delete
   unless status=='sent'. If a future refactor calls delete before
   mark_sent, this fires an ERROR instead of losing the file silently.
   With one table the check is a single authoritative read — no risk of
   reading a stale mirror.
+
+  The safebrake (4) is a hard override: even with delete-after-upload ON, a
+  protected scope's file is kept. The guard owns that decision so the same
+  rule applies identically to every deletion path in the suite.
 """
 
 from __future__ import annotations
@@ -23,14 +28,17 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from core import QueueStore, Status, cleanup_sidecars, DeletePolicy, RecorderDeletePolicy
+from core import (
+    QueueStore, Status, DeletePolicy, RecorderDeletePolicy, DeletionGuard,
+)
 
 log = logging.getLogger(__name__)
 
 
 def maybe_delete(store: QueueStore, item_id: int, *,
                  delete_policy: DeletePolicy,
-                 recorder_delete_policy: RecorderDeletePolicy) -> None:
+                 recorder_delete_policy: RecorderDeletePolicy,
+                 guard: DeletionGuard) -> None:
     """Gated cleanup. Caller must have already called mark_sent(item_id)."""
     item = store.get(item_id)
     if item is None:
@@ -49,4 +57,6 @@ def maybe_delete(store: QueueStore, item_id: int, *,
         should_delete = delete_policy.should_delete(item.platform, item.username)
     if not should_delete:
         return
-    cleanup_sidecars(item.file_path)
+    # The guard re-checks the safebrake and skips (logging) if protected.
+    guard.delete(item.platform, item.username, item.file_path,
+                 reason="delete-after-upload")
