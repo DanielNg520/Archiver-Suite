@@ -28,11 +28,12 @@ playwright>=1.50                  # headless-browser fallback for age-restricted
 telethon>=1.36.0,<2.0             # MTProto uploads (4GB on Premium), native albums
 
 # ── core (media pre-flight for loose/orphaned files) ──────────────────────
-# AutoSplitter splits oversize videos into <=1GB parts before upload. It is a
-# sibling project (../autosplitter); core.media_prep imports it, falling back to
-# the AUTOSPLITTER_HOME env var or the ../autosplitter checkout if not installed.
-# Install editable for a packaged environment:  pip install -e ../autosplitter
-# (Pure stdlib + ffmpeg/ffprobe at runtime — no extra PyPI deps of its own.)
+# AutoSplitter splits oversize videos into <=1GB parts before upload. Install it
+# stand-alone — `pipx install autosplitter` is the norm — and core.media_prep
+# drives its CLI as a subprocess (resolved on PATH, or via AUTOSPLITTER_BIN).
+# If it instead happens to be importable in THIS venv (pip install -e
+# ../autosplitter, or the ../autosplitter / AUTOSPLITTER_HOME source checkout),
+# media_prep calls it in-process. Pure stdlib + ffmpeg/ffprobe at runtime.
 
 # ── shared ────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0

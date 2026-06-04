@@ -297,15 +297,21 @@ def _convert(src: Path, p: _Probe) -> Path | None:
 
 
 # ── Split (AutoSplitter) ──────────────────────────────────────────────────────
+#
+# AutoSplitter ships two ways and we support both. Typically it is installed
+# stand-alone (pipx → its own isolated interpreter), so it CANNOT be imported
+# into this process; we drive its CLI as a subprocess. If it instead happens to
+# be importable in this same venv (editable install / sibling checkout on the
+# path) we call run_split() in-process to skip the subprocess hop. Either way a
+# missing AutoSplitter degrades to "can't split" — never a crash.
 
 _run_split_cache: "object | None" = None
+_cli_cache: "str | None | bool" = None
 
 
 def _load_run_split():
-    """Locate AutoSplitter's run_split(). Importable first; else add its repo to
-    sys.path (AUTOSPLITTER_HOME, or the sibling ../autosplitter checkout).
-    Returns the callable or None — a missing splitter degrades to 'can't split',
-    never a crash."""
+    """Return an importable AutoSplitter run_split(), or None. Tried first; the
+    CLI is the fallback when AutoSplitter lives in its own (e.g. pipx) venv."""
     global _run_split_cache
     if _run_split_cache is not None:
         return None if _run_split_cache is False else _run_split_cache
@@ -315,15 +321,12 @@ def _load_run_split():
         return run_split
     except ImportError:
         pass
-
+    # Sibling source checkout on the path (dev convenience).
     candidates = []
     home = os.environ.get("AUTOSPLITTER_HOME")
     if home:
         candidates.append(Path(home))
-    # Sibling checkout: <…>/Coding/Archiver suite/core/core/media_prep.py
-    # → parents[3] == <…>/Coding, so <…>/Coding/autosplitter.
     candidates.append(Path(__file__).resolve().parents[3] / "autosplitter")
-
     for cand in candidates:
         if (cand / "autosplitter" / "splitter.py").exists():
             sys.path.insert(0, str(cand))
@@ -333,19 +336,60 @@ def _load_run_split():
                 return run_split
             except ImportError:
                 continue
-    log.error("media_prep: AutoSplitter not found (set AUTOSPLITTER_HOME) — "
-              "cannot split oversized files")
     _run_split_cache = False
     return None
+
+
+def _find_cli() -> str | None:
+    """The AutoSplitter CLI executable (AUTOSPLITTER_BIN override, else on PATH),
+    or None if it isn't installed."""
+    global _cli_cache
+    if _cli_cache is not None:
+        return None if _cli_cache is False else _cli_cache
+    import shutil
+    cli = os.environ.get("AUTOSPLITTER_BIN") or shutil.which("autosplitter")
+    _cli_cache = cli or False
+    return cli
+
+
+def _segment_parts(src: Path) -> list[Path]:
+    """Read AutoSplitter's <stem>_segments.txt to learn the exact part files it
+    wrote (basenames, one per line), resolved against src's directory."""
+    listing = src.parent / f"{src.stem}_segments.txt"
+    try:
+        lines = listing.read_text().splitlines()
+    except OSError:
+        return []
+    return [src.parent / ln.strip() for ln in lines if ln.strip()]
+
+
+def _cleanup_split_debris(src: Path) -> None:
+    """Remove a failed split's partial parts + segment list so a retry (or the
+    next sweep) starts clean and nothing half-written gets enqueued."""
+    for stray in src.parent.glob(f"{src.stem}_part*"):
+        _unlink(stray)
+    _unlink(src.parent / f"{src.stem}_segments.txt")
 
 
 def _split(src: Path) -> list[Path] | None:
     """Split `src` into <=chunk-size parts beside it via AutoSplitter. Returns
     the verified part paths, or None on any failure (no parts trusted)."""
-    run_split = _load_run_split()
-    if run_split is None:
-        return None
     target_gib = split_chunk_bytes() / (1024 ** 3)
+
+    run_split = _load_run_split()
+    if run_split is not None:
+        return _split_in_process(run_split, src, target_gib)
+
+    cli = _find_cli()
+    if cli is not None:
+        return _split_via_cli(cli, src, target_gib)
+
+    log.error("media_prep: AutoSplitter not found (import or CLI; set "
+              "AUTOSPLITTER_BIN/AUTOSPLITTER_HOME) — cannot split oversized files")
+    return None
+
+
+def _split_in_process(run_split, src: Path, target_gib: float) -> list[Path] | None:
     try:
         result = run_split(
             input_path=str(src),
@@ -354,19 +398,50 @@ def _split(src: Path) -> list[Path] | None:
         )
     except Exception as e:   # AutoSplitter raises ValueError/RuntimeError
         log.warning("media_prep: AutoSplitter failed on %s: %s", src.name, e)
+        _cleanup_split_debris(src)
         return None
     if not result.integrity_ok or not result.parts:
         log.warning("media_prep: AutoSplitter integrity check FAILED on %s — "
                     "discarding parts", src.name)
-        for part in result.parts:
-            _unlink(Path(part))
-        _unlink(src.parent / f"{src.stem}_segments.txt")
+        _cleanup_split_debris(src)
         return None
-    # Drop AutoSplitter's segment-list sidecar; it isn't media but lingers.
     _unlink(src.parent / f"{src.stem}_segments.txt")
     log.info("media_prep: split %s → %d part(s) of <=%.2f GiB",
              src.name, len(result.parts), target_gib)
     return [Path(p) for p in result.parts]
+
+
+def _split_via_cli(cli: str, src: Path, target_gib: float) -> list[Path] | None:
+    """Run the AutoSplitter CLI in single-file mode. Exit 0 means it both split
+    and passed its own integrity check; exit 2 is an integrity failure. We learn
+    the parts from the segment-list it writes, then verify they exist."""
+    cmd = [
+        cli, str(src),
+        "--size", repr(target_gib), "--size-unit", "GiB",
+        "--output", str(src.parent),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=_CONVERT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("media_prep: AutoSplitter CLI failed on %s: %s", src.name, e)
+        _cleanup_split_debris(src)
+        return None
+    if r.returncode != 0:
+        log.warning("media_prep: AutoSplitter CLI rc=%d on %s (integrity?): %s",
+                    r.returncode, src.name, (r.stderr or "").strip()[:300])
+        _cleanup_split_debris(src)
+        return None
+    parts = _segment_parts(src)
+    if not parts or not all(p.exists() and p.stat().st_size > 0 for p in parts):
+        log.warning("media_prep: AutoSplitter CLI produced no usable parts for "
+                    "%s — discarding", src.name)
+        _cleanup_split_debris(src)
+        return None
+    _unlink(src.parent / f"{src.stem}_segments.txt")
+    log.info("media_prep: split %s → %d part(s) of <=%.2f GiB (cli)",
+             src.name, len(parts), target_gib)
+    return parts
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────

@@ -155,6 +155,38 @@ def test_split(tmp: Path) -> None:
         media_prep._unlink(p)
 
 
+def test_split_via_cli(tmp: Path) -> None:
+    """Force the CLI path (how AutoSplitter is reached when installed stand-alone
+    via pipx, i.e. not importable into this interpreter)."""
+    print("\n── media_prep split via CLI ──")
+    if media_prep._find_cli() is None:
+        print("  (autosplitter CLI not on PATH — skipping)")
+        return
+    big = tmp / "clivid.mp4"
+    make_video(big, seconds=20, vcodec="libx264", acodec="aac",
+               bitrate="300k", gop=10)
+    size = big.stat().st_size
+    # Disable the in-process import path so _split must shell out to the CLI.
+    saved = media_prep._run_split_cache
+    media_prep._run_split_cache = False
+    os.environ["ARCHIVER_TG_MAX_UPLOAD_BYTES"] = str(size // 3)
+    os.environ["ARCHIVER_SPLIT_CHUNK_BYTES"] = str(size // 3)
+    try:
+        res = media_prep.prepare(big)
+    finally:
+        media_prep._run_split_cache = saved
+        del os.environ["ARCHIVER_TG_MAX_UPLOAD_BYTES"]
+        del os.environ["ARCHIVER_SPLIT_CHUNK_BYTES"]
+    check(res.ok and res.transformed and res.individual and len(res.outputs) >= 2,
+          f"CLI split produced {len(res.outputs)} parts via subprocess")
+    check(all(p.exists() and p.stat().st_size > 0 for p in res.outputs),
+          "all CLI split parts exist and are non-empty")
+    check(not (big.parent / f"{big.stem}_segments.txt").exists(),
+          "CLI segment-list sidecar cleaned up")
+    for p in res.outputs:
+        media_prep._unlink(p)
+
+
 # ── Integration: ingest_folder end to end ─────────────────────────────────────
 
 def test_ingest_folder(tmp: Path) -> None:
@@ -230,6 +262,7 @@ def main() -> None:
         tmp = Path(d)
         test_decisions(tmp)
         test_split(tmp)
+        test_split_via_cli(tmp)
         test_ingest_folder(tmp)
         test_delete_after_split_off(tmp)
     print(f"\nALL PASS ({_checks} checks)")
