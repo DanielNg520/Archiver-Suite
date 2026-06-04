@@ -1,0 +1,38 @@
+# Archiver Suite — aggregated runtime dependencies.
+#
+# The suite is four installable packages (core, archiver, recorder,
+# dispatcher; ops has none). The source of truth is each package's
+# pyproject.toml — this file is a convenience union for setting up a single
+# combined environment (CI, a fresh machine, a venv covering the whole suite).
+#
+# Constraints below are the UNION of the per-package requirements; where two
+# packages pin the same dependency, the tighter/overlapping bound is used.
+#
+# NOTE: playwright additionally needs a one-time browser download:
+#     python -m playwright install chromium
+
+# ── core ──────────────────────────────────────────────────────────────────
+tomli-w>=1.0.0                    # TOML writer for the policy store (read = stdlib tomllib)
+
+# ── archiver (TikTok/X downloads) ─────────────────────────────────────────
+yt-dlp[default]>=2026.1.1         # TikTok videos; [default] pulls curl_cffi for TLS impersonation
+gallery-dl>=1.27.0                # X media + TikTok photo carousels
+curl-cffi>=0.10,<0.15
+
+# ── recorder (TikTok live) ────────────────────────────────────────────────
+TikTokLive==6.6.5
+betterproto==2.0.0b7
+playwright>=1.50                  # headless-browser fallback for age-restricted lives
+
+# ── dispatcher (Telegram delivery) ────────────────────────────────────────
+telethon>=1.36.0,<2.0             # MTProto uploads (4GB on Premium), native albums
+
+# ── core (media pre-flight for loose/orphaned files) ──────────────────────
+# AutoSplitter splits oversize videos into <=1GB parts before upload. It is a
+# sibling project (../autosplitter); core.media_prep imports it, falling back to
+# the AUTOSPLITTER_HOME env var or the ../autosplitter checkout if not installed.
+# Install editable for a packaged environment:  pip install -e ../autosplitter
+# (Pure stdlib + ffmpeg/ffprobe at runtime — no extra PyPI deps of its own.)
+
+# ── shared ────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0

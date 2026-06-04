@@ -33,7 +33,10 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import media_prep
 from .dedup import MEDIA_EXTENSIONS
+from .deletion import DeletionGuard
+from .files import cleanup_sidecars
 from .ingest import register_file, IngestOutcome
 from .routing import is_chat_id
 from .store import ItemStore
@@ -46,6 +49,17 @@ log = logging.getLogger(__name__)
 # re-attempted only once its mtime changes (it was replaced/fixed). One read +
 # at most one write per folder — never a per-file query.
 _HASHFAIL_META_KEY = "orphaned_hashfail"
+
+# Same mtime-keyed memo, but for media-prep: records a file we converted/split
+# whose ORIGINAL we then could NOT delete (delete-after-split off, or the scope
+# is safebraked) so we don't re-convert/re-split it on every sweep. Also records
+# a prep FAILURE (bad/oversize file ffmpeg or AutoSplitter couldn't handle) so a
+# wedged file isn't reprocessed each cycle. Cleared when the file's mtime moves.
+_PREPPED_META_KEY = "orphaned_prepped"
+
+# Files this ingester accepts. The canonical MEDIA_EXTENSIONS plus the extra
+# containers media_prep can rescue by converting them to a streamable .mp4.
+_INGESTABLE_EXTS = MEDIA_EXTENSIONS | media_prep.PREP_VIDEO_EXTS
 
 ORPHANED_SOURCE = "orphaned"
 # Synthetic platform value for orphaned rows. Keeps them out of every
@@ -83,9 +97,13 @@ def ingest_chat_id_dirs(
     *,
     known_platforms: list[str] | set[str],
     priority:        int = 100,
+    guard:           DeletionGuard | None = None,
 ) -> list[OrphanedReport]:
     """Scan output_dir's top-level folders; ingest every chat_id-named one.
-    Returns one report per top-level folder considered."""
+    Returns one report per top-level folder considered.
+
+    `guard` (optional) gates deletion of an original that media_prep replaced
+    with a converted/split copy: a safebraked scope keeps its original."""
     base = Path(output_dir)
     reports: list[OrphanedReport] = []
     if not base.exists():
@@ -99,6 +117,10 @@ def ingest_chat_id_dirs(
         except OSError:
             continue
         name = entry.name
+        # Skip dotfolders (e.g. media_prep working dirs, macOS cruft) silently —
+        # they are never a destination chat_id.
+        if name.startswith("."):
+            continue
         if name.lower() in known:
             continue   # a platform dir — the archiver's reconcile pass owns it
         if not is_chat_id(name):
@@ -109,7 +131,8 @@ def ingest_chat_id_dirs(
             )
             reports.append(OrphanedReport(chat_id=name, skipped_dir=True))
             continue
-        reports.append(ingest_folder(store, entry, chat_id=name, priority=priority))
+        reports.append(ingest_folder(
+            store, entry, chat_id=name, priority=priority, guard=guard))
     return reports
 
 
@@ -125,6 +148,7 @@ _OUTCOME_TALLY = {
 
 def ingest_folder(
     store: ItemStore, folder: Path, *, chat_id: str, priority: int = 100,
+    guard: DeletionGuard | None = None,
 ) -> OrphanedReport:
     """Ingest every media file under `folder`, routed to `chat_id`. Two shapes:
 
@@ -135,10 +159,19 @@ def ingest_folder(
         unique batch key (group_key=NULL, caption=the filename), so claim_batch
         never groups two of them; the displayed caption is still the stem.
 
+    MEDIA-PREP: before a file is registered it is run through media_prep, which
+    makes a video Telegram-streamable (converting an incompatible format) and
+    splits anything over the upload ceiling into <=1 GiB parts. One source file
+    may therefore become several queue rows (the split parts, each sent as its
+    own message). When prep replaces an original, that original is deleted
+    (gated by `guard`'s safebrake); a protected scope keeps it and is memoized
+    so it isn't reprocessed every sweep.
+
     Reusable for both the chat_id-folder sweep and `archiver ingest --path`,
     where `folder` is arbitrary and `chat_id` is supplied explicitly."""
     rep = OrphanedReport(chat_id=chat_id)
     quarantine, q_dirty = _load_quarantine(store), False
+    prepped, p_dirty = _load_prepped(store), False
     # NOT wrapped in store.batch() — deliberately. register_file's dedup-collapse
     # can delete a file from disk (the "adopt" branch deletes the losing copy)
     # right alongside its relink_file DB write. A filesystem delete is not part
@@ -160,69 +193,159 @@ def ingest_folder(
         # stubs, not media. Matches dedup.py's convention.
         if f.name.startswith("."):
             continue
-        if f.suffix.lower() not in MEDIA_EXTENSIONS:
+        if f.suffix.lower() not in _INGESTABLE_EXTS:
             continue
         rep.scanned += 1
 
-        # Skip a known-bad file until it changes (see _HASHFAIL_META_KEY).
         key = str(f)
         try:
             mtime = str(f.stat().st_mtime_ns)
         except OSError:
             mtime = None
+
+        # Skip a known-bad file until it changes (hash failure → still counts as
+        # failed for visibility; a prep failure / deliberately-kept prepped
+        # original → known, it's handled and quiet — see the two META keys).
         if mtime is not None and quarantine.get(key) == mtime:
             rep.failed += 1
             continue
-
-        rel = f.relative_to(folder)
-        subpath = rel.parent.as_posix()
-        subpath = "" if subpath == "." else subpath
-        if subpath:
-            group_key, caption = f"{chat_id}/{subpath}", None
-        else:
-            # Top-level loose file → its own message. NULL group_key means
-            # claim_batch groups by caption instead; a per-file filename makes
-            # that key unique, so each loose file sends alone. Display still
-            # uses the stem (see drain.orphaned_caption).
-            group_key, caption = None, f.name
-
-        try:
-            res = register_file(
-                store, f,
-                source    = ORPHANED_SOURCE,
-                platform  = ORPHANED_PLATFORM,
-                username  = chat_id,
-                chat_id   = chat_id,
-                group_key = group_key,
-                caption   = caption,
-                priority  = priority,
-            )
-        except Exception as e:               # pragma: no cover — defensive
-            rep.errors.append(f"{f.name}: {e}")
-            log.exception("orphaned: register_file raised on %s", f)
+        if mtime is not None and prepped.get(key) == mtime:
+            rep.known += 1
             continue
 
-        # Maintain the quarantine: record a fresh hash failure; clear the marker
-        # once a previously-bad file succeeds (it was fixed/replaced).
-        if res.outcome is IngestOutcome.HASH_FAILED and mtime is not None:
-            quarantine[key] = mtime
-            q_dirty = True
-        elif key in quarantine:
-            del quarantine[key]
-            q_dirty = True
+        # Cheap short-circuit: this exact path already has a row. Skip prep
+        # entirely (a known file is already converted/split as needed) — this is
+        # what keeps repeated sweeps from re-probing every file.
+        if store.has_file_path(key):
+            rep.known += 1
+            continue
 
-        setattr(rep, _OUTCOME_TALLY[res.outcome],
-                getattr(rep, _OUTCOME_TALLY[res.outcome]) + 1)
+        # ── Media-prep: convert non-streamable formats, split oversize files ──
+        try:
+            prep = media_prep.prepare(f)
+        except Exception as e:               # pragma: no cover — defensive
+            rep.errors.append(f"{f.name}: prep {e}")
+            log.exception("orphaned: media_prep raised on %s", f)
+            continue
+        if not prep.ok:
+            # Couldn't prepare safely (bad/oversize file ffmpeg or AutoSplitter
+            # refused). Leave the original in place and memoize so we don't keep
+            # retrying it every sweep until the user replaces it.
+            if mtime is not None:
+                prepped[key] = mtime
+                p_dirty = True
+            rep.failed += 1
+            rep.errors.append(f"{f.name}: {prep.error}")
+            continue
+
+        # Register every output. For split parts each is its own message; for a
+        # passthrough or single conversion the file's location decides grouping.
+        outcomes: list[IngestOutcome] = []
+        for out in prep.outputs:
+            group_key, caption = _route_for(
+                folder, chat_id, out, individual=prep.individual)
+            try:
+                res = register_file(
+                    store, out,
+                    source    = ORPHANED_SOURCE,
+                    platform  = ORPHANED_PLATFORM,
+                    username  = chat_id,
+                    chat_id   = chat_id,
+                    group_key = group_key,
+                    caption   = caption,
+                    priority  = priority,
+                )
+            except Exception as e:           # pragma: no cover — defensive
+                rep.errors.append(f"{out.name}: {e}")
+                log.exception("orphaned: register_file raised on %s", out)
+                continue
+            outcomes.append(res.outcome)
+            setattr(rep, _OUTCOME_TALLY[res.outcome],
+                    getattr(rep, _OUTCOME_TALLY[res.outcome]) + 1)
+
+        # Passthrough (untouched original): keep the legacy hash-failure
+        # quarantine so a corrupt loose file isn't re-hashed every sweep.
+        if not prep.transformed:
+            if (IngestOutcome.HASH_FAILED in outcomes) and mtime is not None:
+                quarantine[key] = mtime
+                q_dirty = True
+            elif key in quarantine:
+                del quarantine[key]
+                q_dirty = True
+            continue
+
+        # Transformed: the original has been replaced by its output(s). Only
+        # retire it once EVERY output is accounted for (registered or deduped) —
+        # if any registration raised we keep the original so its bytes aren't
+        # lost, and memoize so the failure isn't retried forever.
+        all_accounted = len(outcomes) == len(prep.outputs)
+        removed = all_accounted and _delete_replaced_original(guard, chat_id, f)
+        if not removed and mtime is not None:
+            # Safebrake-protected, delete-after-split off, or a partial-register
+            # failure: remember the kept original so the next sweep skips it.
+            prepped[key] = mtime
+            p_dirty = True
 
     if q_dirty:
         store.meta_set(_HASHFAIL_META_KEY, json.dumps(quarantine))
+    if p_dirty:
+        store.meta_set(_PREPPED_META_KEY, json.dumps(prepped))
     return rep
+
+
+def _route_for(
+    folder: Path, chat_id: str, out: Path, *, individual: bool,
+) -> tuple[str | None, str | None]:
+    """(group_key, caption) for an output file. Split parts (individual=True)
+    each get a unique batch key so they send as separate ordered messages; a
+    file in a subfolder albums by subfolder; a top-level file sends alone."""
+    if individual:
+        # Unique group via caption; display caption is the stem (drain).
+        return None, out.name
+    try:
+        rel = out.relative_to(folder)
+        subpath = rel.parent.as_posix()
+    except ValueError:
+        subpath = "."
+    subpath = "" if subpath == "." else subpath
+    if subpath:
+        return f"{chat_id}/{subpath}", None
+    # Top-level loose file → its own message (see drain.orphaned_caption).
+    return None, out.name
+
+
+def _delete_replaced_original(
+    guard: DeletionGuard | None, chat_id: str, original: Path,
+) -> bool:
+    """Delete an original that media_prep replaced. Returns True if removed.
+
+    delete-after-split (default ON) gates whether we delete at all; the
+    DeletionGuard safebrake can still veto a protected scope. With no guard we
+    fall back to the suite's legacy unconditional cleanup."""
+    if not media_prep.delete_after_split():
+        return False
+    if guard is not None:
+        return guard.delete(
+            ORPHANED_PLATFORM, chat_id, str(original),
+            reason="media-prep replaced original with streamable/split copy",
+        )
+    cleanup_sidecars(str(original))
+    return True
 
 
 def _load_quarantine(store: ItemStore) -> dict[str, str]:
     """The {path: mtime_ns} hash-failure quarantine, or {} if unset/corrupt."""
     try:
         return json.loads(store.meta_get(_HASHFAIL_META_KEY) or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _load_prepped(store: ItemStore) -> dict[str, str]:
+    """The {path: mtime_ns} media-prep memo (kept originals + prep failures),
+    or {} if unset/corrupt."""
+    try:
+        return json.loads(store.meta_get(_PREPPED_META_KEY) or "{}")
     except (json.JSONDecodeError, TypeError):
         return {}
 

@@ -482,6 +482,8 @@ def cmd_ingest(args, config: Config, db: ItemStore) -> int:
     ingest an arbitrary folder to an explicit chat (same dedup guarantee)."""
     from core import ingest_chat_id_dirs, ingest_folder, is_chat_id
 
+    guard = DeletionGuard(config.policy_store)
+
     if args.path:
         if not args.chat:
             log.error("ingest --path requires --chat <chat_id>")
@@ -493,7 +495,8 @@ def cmd_ingest(args, config: Config, db: ItemStore) -> int:
         if not folder.is_dir():
             log.error("ingest --path %s is not a directory", folder)
             return 2
-        rep = ingest_folder(db, folder, chat_id=args.chat, priority=args.priority)
+        rep = ingest_folder(db, folder, chat_id=args.chat,
+                            priority=args.priority, guard=guard)
         print(rep)
         return 0
 
@@ -501,6 +504,7 @@ def cmd_ingest(args, config: Config, db: ItemStore) -> int:
         db, config.output_dir,
         known_platforms = list(PLATFORM_CHOICES) + list(config.local_platforms),
         priority        = args.priority,
+        guard           = guard,
     )
     if not reports:
         print("No chat_id folders found under", config.output_dir)

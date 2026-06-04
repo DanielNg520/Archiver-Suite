@@ -233,6 +233,7 @@ class Archiver:
         reports = ingest_chat_id_dirs(
             self.db, self.config.output_dir,
             known_platforms=known_platform_names,
+            guard=self.deletion_guard,
         )
         total = sum(r.inserted for r in reports)
         if total:

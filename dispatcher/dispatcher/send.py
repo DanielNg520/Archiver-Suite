@@ -5,7 +5,10 @@ The send Strategy. SendStrategy ABC defines the contract; TelethonSend-
 Strategy implements it using Telethon.
 
 WHY STRATEGY:
-  Today: Telethon (MTProto user-account uploads, 2GB limit, native albums).
+  Today: Telethon (MTProto user-account uploads, native albums). The per-file
+  upload ceiling is the account's MTProto limit (4GB on Premium); files over it
+  are split into <=1GB parts up-front at ingest (core.media_prep), so the send
+  path never has to chunk a file itself.
   Tomorrow: maybe Bot API for some channels, maybe a fake strategy in
   tests, maybe MTProxy in a different region. The drain loop should not
   care which one is mounted — it just calls .send().

@@ -1,0 +1,239 @@
+"""
+Validation harness for media_prep + the orphaned ingester's pre-flight
+(convert non-streamable formats; split oversize files via AutoSplitter).
+
+Generates REAL tiny videos with ffmpeg and drives the actual code paths — no
+mocks — asserting the on-disk + DB outcome of each branch:
+
+    passthrough · remux · re-encode · split · idempotency · delete-after-split
+
+Run: PYTHONPATH=core python core/core/_selftest_media_prep.py
+Requires ffmpeg/ffprobe on PATH and the AutoSplitter sibling checkout (for the
+split test); both are part of the suite's normal toolchain.
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core import ItemStore, media_prep                      # noqa: E402
+from core.orphaned import (                                  # noqa: E402
+    ingest_folder, ORPHANED_PLATFORM, _PREPPED_META_KEY,
+)
+
+OK = "✓"
+_checks = 0
+
+
+def check(cond: bool, label: str) -> None:
+    global _checks
+    _checks += 1
+    if not cond:
+        print(f"✗ FAIL: {label}")
+        raise SystemExit(1)
+    print(f"{OK} {label}")
+
+
+def _ffmpeg(args: list[str]) -> None:
+    r = subprocess.run(["ffmpeg", "-y", "-v", "error", *args],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"ffmpeg setup failed: {r.stderr.strip()[:300]}")
+
+
+def make_video(path: Path, *, seconds: float, vcodec: str, acodec: str,
+               bitrate: str | None = None, gop: int | None = None) -> None:
+    """Synthesize a tiny test clip with the requested codecs/container."""
+    args = [
+        "-f", "lavfi", "-i", f"testsrc=duration={seconds}:size=240x160:rate=10",
+        "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+        "-shortest", "-pix_fmt", "yuv420p",
+        "-c:v", vcodec, "-c:a", acodec,
+    ]
+    if gop:
+        # Frequent keyframes so a -c copy segment split can actually cut.
+        args += ["-g", str(gop), "-force_key_frames", f"expr:gte(t,n_forced*1)"]
+    if bitrate:
+        args += ["-b:v", bitrate]
+    if path.suffix.lower() == ".mp4":
+        args += ["-movflags", "+faststart"]
+    _ffmpeg([*args, str(path)])
+
+
+def rows_for(store: ItemStore, chat_id: str):
+    return store.pending_items(ORPHANED_PLATFORM, chat_id)
+
+
+# ── Unit: decision logic ──────────────────────────────────────────────────────
+
+def test_decisions(tmp: Path) -> None:
+    print("\n── media_prep.prepare branches ──")
+    chat = tmp  # not a chat folder here; we call prepare() directly
+
+    # 1. Compatible mp4 within size → passthrough (untouched).
+    good = chat / "good.mp4"
+    make_video(good, seconds=2, vcodec="libx264", acodec="aac")
+    res = media_prep.prepare(good)
+    check(res.ok and not res.transformed and res.outputs == [good],
+          "compatible mp4 → passthrough (no transform)")
+    check(good.exists(), "passthrough leaves original in place")
+
+    # 2. h264/aac in an mkv → lossless remux to mp4, original superseded.
+    mkv = chat / "remuxme.mkv"
+    make_video(mkv, seconds=2, vcodec="libx264", acodec="aac")
+    res = media_prep.prepare(mkv)
+    check(res.ok and res.transformed and not res.individual,
+          "mkv(h264/aac) → transformed, single output")
+    check(len(res.outputs) == 1 and res.outputs[0].suffix == ".mp4"
+          and res.outputs[0].exists(), "remux produced one .mp4 output")
+    probe = media_prep._probe(res.outputs[0])
+    check(probe is not None and media_prep._is_streamable(probe),
+          "remux output is Telegram-streamable")
+    media_prep._unlink(res.outputs[0])
+
+    # 3. mpeg4 video in an avi → re-encode to h264 mp4.
+    avi = chat / "reencode.avi"
+    make_video(avi, seconds=2, vcodec="mpeg4", acodec="mp3")
+    res = media_prep.prepare(avi)
+    check(res.ok and res.transformed and len(res.outputs) == 1,
+          "avi(mpeg4) → transformed single output")
+    probe = media_prep._probe(res.outputs[0])
+    check(probe is not None and probe.vcodec == "h264"
+          and media_prep._is_streamable(probe),
+          "re-encode output is h264 / streamable")
+    media_prep._unlink(res.outputs[0])
+
+    # 4. Disabled master switch → always passthrough.
+    os.environ["ARCHIVER_MEDIA_PREP"] = "0"
+    try:
+        res = media_prep.prepare(mkv)
+        check(not res.transformed and res.outputs == [mkv],
+              "ARCHIVER_MEDIA_PREP=0 disables prep (passthrough)")
+    finally:
+        del os.environ["ARCHIVER_MEDIA_PREP"]
+
+    # 5. Non-video (image extension) → passthrough untouched.
+    img = chat / "pic.jpg"
+    img.write_bytes(b"not really a jpeg")
+    res = media_prep.prepare(img)
+    check(res.outputs == [img] and not res.transformed,
+          "image extension → passthrough (not a prep candidate)")
+
+
+# ── Unit: split via AutoSplitter ──────────────────────────────────────────────
+
+def test_split(tmp: Path) -> None:
+    print("\n── media_prep split (AutoSplitter) ──")
+    if media_prep._load_run_split() is None:
+        print("  (AutoSplitter not found — skipping split test)")
+        return
+    big = tmp / "long.mp4"
+    make_video(big, seconds=20, vcodec="libx264", acodec="aac",
+               bitrate="300k", gop=10)
+    size = big.stat().st_size
+    # Force the oversize path: ceiling + chunk a third of the file, so a ~20s
+    # clip yields ~3 parts each well over AutoSplitter's 5s chunk floor.
+    os.environ["ARCHIVER_TG_MAX_UPLOAD_BYTES"] = str(size // 3)
+    os.environ["ARCHIVER_SPLIT_CHUNK_BYTES"] = str(size // 3)
+    try:
+        res = media_prep.prepare(big)
+    finally:
+        del os.environ["ARCHIVER_TG_MAX_UPLOAD_BYTES"]
+        del os.environ["ARCHIVER_SPLIT_CHUNK_BYTES"]
+    check(res.ok and res.transformed and res.individual,
+          "oversize mp4 → split, individual=True")
+    check(len(res.outputs) >= 2, f"split produced {len(res.outputs)} parts (>=2)")
+    check(all(p.exists() and p.stat().st_size > 0 for p in res.outputs),
+          "all split parts exist and are non-empty")
+    check(not (big.parent / f"{big.stem}_segments.txt").exists(),
+          "AutoSplitter segment-list sidecar was cleaned up")
+    for p in res.outputs:
+        media_prep._unlink(p)
+
+
+# ── Integration: ingest_folder end to end ─────────────────────────────────────
+
+def test_ingest_folder(tmp: Path) -> None:
+    print("\n── orphaned.ingest_folder integration ──")
+    chat_id = "100200300"
+    folder = tmp / chat_id
+    (folder / "album").mkdir(parents=True)
+
+    # Top-level compatible file → individual message, untouched.
+    make_video(folder / "loose.mp4", seconds=2, vcodec="libx264", acodec="aac")
+    # Subfolder incompatible container → remux, album-grouped by subfolder.
+    make_video(folder / "album" / "clip.mkv", seconds=2,
+               vcodec="libx264", acodec="aac")
+
+    store = ItemStore.open(str(tmp / "t.db"))
+    rep = ingest_folder(store, folder, chat_id=chat_id, guard=None)
+
+    check(rep.scanned == 2, f"scanned both files (got {rep.scanned})")
+    check(rep.inserted == 2, f"inserted 2 rows (got {rep.inserted})")
+    rows = {Path(r.file_path).name: r for r in rows_for(store, chat_id)}
+    check(len(rows) == 2, "two pending rows present")
+
+    # The mkv was replaced on disk by a streamable .mp4 and the original is gone.
+    check(not (folder / "album" / "clip.mkv").exists(),
+          "incompatible original (.mkv) deleted after prep")
+    check((folder / "album" / "clip.tgprep.mp4").exists(),
+          "converted .mp4 sits beside where the .mkv was")
+    conv = rows.get("clip.tgprep.mp4")
+    check(conv is not None and conv.group_key == f"{chat_id}/album"
+          and conv.caption is None,
+          "converted file keeps subfolder album routing")
+    loose = rows.get("loose.mp4")
+    check(loose is not None and loose.group_key is None
+          and loose.caption == "loose.mp4",
+          "top-level compatible file routes as individual message")
+
+    # Idempotency: a second sweep enqueues nothing new and adds no rows.
+    rep2 = ingest_folder(store, folder, chat_id=chat_id, guard=None)
+    check(rep2.inserted == 0, "second sweep inserts nothing (idempotent)")
+    check(len(rows_for(store, chat_id)) == 2, "still exactly two rows")
+    store.close()
+
+
+def test_delete_after_split_off(tmp: Path) -> None:
+    print("\n── delete-after-split=0 keeps original + memoizes ──")
+    chat_id = "100200301"
+    folder = tmp / chat_id
+    folder.mkdir(parents=True)
+    make_video(folder / "keep.mkv", seconds=2, vcodec="libx264", acodec="aac")
+
+    store = ItemStore.open(str(tmp / "k.db"))
+    os.environ["ARCHIVER_DELETE_AFTER_SPLIT"] = "0"
+    try:
+        rep = ingest_folder(store, folder, chat_id=chat_id, guard=None)
+        check(rep.inserted == 1, "converted file enqueued")
+        check((folder / "keep.mkv").exists(),
+              "original KEPT when delete-after-split=0")
+        memo = store.meta_get(_PREPPED_META_KEY)
+        check(memo and "keep.mkv" in memo,
+              "kept original is memoized so it won't be reprocessed")
+        # Second sweep must NOT re-convert (memo hit) → no new rows.
+        rep2 = ingest_folder(store, folder, chat_id=chat_id, guard=None)
+        check(rep2.inserted == 0 and rep2.known >= 1,
+              "memoized original skipped on the next sweep")
+    finally:
+        del os.environ["ARCHIVER_DELETE_AFTER_SPLIT"]
+    store.close()
+
+
+def main() -> None:
+    print("media_prep self-test")
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        test_decisions(tmp)
+        test_split(tmp)
+        test_ingest_folder(tmp)
+        test_delete_after_split_off(tmp)
+    print(f"\nALL PASS ({_checks} checks)")
+
+
+if __name__ == "__main__":
+    main()
