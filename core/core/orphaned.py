@@ -138,6 +138,7 @@ def ingest_chat_id_dirs(
 
 _OUTCOME_TALLY = {
     IngestOutcome.INSERTED:      "inserted",
+    IngestOutcome.REARMED:       "inserted",   # re-armed a failed twin → enqueued
     IngestOutcome.DEDUP_DROPPED: "deduped",
     IngestOutcome.DEDUP_ADOPTED: "deduped",
     IngestOutcome.ALREADY_KNOWN: "known",

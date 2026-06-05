@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from core import identity, stability, cleanup_sidecars, DeletionGuard
+from core import identity, stability, cleanup_sidecars, DeletionGuard, media_prep
 from core.hashing import full_hash
 
 # Upload priority for re-registered recordings. MUST match the recorder's live
@@ -83,6 +83,7 @@ class ReconcileReport:
     manual_files:    int = 0   # subset of `inserted` with is_manual=True
     seeded_archive:  int = 0
     deleted_dupes:   int = 0   # re-introduced files whose bytes were already sent
+    prep_failed:     int = 0   # convertible containers media_prep couldn't rescue
     max_upload_date: str | None = None
     archive_entries: list[str] = field(default_factory=list)
 
@@ -90,10 +91,11 @@ class ReconcileReport:
         manual_note = f" ({self.manual_files} manual)" if self.manual_files else ""
         seed_note = f", seeded {self.seeded_archive}" if self.seeded_archive else ""
         dup_note = f", deleted {self.deleted_dupes} dup" if self.deleted_dupes else ""
+        prep_note = f", prep-failed {self.prep_failed}" if self.prep_failed else ""
         return (
             f"[{self.platform}] @{self.username}: scanned {self.scanned}, "
             f"+{self.inserted}{manual_note}, known {self.already_known}, "
-            f"unstable {self.skipped_unstable}{seed_note}{dup_note}, "
+            f"unstable {self.skipped_unstable}{seed_note}{dup_note}{prep_note}, "
             f"floor={self.max_upload_date or '-'}"
         )
 
@@ -241,6 +243,88 @@ def _reconcile_dir(
     # seed the extractor archive with them.
     new_archive_entries: list[str] = []
 
+    def _register(out: Path) -> bool:
+        """Register one ready-to-send file — a canonical original, or a
+        media_prep output for a converted container. Returns True once the file
+        is accounted for (a row was inserted, an existing row already covers it,
+        or a re-introduced already-sent copy was removed/kept), so a replaced
+        original may be retired. False only when the file vanished mid-walk and
+        must be retried next pass."""
+        out_str = str(out)
+
+        ident = identity.resolve(out)
+        identifier = (identifier_for_path(out) if identifier_for_path
+                      else ident.identifier)
+        try:
+            size = out.stat().st_size
+        except OSError:
+            log.warning("  reconcile: vanished mid-walk: %s", out)
+            return False
+
+        # Content-hash the new file — the move/rename-proof identity.
+        digest = full_hash(out)
+
+        # Re-introduction guard: if these exact bytes already belong to an
+        # ALREADY-UPLOADED row (under a different path), this is a copy the user
+        # moved back in. Don't re-enqueue it — delete it from disk (unless the
+        # safebrake shields this scope). Twins with NULL hashes (pre-content_hash)
+        # won't match; identity-collision still blocks re-upload below.
+        if digest is not None:
+            twin = db.find_by_content_hash(digest)
+            if (twin is not None
+                    and twin.status == "sent"
+                    and twin.file_path != out_str):
+                if guard is None:
+                    cleanup_sidecars(out_str)
+                    removed = True
+                else:
+                    removed = guard.delete(report.platform, username, out_str,
+                                           reason="reconcile-reintroduced-dup")
+                if removed:
+                    report.deleted_dupes += 1
+                    log.info("  reconcile: deleted re-introduced already-"
+                             "uploaded file %s (bytes already sent as id=%d)",
+                             out.name, twin.id)
+                else:
+                    log.info("  reconcile: kept re-introduced dup %s (safebrake; "
+                             "already sent as id=%d, not re-enqueued)",
+                             out.name, twin.id)
+                return True
+
+        inserted = db.add_item(
+            source          = source,
+            platform        = report.platform,
+            username        = username,
+            identifier      = identifier,
+            file_path       = out_str,
+            upload_date     = ident.upload_date,
+            file_size_bytes = size,
+            title           = ident.title,
+            caption         = caption_for_path(out) if caption_for_path else None,
+            priority        = priority,
+            content_hash    = digest,
+        )
+        if inserted:
+            report.inserted += 1
+            if ident.is_manual:
+                report.manual_files += 1
+                log.info("  reconcile: + (manual) %s [%s]",
+                         out.name, ident.upload_date)
+            else:
+                log.info("  reconcile: + %s [%s]", out.name, ident.upload_date)
+            entry = (
+                identity.archive_entry_for(platform.name, ident)
+                if platform is not None else None
+            )
+            if entry:
+                new_archive_entries.append(entry)
+        else:
+            # INSERT OR IGNORE hit a UNIQUE constraint (same (platform,
+            # identifier) or file_path already present). Rare; log + move on.
+            report.already_known += 1
+            log.debug("  reconcile: collision on %s id=%s", out.name, identifier)
+        return True
+
     files = scan_dir.rglob("*") if recursive else scan_dir.iterdir()
     # NOT wrapped in db.batch() — deliberately. Each new file is content-hashed
     # (full_hash, a whole-file read) right before its add_item. Under WAL the
@@ -259,7 +343,10 @@ def _reconcile_dir(
         # are 4KB metadata stubs, not media. Matches dedup.py's convention.
         if f.name.startswith("."):
             continue
-        if f.suffix.lower() not in MEDIA_EXTENSIONS:
+        ext = f.suffix.lower()
+        convertible = (ext in media_prep.CONVERTIBLE_VIDEO_EXTS
+                       and ext not in MEDIA_EXTENSIONS)
+        if ext not in MEDIA_EXTENSIONS and not convertible:
             continue
 
         report.scanned += 1
@@ -276,90 +363,36 @@ def _reconcile_dir(
             report.skipped_unstable += 1
             continue
 
-        ident = identity.resolve(f)
-        identifier = (identifier_for_path(f) if identifier_for_path
-                      else ident.identifier)
-
-        try:
-            size = f.stat().st_size
-        except OSError:
-            log.warning("  reconcile: vanished mid-walk: %s", f)
-            continue
-
-        # Content-hash the new file — the move/rename-proof identity. Only
-        # NEW paths reach here (has_file_path fast-path skipped known ones),
-        # so on a quiescent archive this hashes nothing.
-        digest = full_hash(f)
-
-        # Re-introduction guard: if these exact bytes already belong to an
-        # ALREADY-UPLOADED row (under a different path), this is a copy the
-        # user moved back in. Don't re-enqueue it — delete it from disk.
-        # (Same-path files never get here; the canonical sent file at its
-        # own path is untouched. Twins created before content_hash existed
-        # have NULL hashes and won't match — identity-collision still blocks
-        # re-upload, just without the disk cleanup.)
-        if digest is not None:
-            twin = db.find_by_content_hash(digest)
-            if (twin is not None
-                    and twin.status == "sent"
-                    and twin.file_path != path_str):
-                # Re-introduced copy of already-sent bytes → delete it, UNLESS
-                # the safebrake shields this scope. A guard=None caller (older
-                # paths, tests) keeps the original unconditional behavior.
-                if guard is None:
-                    cleanup_sidecars(path_str)
-                    removed = True
-                else:
-                    removed = guard.delete(report.platform, username, path_str,
-                                           reason="reconcile-reintroduced-dup")
-                if removed:
-                    report.deleted_dupes += 1
-                    log.info("  reconcile: deleted re-introduced already-"
-                             "uploaded file %s (bytes already sent as id=%d)",
-                             f.name, twin.id)
-                    continue
-                # Protected: leave the file AND don't re-enqueue it (its bytes
-                # are already delivered under twin.id) — fall through to skip.
-                log.info("  reconcile: kept re-introduced dup %s (safebrake; "
-                         "already sent as id=%d, not re-enqueued)",
-                         f.name, twin.id)
+        # Convertible containers (.ts/.flv/.m4v/...) — e.g. a crashed recording
+        # that never reached the recorder's remux — are not Telegram-streamable
+        # as-is and were historically skipped here entirely. Run them through
+        # media_prep to get a streamable .mp4 (split if oversize); only its
+        # transformed outputs are registered, then the raw original is retired.
+        # Canonical media keeps the untouched single-file fast path.
+        if convertible:
+            prep = media_prep.prepare(f)
+            if not prep.ok:
+                report.prep_failed += 1
+                log.warning("  reconcile: media_prep failed for %s: %s",
+                            f.name, prep.error)
                 continue
-
-        inserted = db.add_item(
-            source          = source,
-            platform        = report.platform,
-            username        = username,
-            identifier      = identifier,
-            file_path       = path_str,
-            upload_date     = ident.upload_date,
-            file_size_bytes = size,
-            title           = ident.title,
-            caption         = caption_for_path(f) if caption_for_path else None,
-            priority        = priority,
-            content_hash    = digest,
-        )
-        if inserted:
-            report.inserted += 1
-            if ident.is_manual:
-                report.manual_files += 1
-                log.info("  reconcile: + (manual) %s [%s]",
-                         f.name, ident.upload_date)
-            else:
-                log.info("  reconcile: + %s [%s]", f.name, ident.upload_date)
-            # Collect archive seed entries (manual files get None back)
-            entry = (
-                identity.archive_entry_for(platform.name, ident)
-                if platform is not None else None
-            )
-            if entry:
-                new_archive_entries.append(entry)
+            if not prep.transformed:
+                # Prep disabled or the file isn't a usable video — skip rather
+                # than enqueue an unplayable container (prior behaviour).
+                report.prep_failed += 1
+                log.warning("  reconcile: %s not converted to a streamable "
+                            "format — skipped", f.name)
+                continue
+            targets, transformed = prep.outputs, True
         else:
-            # add_item returned False — INSERT OR IGNORE hit a UNIQUE
-            # constraint (same (platform, identifier) or file_path already
-            # present, possibly under a different path). Rare; log + move on.
-            report.already_known += 1
-            log.debug("  reconcile: collision on %s id=%s",
-                      f.name, identifier)
+            targets, transformed = [f], False
+
+        accounted = sum(1 for out in targets if _register(out))
+
+        # Retire the replaced original only once every output is accounted for,
+        # so a partial-registration failure keeps the source bytes on disk.
+        if transformed and accounted == len(targets):
+            _retire_replaced_original(guard, report.platform, username, f)
 
     # Seed extractor archive — only for entries we actually added this
     # pass (we don't need to keep re-seeding already-known ones).
@@ -378,6 +411,26 @@ def _reconcile_dir(
     report.max_upload_date = db.max_upload_date(report.platform, username)
 
     return report
+
+
+def _retire_replaced_original(
+    guard: "DeletionGuard | None", platform: str, username: str, original: Path,
+) -> None:
+    """Delete a convertible original that media_prep replaced with streamable
+    output(s). delete-after-split (default ON) gates whether we delete at all;
+    the DeletionGuard safebrake can still veto a protected scope. With no guard
+    we fall back to the suite's legacy unconditional cleanup. A kept original is
+    re-converted on the next pass (idempotent: its output's file_path already
+    has a row), so nothing is lost — it just isn't cleaned up."""
+    if not media_prep.delete_after_split():
+        return
+    if guard is not None:
+        guard.delete(
+            platform, username, str(original),
+            reason="reconcile media-prep replaced original with streamable copy",
+        )
+    else:
+        cleanup_sidecars(str(original))
 
 
 def _recorder_output_dir() -> Path:

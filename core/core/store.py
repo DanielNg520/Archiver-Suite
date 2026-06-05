@@ -320,13 +320,44 @@ class ItemStore:
         return r["id"] if r else None
 
     def find_by_content_hash(self, content_hash: str) -> Item | None:
-        """First existing row sharing these exact bytes, or None. Drives
-        ingest-time global dedup: if a row already holds this content_hash,
-        the incoming file is a duplicate and never gets a second row."""
+        """Existing row sharing these exact bytes, or None. Drives ingest-time
+        global dedup: if a row already holds this content_hash, the incoming
+        file is a duplicate and never gets a second row.
+
+        Prefers a DELIVERABLE twin over a permanently-failed one: a 'failed'
+        row will never be sent, so collapsing onto it would silently drop the
+        re-introduced bytes. Order sent → sending → pending → failed so a live
+        twin is returned when one exists (and ingest re-arms a lone failed twin
+        instead of dropping the copy). Also makes reconcile's already-sent
+        detection deterministic when both a sent and a pending twin exist."""
         r = self.conn.execute(
-            "SELECT * FROM items WHERE content_hash=? LIMIT 1", (content_hash,),
+            """SELECT * FROM items WHERE content_hash=?
+               ORDER BY CASE status
+                          WHEN 'sent'    THEN 0
+                          WHEN 'sending' THEN 1
+                          WHEN 'pending' THEN 2
+                          ELSE 3
+                        END
+               LIMIT 1""",
+            (content_hash,),
         ).fetchone()
         return Item.from_row(r) if r else None
+
+    def rearm_failed(self, item_id: int) -> bool:
+        """failed → pending for one row (attempts reset), or False if the row
+        is no longer 'failed'. Used by ingest when an identical-bytes file is
+        re-introduced but its only twin had permanently failed: those bytes
+        were never delivered, so the row is re-armed rather than the incoming
+        copy being dropped as a dedup. Guarded on 'failed' so a racing delivery
+        (a twin reset/resent out from under us) is never overwritten."""
+        cur = self.conn.execute(
+            """UPDATE items SET status='pending', attempts=0, claimed_at=NULL,
+                   sent_at=NULL, last_error=NULL
+               WHERE id=? AND status='failed'""",
+            (item_id,),
+        )
+        self._commit()
+        return cur.rowcount > 0
 
     def relink_file(self, item_id: int, new_file_path: str) -> None:
         """Re-point an existing row at a different physical file (the dedup

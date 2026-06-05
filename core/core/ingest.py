@@ -44,6 +44,7 @@ from . import identity, stability
 from .dedup import _pick_winner
 from .files import cleanup_sidecars
 from .hashing import full_hash
+from .models import Status
 from .stores import ProducerStore
 
 log = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ log = logging.getLogger(__name__)
 class IngestOutcome(str, Enum):
     """What register_file did. str-Enum so it logs/serializes as plain text."""
     INSERTED       = "inserted"        # new content → new pending row
+    REARMED        = "rearmed"         # bytes' only twin had FAILED; row reset to pending
     DEDUP_DROPPED  = "dedup_dropped"   # bytes already known; incoming file deleted
     DEDUP_ADOPTED  = "dedup_adopted"   # incoming file won on name; row re-pointed, old deleted
     ALREADY_KNOWN  = "already_known"   # this exact file_path already has a row
@@ -67,7 +69,9 @@ class IngestResult:
 
     @property
     def inserted(self) -> bool:
-        return self.outcome is IngestOutcome.INSERTED
+        """True when this call made content newly claimable — a brand-new row
+        (INSERTED) or a re-armed previously-failed twin (REARMED)."""
+        return self.outcome in (IngestOutcome.INSERTED, IngestOutcome.REARMED)
 
 
 def register_file(
@@ -141,9 +145,28 @@ def _collapse(
 ) -> IngestResult:
     """Resolve a byte-identical collision between an incoming file and an
     existing row's file. Keep exactly ONE physical copy — the winner by
-    core.dedup rules (canonical name > sidecar > has-row > earliest > path) —
-    and never create a second row."""
+    core.dedup rules (canonical name > sidecar > has-row > earliest > path).
+
+    A second row is never created. But if the twin had permanently FAILED its
+    bytes were never delivered, so collapsing onto it silently would lose the
+    re-introduced content. In that case we keep the winning copy AND re-arm the
+    row (failed → pending) so it sends — reported as REARMED. find_by_content_
+    hash prefers a deliverable twin, so a 'failed' twin means it's the only one."""
+    failed = (twin.status == Status.FAILED.value)
     existing = Path(twin.file_path)
+
+    def _finish(adopted: bool) -> IngestResult:
+        """Apply the re-arm (if the twin had failed) and pick the outcome."""
+        if failed and store.rearm_failed(twin.id):
+            log.info("ingest: re-arm failed twin id=%d from %s "
+                     "(bytes never delivered)", twin.id, incoming.name)
+            return IngestResult(IngestOutcome.REARMED, item_id=twin.id,
+                                content_hash=digest)
+        outcome = (IngestOutcome.DEDUP_ADOPTED if adopted
+                   else IngestOutcome.DEDUP_DROPPED)
+        return IngestResult(outcome,
+                            item_id=(twin.id if adopted else None),
+                            content_hash=digest)
 
     # If the twin's file vanished, the incoming copy simply takes its place:
     # re-point the row, no deletion needed.
@@ -151,8 +174,7 @@ def _collapse(
         store.relink_file(twin.id, str(incoming))
         log.info("ingest: dedup adopt (twin file gone) %s → row id=%d",
                  incoming.name, twin.id)
-        return IngestResult(IngestOutcome.DEDUP_ADOPTED, item_id=twin.id,
-                            content_hash=digest)
+        return _finish(adopted=True)
 
     # db_meta: the twin has a row (use its discovered_at); the incoming file
     # has none yet. _pick_winner reads None as "no row".
@@ -163,11 +185,11 @@ def _collapse(
 
     if winner == existing:
         # Existing copy wins → incoming is the redundant one. Delete it "as if
-        # never there" (file + sidecars). No new row.
+        # never there" (file + sidecars); the row keeps pointing at `existing`.
         cleanup_sidecars(str(incoming))
         log.info("ingest: dedup drop %s (dup of row id=%d)",
                  incoming.name, twin.id)
-        return IngestResult(IngestOutcome.DEDUP_DROPPED, content_hash=digest)
+        return _finish(adopted=False)
 
     # Incoming wins (better/canonical name) → ADOPT: re-point the row at the
     # incoming file, then retire the old copy.
@@ -175,5 +197,4 @@ def _collapse(
     cleanup_sidecars(str(existing))
     log.info("ingest: dedup adopt %s → row id=%d (retired %s)",
              incoming.name, twin.id, existing.name)
-    return IngestResult(IngestOutcome.DEDUP_ADOPTED, item_id=twin.id,
-                        content_hash=digest)
+    return _finish(adopted=True)
