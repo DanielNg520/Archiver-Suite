@@ -18,11 +18,20 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core import db_path as _core_db_path
+try:
+    from core import db_path as _core_db_path
+except ModuleNotFoundError:
+    _this_dir = Path(__file__).resolve()
+    _repo_root = _this_dir.parents[2]
+    _core_pkg = _repo_root / "core"
+    if _core_pkg.is_dir():
+        sys.path.insert(0, str(_core_pkg))
+    from core import db_path as _core_db_path
 
 # Single source of truth: one DB for the whole suite. ops still imports no
 # *service* package (dispatcher/recorder/archiver) — it only borrows the
