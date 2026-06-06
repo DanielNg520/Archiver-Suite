@@ -245,7 +245,7 @@ def _seed_ytdlp_txt(archive_path: Path, entries: Iterable[str]) -> int:
     if archive_path.exists():
         existing = set(
             line.strip()
-            for line in archive_path.read_text(encoding="utf-8").splitlines()
+            for line in archive_path.read_text(encoding="utf-8", errors="replace").splitlines()
             if line.strip()
         )
     new = [e for e in entries if e not in existing]
@@ -582,7 +582,10 @@ class TikTokPlatform(Platform):
             f"https://www.tiktok.com/@{username}",
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=600,
+            )
             if result.returncode not in (0, 1):
                 log.warning("  gallery-dl exit %d: %s",
                             result.returncode, result.stderr[:300])

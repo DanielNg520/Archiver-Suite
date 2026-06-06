@@ -127,8 +127,12 @@ def _read_sidecar(media_file: Path) -> dict | None:
         if not sidecar.exists():
             continue
         try:
-            return json.loads(sidecar.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
+            # errors="replace": TikTok captions/usernames routinely carry
+            # non-UTF-8 bytes (e.g. a stray 0xb0 "°"); a strict decode would
+            # raise UnicodeDecodeError (a ValueError, NOT an OSError) and abort
+            # the whole fetch. Tolerate the bad byte — JSON structure survives.
+            return json.loads(sidecar.read_text(encoding="utf-8", errors="replace"))
+        except (json.JSONDecodeError, OSError, ValueError) as e:
             log.debug("sidecar %s unreadable: %s", sidecar, e)
             continue
     return None
