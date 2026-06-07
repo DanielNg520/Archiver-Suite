@@ -66,6 +66,7 @@ class StreamCapture:
         self._run_dir: Path | None = None
         self._started_at: float = 0.0
         self._log_fh = None  # yt-dlp stdout/stderr sink; closed in wait()
+        self._log_path: Path | None = None  # the sink's path, for finalize()
 
     def start(self, stream_url: str, username: str) -> None:
         """Launch yt-dlp. Files land in output_dir/<username>/."""
@@ -100,8 +101,8 @@ class StreamCapture:
         # write() and silently freezing the recording. Redirect to a regular
         # file fd instead: kernel appends never block the writer. stderr is
         # merged into stdout so one file holds the full diagnostic stream.
-        log_path = self._run_dir / f"{username}_{int(self._started_at)}_ytdlp.log"
-        self._log_fh = open(log_path, "ab", buffering=0)
+        self._log_path = self._run_dir / f"{username}_{int(self._started_at)}_ytdlp.log"
+        self._log_fh = open(self._log_path, "ab", buffering=0)
         self._proc = subprocess.Popen(
             cmd, stdout=self._log_fh, stderr=subprocess.STDOUT,
         )
@@ -172,6 +173,36 @@ class StreamCapture:
                 self._log_fh.close()
             finally:
                 self._log_fh = None
+
+    def finalize(self) -> None:
+        """Settle this run's yt-dlp log so it never orphans. Call once after
+        wait() returns.
+
+          recording produced → rename the log to share the media's stem
+            (<user>_<epoch>_ytdlp.log) so cleanup_sidecars deletes it when the
+            recording is deleted post-upload. The log is named off our wall
+            clock but the media off yt-dlp's own %(epoch)s; the two can drift a
+            second, so we re-key the log to the actual file rather than trust
+            the names to match.
+          no recording (dead stream) → there is no record to ever pair with or
+            delete, so the log would pile up forever. Remove it now.
+
+        The media stem survives the later -c copy remux (suffix-only change),
+        so the pairing still holds for the uploaded .mp4."""
+        if self._log_path is None:
+            return
+        media = self.output_files()
+        if not media:
+            self._log_path.unlink(missing_ok=True)
+            self._log_path = None
+            return
+        target = media[0].with_name(media[0].stem + "_ytdlp.log")
+        if target != self._log_path and self._log_path.exists():
+            try:
+                self._log_path.rename(target)
+                self._log_path = target
+            except OSError as e:
+                log.debug("capture: could not pair log with recording: %s", e)
 
     def output_files(self) -> list[Path]:
         """Files written by this run: anything in the run dir with mtime

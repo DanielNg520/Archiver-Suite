@@ -1,0 +1,222 @@
+"""
+recorder.startup_sweep
+──────────────────────
+A reconciliation pass run ONCE at the top of `recorder start`, before the
+state machine begins listening. It makes the on-disk output dir and the shared
+queue agree, so nothing a previous run left behind is silently stranded:
+
+  1. delete every *.log under the output dir — the per-recording yt-dlp logs
+     (recorder.capture writes one beside each stream). They are never uploaded
+     and accumulate forever otherwise; a fresh start wants a clean tree.
+
+  2. for every media file, make the queue reflect reality:
+       - already SENT (uploaded, but the file wasn't deleted)  → delete it now
+         (file + sidecars), the dispatcher already shipped these bytes.
+       - PENDING / SENDING                                     → leave it; it's
+         already queued / in flight.
+       - FAILED                                                → re-arm it
+         (failed → pending) so the next drain retries it.
+       - no row at all                                         → register it via
+         core.ingest (which also content-hash-dedups: bytes already sent under
+         another path are deleted rather than re-uploaded).
+
+  3. delete any directory left empty AFTER the above — recordings that were
+     sent-and-deleted leave behind empty per-user folders.
+
+Self-contained: imports only `core` (never archiver), matching the suite's
+producer-shares-core rule. The heavy requeue/dedup logic is core.ingest, reused
+verbatim rather than re-derived here.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+
+from core import (
+    DeletionGuard, ItemStore, PolicyStore, RecorderDeletePolicy, Status,
+    cleanup_sidecars, register_file,
+)
+from core.ingest import IngestOutcome
+
+from .enqueue import RECORDER_PRIORITY
+
+log = logging.getLogger(__name__)
+
+# "What we consider a recording." Mirrors archiver.reconcile.MEDIA_EXTENSIONS;
+# sidecars (.json) and logs (.log) are intentionally excluded.
+MEDIA_EXTENSIONS = {
+    ".mp4", ".mov", ".webm", ".mkv",   # video
+    ".jpg", ".jpeg", ".png", ".webp",  # image
+    ".gif",                            # animated
+}
+
+
+@dataclass
+class SweepReport:
+    logs_deleted:   int = 0
+    requeued:       int = 0   # new rows + re-armed failed twins
+    already_queued: int = 0   # pending/sending — left alone
+    deleted_sent:   int = 0   # uploaded-but-not-deleted files removed
+    kept_sent:      int = 0   # uploaded files kept (policy off / safebraked)
+    dedup_dropped:  int = 0   # bytes already sent under another path — removed
+    skipped:        int = 0   # unstable / unreadable — retried next start
+    dirs_removed:   int = 0
+
+    def __str__(self) -> str:
+        return (
+            f"logs -{self.logs_deleted}, requeued {self.requeued}, "
+            f"already-queued {self.already_queued}, sent-deleted "
+            f"{self.deleted_sent}, sent-kept {self.kept_sent}, dedup-dropped "
+            f"{self.dedup_dropped}, skipped {self.skipped}, "
+            f"empty-dirs -{self.dirs_removed}"
+        )
+
+
+def _username_for(media: Path, root: Path) -> str:
+    """Recorder layout is {output_dir}/{username}/file. A file directly in the
+    root has no owning user folder → '_root', matching reconcile_recordings."""
+    rel = media.relative_to(root)
+    return rel.parts[0] if len(rel.parts) > 1 else "_root"
+
+
+def _caption(username: str, media: Path) -> str:
+    # Same shape recorder.state._enqueue builds for a live recording.
+    return f"@{username} · tiktok · live · {media.stem}"
+
+
+def _handle_sent(store: ItemStore, media: Path, may_delete: bool,
+                 guard: "DeletionGuard | None", report: SweepReport) -> None:
+    """Delete an already-uploaded leftover file, gated by the delete policy and
+    the safebrake. Resolves the owning (platform, username) from the DB row so
+    the protection check matches what the dispatcher would have applied."""
+    if not may_delete:
+        report.kept_sent += 1
+        return
+    item_id = store.id_of(str(media))
+    item = store.get(item_id) if item_id is not None else None
+    # The row is the authority on the owning scope. If it vanished mid-sweep
+    # (race), fall back to the parent folder name — never a path-relative call
+    # that could raise on an absolute path.
+    platform = item.platform if item else "tiktok"
+    username = item.username if item else media.parent.name
+    # guard is None only when policy/guard couldn't be built; may_delete would
+    # be False in that case, so reaching here means we have a guard.
+    if guard is not None and not guard.delete(
+            platform, username, str(media), reason="startup-sweep-already-sent"):
+        report.kept_sent += 1   # safebrake shielded this scope
+        return
+    if guard is None:
+        cleanup_sidecars(str(media))
+    report.deleted_sent += 1
+
+
+def _delete_policy_and_guard(
+    policy_store: "PolicyStore | None",
+) -> "tuple[RecorderDeletePolicy | None, DeletionGuard | None]":
+    """Build the recorder delete-policy + safebrake guard from the shared
+    config.toml. Best-effort: if config is unreadable we return (None, None),
+    and the caller treats that as 'cannot confirm deletion is allowed' — i.e.
+    it KEEPS uploaded files rather than risk deleting ones the user wanted to
+    retain. Failing safe is the point."""
+    try:
+        store = policy_store or PolicyStore()
+        return RecorderDeletePolicy(store), DeletionGuard(store)
+    except Exception as e:  # malformed config.toml, etc.
+        log.warning("startup-sweep: policy/guard unavailable (%s) — "
+                    "uploaded files will be KEPT this pass", e)
+        return None, None
+
+
+def sweep(output_dir: str, db_path: str | None = None,
+          *, priority: int = RECORDER_PRIORITY,
+          policy_store: "PolicyStore | None" = None) -> SweepReport:
+    """Run the startup reconciliation over `output_dir`. Never raises for an
+    expected condition — a single bad file logs and the sweep continues — so a
+    cluttered tree can never stop the recorder from starting."""
+    report = SweepReport()
+    root = Path(output_dir).expanduser()
+    if not root.exists():
+        return report
+
+    # Deleting an already-uploaded file is a deletion like any other: it must
+    # honor the user's delete-after-upload setting AND the safebrake, exactly
+    # as the dispatcher's delete-after-upload path does. We never bypass them.
+    delete_policy, guard = _delete_policy_and_guard(policy_store)
+    may_delete_sent = (delete_policy is not None
+                       and delete_policy.should_delete_recording())
+
+    # 1. delete every per-recording log.
+    for f in root.rglob("*.log"):
+        if not f.is_file():
+            continue
+        try:
+            f.unlink()
+            report.logs_deleted += 1
+        except OSError as e:
+            log.warning("startup-sweep: could not delete log %s: %s", f.name, e)
+
+    # 2. reconcile media against the queue.
+    store = ItemStore.open(db_path)
+    try:
+        for f in sorted(root.rglob("*")):
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            if f.suffix.lower() not in MEDIA_EXTENSIONS:
+                continue
+
+            path_str = str(f)
+            status = store.status_of(path_str)
+
+            if status == Status.SENT.value:
+                # Uploaded already, but the file is still here (the dispatcher's
+                # delete was missed, or delete-after-upload is off). Clean it up
+                # ONLY if the policy says recordings may be deleted and the
+                # safebrake doesn't shield this scope — same gate the dispatcher
+                # uses. Read the owning scope from the row, not the folder name.
+                _handle_sent(store, f, may_delete_sent, guard, report)
+                continue
+
+            if status in (Status.PENDING.value, Status.SENDING.value):
+                report.already_queued += 1
+                continue
+
+            if status == Status.FAILED.value:
+                item_id = store.id_of(path_str)
+                if item_id is not None and store.rearm_failed(item_id):
+                    report.requeued += 1
+                continue
+
+            # No row → register it (content-hash dedup happens inside).
+            username = _username_for(f, root)
+            result = register_file(
+                store, f,
+                source="recorder", platform="tiktok",
+                username=username,
+                caption=_caption(username, f),
+                priority=priority,
+            )
+            if result.inserted:
+                report.requeued += 1
+            elif result.outcome == IngestOutcome.DEDUP_DROPPED:
+                report.dedup_dropped += 1
+            elif result.outcome in (IngestOutcome.DEDUP_ADOPTED,
+                                    IngestOutcome.ALREADY_KNOWN):
+                report.already_queued += 1
+            else:  # UNSTABLE / HASH_FAILED
+                report.skipped += 1
+    finally:
+        store.close()
+
+    # 3. prune directories left empty by the deletions above. Deepest first so
+    #    a parent emptied only by removing its now-empty children is also caught.
+    for d in sorted((p for p in root.rglob("*") if p.is_dir()),
+                    key=lambda p: len(p.parts), reverse=True):
+        try:
+            d.rmdir()  # raises OSError if not empty — exactly what we want
+            report.dirs_removed += 1
+        except OSError:
+            pass
+
+    return report

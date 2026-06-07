@@ -102,6 +102,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
 
+    # Startup reconciliation: clear stale logs, requeue un-uploaded recordings,
+    # delete already-uploaded leftovers, prune empty folders. Best-effort — a
+    # failed sweep must never stop the recorder from coming up.
+    from .startup_sweep import sweep
+    try:
+        report = sweep(config.output_dir, config.db_path)
+        log.info("startup-sweep: %s", report)
+    except Exception as e:
+        log.warning("startup-sweep: skipped after error: %s", e)
+
     platform = TikTokLivePlatform(config.tiktok_cookies_file, config.state_dir)
     capture  = StreamCapture(config.output_dir, config.tiktok_cookies_file)
     enqueue_client = EnqueueClient(config.db_path)

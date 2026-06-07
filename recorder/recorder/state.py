@@ -280,6 +280,9 @@ class StateMachine:
         self._release_lock_if_held()
 
         files = self.capture.output_files()
+        # Pair the yt-dlp log with the recording (or drop it if the stream was
+        # dead) so it's cleaned up with the media instead of piling up forever.
+        self.capture.finalize()
         log.info("recorder: recording of @%s ended (rc=%d, %d file(s))",
                  self.current_user, rc, len(files))
         for f in files:

@@ -51,6 +51,7 @@ def cleanup_sidecars(file_path: str) -> None:
     Sidecar shapes covered:
       yt-dlp:     <stem>.info.json   and  <stem>.json
       gallery-dl: <full_name>.json   (e.g. clip.mp4.json)
+      recorder:   <stem>_ytdlp.log   (live-capture diagnostic log)
     """
     p = Path(file_path)
     try:
@@ -65,5 +66,11 @@ def cleanup_sidecars(file_path: str) -> None:
             pass
     try:
         (p.parent / (p.name + ".json")).unlink(missing_ok=True)
+    except OSError:
+        pass
+    # recorder.capture pairs each live recording with a <stem>_ytdlp.log;
+    # drop it with the media so capture logs don't accumulate after upload.
+    try:
+        (p.parent / (p.stem + "_ytdlp.log")).unlink(missing_ok=True)
     except OSError:
         pass
