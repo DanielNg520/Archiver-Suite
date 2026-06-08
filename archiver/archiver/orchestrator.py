@@ -34,7 +34,7 @@ from pathlib import Path
 
 from .config import Config
 from .lock_reader import tiktok_lock_held
-from .platforms import Platform, AuthError, HealthStatus
+from .platforms import Platform, AuthError, AccountGoneError, HealthStatus
 from .reconcile import (
     MEDIA_EXTENSIONS, reconcile_platform_root, reconcile_recordings,
     reconcile_user,
@@ -143,6 +143,8 @@ class Archiver:
         self.deletion_guard  = DeletionGuard(config.policy_store)
         # Per-platform tripped flag for THIS run. Resets each new Archiver.
         self._tripped: set[str] = set()
+        # Accounts retired (banned/deleted) DURING this run, reported at the end.
+        self._banned_this_run: list[dict] = []
 
     async def run(self,
                   platform_filter: str | None = None,
@@ -197,7 +199,46 @@ class Archiver:
                 if not self._fetches(platform):
                     await self._reconcile_one_platform(platform, user_filter)
         self._maybe_ingest_orphaned(known_platform_names)
+        self._report_banned()
         return results
+
+    def _ban_account(self, platform: str, username: str, reason: str) -> None:
+        """Persist a banned/deleted account: drop it from the active user list
+        and record it under config.toml's banned roster, then stage it for the
+        end-of-run report. Idempotent — re-detecting an already-banned account
+        just refreshes the report line."""
+        detected_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        newly = self.config.policy_store.ban_user(
+            platform, username, reason=reason, detected_at=detected_at,
+        )
+        self._banned_this_run.append({
+            "platform": platform, "username": username,
+            "reason": reason, "newly": newly,
+        })
+        if newly:
+            log.warning("[%s/%s] account appears banned/deleted — removed from "
+                        "active users and added to the banned list: %s",
+                        platform, username, reason)
+        else:
+            log.warning("[%s/%s] account banned/deleted (already on banned "
+                        "list): %s", platform, username, reason)
+
+    def _report_banned(self) -> None:
+        """End-of-run summary of accounts retired this run. Logged at WARNING so
+        it stands out in the run output and the loop log."""
+        if not self._banned_this_run:
+            return
+        log.warning("")
+        log.warning("──────────── Banned / deleted accounts this run ──────────")
+        for b in self._banned_this_run:
+            flag = "NEW" if b["newly"] else "already-listed"
+            log.warning("  ✗ [%s] @%s (%s) — %s",
+                        b["platform"], b["username"], flag, b["reason"])
+        log.warning("Removed from the active user list; their queued uploads "
+                    "still deliver. Inspect with `archiver banned list`; "
+                    "restore with `archiver banned unban --platform <p> "
+                    "--user <u> --re-add`.")
+        log.warning("──────────────────────────────────────────────────────────")
 
     def _fetches(self, platform: Platform) -> bool:
         """Does this platform download new media this run? False for a
@@ -430,6 +471,13 @@ class Archiver:
         try:
             count = await asyncio.to_thread(platform.download, username, self.db)
             return {"count": count}
+        except AccountGoneError as e:
+            # The account is gone (banned/suspended/deleted) — not our auth.
+            # Retire it: move to the banned list, drop from active users, and
+            # record it for the end-of-run report. Already-queued rows for this
+            # user are untouched; the dispatcher still delivers them.
+            self._ban_account(platform.name, username, str(e))
+            return {"_error": {"status": "banned", "reason": str(e)}}
         except AuthError as e:
             handled = await self._handle_auth_failure(platform, str(e))
             if handled:
@@ -501,6 +549,10 @@ class Archiver:
         self.db.set_last_run(platform.name, username, run_time)
         new_floor = self.db.max_sent_upload_date(platform.name, username)
         self.db.set_date_floor(platform.name, username, new_floor)
+        # The download above ran without an early-return error, so the full
+        # timeline was walked for a new/re-armed user — close the gate so the
+        # next run goes back to fast incremental (date-min) fetching.
+        self.db.mark_full_history_done(platform.name, username)
         self.db.reset_circuit(platform.name)
         log.info("  ✓ Checkpoint → last_run=%s floor=%s",
                  run_time.strftime("%Y-%m-%d %H:%M UTC"), new_floor or "-")

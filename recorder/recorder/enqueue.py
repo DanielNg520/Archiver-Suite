@@ -22,6 +22,7 @@ import os
 from pathlib import Path
 
 from core import ItemStore
+from core.hashing import full_hash
 
 log = logging.getLogger(__name__)
 
@@ -73,16 +74,31 @@ class EnqueueClient:
     ) -> bool:
         """Insert one job. Returns True if inserted, False if it already
         existed (idempotent on file_path / synthesized identifier)."""
+        # Stamp content_hash so a finished recording is a first-class citizen of
+        # the global-dedup guarantee — exactly like the archiver's download and
+        # reconcile paths, and core.ingest (startup-sweep). The recorder is the
+        # only producer that enqueued NULL-hash rows; that left live recordings
+        # invisible to the dispatcher's sent_twin suppression and the
+        # re-introduction guard. The stream has ended and yt-dlp has exited, so
+        # the file is complete; this is a one-time whole-file read per recording.
+        # A read failure must NOT drop the recording — fall back to NULL (the
+        # prior behavior), and `archiver backfill` can fill it in later.
+        digest = full_hash(Path(file_path))
+        if digest is None:
+            log.warning("enqueue: could not hash %s — enqueuing without "
+                        "content_hash (dedup guarantee won't cover it until "
+                        "backfilled)", Path(file_path).name)
         store = ItemStore.open(self._db_path)
         try:
             inserted = store.add_item(
-                source     = "recorder",
-                platform   = platform,
-                username   = username,
-                identifier = _recorder_identifier(file_path),
-                file_path  = file_path,
-                caption    = caption,
-                priority   = priority,
+                source       = "recorder",
+                platform     = platform,
+                username     = username,
+                identifier   = _recorder_identifier(file_path),
+                file_path    = file_path,
+                caption      = caption,
+                priority     = priority,
+                content_hash = digest,
             )
             log.info("enqueue: %s @%s %s → %s",
                      platform, username, Path(file_path).name,

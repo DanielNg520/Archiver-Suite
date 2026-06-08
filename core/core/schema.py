@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 # (not executescript) so the whole upgrade is ONE transaction that rolls back
 # cleanly on failure — including the user_version bump, which lives in the DB
 # header and participates in the transaction.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class SchemaVersionError(RuntimeError):
@@ -158,6 +158,16 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
         # indexed for large archives while preserving NULL-friendly storage.
         "CREATE INDEX IF NOT EXISTS idx_items_hash "
         "    ON items (content_hash) WHERE content_hash IS NOT NULL",
+    ]),
+    (3, [
+        # Per-user "has the full back-catalogue been walked yet?" flag. A newly
+        # added user must be fetched with NO date-min so gallery-dl/yt-dlp walk
+        # the entire timeline; once that one full pass completes we set this and
+        # subsequent runs go back to incremental (date-min) fetching. Existing
+        # users are assumed already backfilled, so flag them done — only genuinely
+        # new users (no checkpoint row yet) default to "needs full history".
+        "ALTER TABLE checkpoints ADD COLUMN full_history_done INTEGER NOT NULL DEFAULT 0",
+        "UPDATE checkpoints SET full_history_done = 1",
     ]),
 ]
 

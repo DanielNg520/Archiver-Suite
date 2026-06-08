@@ -932,6 +932,42 @@ class ItemStore:
         )
         self._commit()
 
+    # ── Full-history gate ────────────────────────────────────────────────
+    #
+    # A newly added user has no checkpoint row → needs_full_history is True,
+    # so _compute_date_min returns None and the extractor walks the WHOLE
+    # timeline. After the first successful download the orchestrator calls
+    # mark_full_history_done, flipping the user to incremental forever after.
+    # rearm_full_history re-opens the gate on demand (`run --full-history`)
+    # without deleting any rows or files — the gallery-dl/yt-dlp archive still
+    # skips everything already fetched, so only missing old posts come down.
+
+    def needs_full_history(self, platform: str, username: str) -> bool:
+        r = self.get_checkpoint(platform, username)
+        if r is None:
+            return True                       # brand-new user, never run
+        return not r["full_history_done"]
+
+    def mark_full_history_done(self, platform: str, username: str) -> None:
+        self.conn.execute(
+            """INSERT INTO checkpoints (platform, username, full_history_done)
+               VALUES (?,?,1)
+               ON CONFLICT(platform, username)
+               DO UPDATE SET full_history_done=1""",
+            (platform, username),
+        )
+        self._commit()
+
+    def rearm_full_history(self, platform: str, username: str) -> None:
+        self.conn.execute(
+            """INSERT INTO checkpoints (platform, username, full_history_done)
+               VALUES (?,?,0)
+               ON CONFLICT(platform, username)
+               DO UPDATE SET full_history_done=0""",
+            (platform, username),
+        )
+        self._commit()
+
     # ── Circuit breaker ──────────────────────────────────────────────────
 
     def bump_circuit_fail(self, platform: str, error: str) -> int:

@@ -63,6 +63,26 @@ _FILENAME_RE = re.compile(
     r"^(?P<date>\d{8})_(?P<ident>.+?)(?:_(?P<num>\d+))?$"
 )
 
+# Instagram (instaloader / gallery-dl default) filename:
+#   <username>_<taken_at_unixts>_<media_pk>_<owner_id>.<ext>
+# e.g. fit_miness_1736258696_3540317000569885880_50348444507.jpg
+# The username may contain underscores; what's reliable is the rigid numeric
+# TAIL — a 9-11-digit unix timestamp, then the post's media PK (17-20 digits),
+# then the owner id. These files carry NO sidecar and don't start with our
+# YYYYMMDD prefix, so without this they all fall to `manual_<pathhash>`: a
+# DIFFERENT identifier per path. That defeats UNIQUE(platform, identifier), so
+# the SAME post re-downloaded under a renamed handle (different user folder) or
+# re-encoded by IG (different bytes) slips past every dedup layer and uploads
+# again. Extracting the media PK as the identifier collapses those onto one row.
+# Tried only AFTER _FILENAME_RE fails, so our own downloads are unaffected.
+_IG_PK_RE = re.compile(
+    r"^.+?_(?P<takenat>\d{9,11})_(?P<pk>\d{16,21})_(?P<owner>\d{3,})$"
+)
+
+# Video containers — a video post is a single asset, used to collapse the
+# `<id>` vs `<id>_0` split two TikTok extractors produce for the same clip.
+_VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".ts", ".m4v"}
+
 
 @dataclass(frozen=True)
 class MediaIdentity:
@@ -201,6 +221,23 @@ def _parse_filename(stem: str) -> tuple[str | None, str | None]:
     return (date, ident)
 
 
+def _parse_ig_pk(stem: str) -> tuple[str | None, str | None]:
+    """Parse the instaloader/gallery-dl IG `<user>_<taken_at>_<pk>_<owner>`
+    layout → (date, media_pk). (None, None) if it doesn't match. The media PK
+    is the stable per-asset post identifier (each carousel image has its own),
+    so it's a correct one-row-per-asset key. taken_at gives the upload date."""
+    m = _IG_PK_RE.match(stem)
+    if not m:
+        return (None, None)
+    pk = m.group("pk")
+    try:
+        date = datetime.fromtimestamp(
+            int(m.group("takenat")), tz=timezone.utc).strftime("%Y%m%d")
+    except (ValueError, OSError, OverflowError):
+        date = None
+    return (date, pk)
+
+
 # ── Path-hash fallback ────────────────────────────────────────────────────────
 
 def _path_hash(path: Path) -> str:
@@ -241,8 +278,12 @@ def resolve(media_file: Path) -> MediaIdentity:
     title        = _extract_title_from_sidecar(sidecar) if sidecar else ""
 
     fn_date, fn_id = _parse_filename(media_file.stem)
+    # IG media-PK tail is tried only when our own YYYYMMDD pattern didn't match.
+    ig_date = ig_pk = None
+    if not fn_id:
+        ig_date, ig_pk = _parse_ig_pk(media_file.stem)
 
-    # Identifier resolution: sidecar > filename > hash
+    # Identifier resolution: sidecar > our filename > IG media-pk > hash
     if sidecar_id:
         ident = sidecar_id
         is_manual = False
@@ -256,12 +297,28 @@ def resolve(media_file: Path) -> MediaIdentity:
     elif fn_id:
         ident = fn_id
         is_manual = False
+    elif ig_pk:
+        ident = ig_pk
+        is_manual = False
     else:
         ident = _path_hash(media_file)
         is_manual = True
 
-    # Date resolution: sidecar > filename > mtime
-    upload_date = sidecar_date or fn_date or _mtime_date(media_file)
+    # Single-video normalization: a video is one asset, but our two TikTok
+    # extractors name it differently — yt-dlp writes `<id>.mp4` (no index),
+    # gallery-dl writes `<id>_0.mp4` (0-based first asset). Left alone they
+    # resolve to `<id>` vs `<id>_0`, two identifiers for ONE video → two rows →
+    # the same clip uploads twice (often paired in one album). Stripping a
+    # trailing `_0` from VIDEO files collapses them onto `<id>`, so
+    # UNIQUE(platform, identifier) drops the second. Photo carousels start their
+    # index at _1 (and keep distinct assets), so a `_0`-only rule never merges
+    # two real images. Skipped for manual/hash ids (no extractor index there).
+    if (not is_manual and ident.endswith("_0")
+            and media_file.suffix.lower() in _VIDEO_EXTS):
+        ident = ident[:-2]
+
+    # Date resolution: sidecar > our filename > IG taken_at > mtime
+    upload_date = sidecar_date or fn_date or ig_date or _mtime_date(media_file)
 
     return MediaIdentity(
         identifier  = ident,
@@ -293,6 +350,14 @@ def archive_entry_for(platform: str, identity: MediaIdentity) -> str | None:
         # the _num suffix when applicable.
         return f"twitter{identity.identifier}"
     if platform == "instagram":
+        # gallery-dl's IG archive keys on the URL SHORTCODE (e.g. "C1a2b3").
+        # A purely-numeric identifier here is a media PK parsed from an
+        # instaloader-style filename (_parse_ig_pk), not a shortcode — seeding
+        # it would never match a real gallery-dl entry and just pollute the
+        # archive, so skip it. The DB's UNIQUE(platform, identifier) still
+        # dedups those files; the extractor archive simply isn't involved.
+        if identity.identifier.isdigit():
+            return None
         return f"instagram{identity.identifier}"
     if platform == "tiktok":
         # yt-dlp uses "<extractor> <id>" — strip any _num suffix our parser

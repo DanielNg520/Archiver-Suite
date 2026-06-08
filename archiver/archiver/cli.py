@@ -110,6 +110,12 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Limit to one platform")
     s_run.add_argument("--user", metavar="USERNAME",
                        help="Limit to one username (no @)")
+    s_run.add_argument("--full-history", action="store_true",
+                       help="Re-walk the entire timeline for the targeted "
+                            "user(s), fetching old posts skipped by the "
+                            "incremental date-min cutoff. Already-downloaded "
+                            "posts are skipped (no re-download/re-send). "
+                            "Requires --user or --platform.")
 
     # ── queue (shared noun, identical across all three binaries) ───
     core_cli.add_queue_parser(sub)
@@ -320,6 +326,23 @@ def build_parser() -> argparse.ArgumentParser:
     cfg_rem = cfg_sub.add_parser("remove", help="Remove a user from a platform")
     cfg_rem.add_argument("--platform", choices=PLATFORM_CHOICES, required=True)
     cfg_rem.add_argument("--user", metavar="USERNAME", required=True)
+
+    # ── banned (accounts auto-retired as gone) ───
+    s_banned = sub.add_parser(
+        "banned",
+        help="List or manage accounts auto-detected as banned/suspended/"
+             "deleted (removed from the active user list during runs).")
+    banned_sub = s_banned.add_subparsers(dest="banned_cmd", required=False,
+                                         metavar="ACTION",
+                                         help="omit to list; 'unban' to restore")
+    bl = banned_sub.add_parser("list", help="List banned accounts")
+    bl.add_argument("--platform", choices=PLATFORM_CHOICES)
+    bu = banned_sub.add_parser(
+        "unban", help="Remove an account from the banned list")
+    bu.add_argument("--platform", choices=PLATFORM_CHOICES, required=True)
+    bu.add_argument("--user", metavar="USERNAME", required=True)
+    bu.add_argument("--re-add", action="store_true",
+                    help="Also re-add the account to the active user list")
 
     # ── platform (run enablement) ───
     s_plat = sub.add_parser(
@@ -656,10 +679,30 @@ def cmd_backfill(args, config: Config, db: ItemStore) -> int:
 
 
 def cmd_run(args, config: Config, db: ItemStore) -> int:
+    user_filter = args.user.lstrip("@") if args.user else None
+
+    if getattr(args, "full_history", False):
+        if not user_filter and not args.platform:
+            log.error("--full-history requires --user or --platform "
+                      "(refusing to re-walk every user's full timeline).")
+            return 2
+        platforms = build_platforms(config)
+        if args.platform:
+            platforms = [p for p in platforms if p.name == args.platform]
+        rearmed = 0
+        for platform in platforms:
+            users = (user_filter,) if user_filter else platform.users
+            for u in users:
+                db.rearm_full_history(platform.name, u)
+                rearmed += 1
+        log.info("full-history: re-armed %d user(s) — this run walks their "
+                 "entire timeline (already-archived posts are skipped).",
+                 rearmed)
+
     arch = Archiver(config, db)
     results = asyncio.run(arch.run(
         platform_filter = args.platform,
-        user_filter     = args.user.lstrip("@") if args.user else None,
+        user_filter     = user_filter,
     ))
 
     log.info("")
@@ -677,11 +720,15 @@ def cmd_run(args, config: Config, db: ItemStore) -> int:
                 f"  ⚠ {key:32s} dl={r.get('downloaded',0):>3} "
                 f"pending={r.get('pending',0):>3} failed={r.get('failed',0)}"
             )
+        elif status == "banned":
+            line = f"  ⊘ {key:32s} banned/deleted — retired: {r.get('reason','')[:40]}"
         else:
             line = f"  ✗ {key:32s} {status}: {r.get('reason','')[:40]}"
         log.info(line)
     log.info("═════════════════════════════════════════════════")
-    return 0 if all(r.get("status") in ("ok",) for r in results.values()) else 1
+    # "banned" is a handled terminal outcome, not a failure — a retired account
+    # shouldn't count against a loop's consecutive-failure budget.
+    return 0 if all(r.get("status") in ("ok", "banned") for r in results.values()) else 1
 
 
 def cmd_bootstrap(args, config: Config, db: ItemStore) -> int:
@@ -1218,9 +1265,16 @@ def cmd_config(args, config: Config, db: ItemStore) -> int:
     username = args.user.lstrip("@")
 
     if args.config_cmd == "add":
+        # Adding a user explicitly overrides a prior auto-ban (the operator is
+        # asserting the account is back); clear it so the two lists stay
+        # mutually exclusive.
+        was_banned = store.unban_user(args.platform, username)
         added = store.add_user(args.platform, username)
         if added:
             log.info("Added @%s to [%s].", username, args.platform)
+            if was_banned:
+                log.info("(also removed @%s from the [%s] banned list)",
+                         username, args.platform)
             log.info("Note: a running `archiver loop` won't see this change until it restarts.")
         else:
             log.error("@%s already in [%s] list.", username, args.platform)
@@ -1234,6 +1288,59 @@ def cmd_config(args, config: Config, db: ItemStore) -> int:
             log.error("@%s not found in [%s] list.", username, args.platform)
             return 1
 
+    return 0
+
+
+# ── banned (auto-retired accounts) ───────────────────────────────────────────
+
+def cmd_banned(args, config: Config, db: ItemStore) -> int:
+    """List banned/deleted accounts or restore one. Bans are written
+    automatically during a run when an extractor reports the account is gone;
+    this command is the manual inspect/restore side."""
+    store  = config.policy_store
+    action = getattr(args, "banned_cmd", None)
+
+    if action == "unban":
+        username = args.user.lstrip("@")
+        if not store.unban_user(args.platform, username):
+            log.error("@%s is not on the [%s] banned list.",
+                      username, args.platform)
+            return 1
+        log.info("Removed @%s from the [%s] banned list.", username, args.platform)
+        if args.re_add:
+            if store.add_user(args.platform, username):
+                log.info("Re-added @%s to [%s] active users — it will be fetched "
+                         "again next run.", username, args.platform)
+            else:
+                log.info("@%s was already in the [%s] active user list.",
+                         username, args.platform)
+        else:
+            log.info("Not re-added to active users. To resume archiving, run "
+                     "`archiver config add --platform %s --user %s` "
+                     "(or re-run unban with --re-add).",
+                     args.platform, username)
+        log.info("Note: a running `archiver loop` won't see this change until "
+                 "it restarts.")
+        return 0
+
+    # Default / "list": show the banned roster.
+    platforms = [args.platform] if getattr(args, "platform", None) else PLATFORM_CHOICES
+    total = 0
+    for plat in platforms:
+        details = store.banned_details(plat)
+        if not details:
+            log.info("[%s] banned: (none)", plat)
+            continue
+        log.info("[%s] banned:", plat)
+        for u, meta in sorted(details.items()):
+            reason = meta.get("reason", "(no reason recorded)")
+            when   = meta.get("detected_at", "?")
+            log.info("  ✗ @%s — %s (detected %s)", u, reason, when)
+            total += 1
+    if total:
+        log.info("")
+        log.info("Restore one with `archiver banned unban --platform <p> "
+                 "--user <u> --re-add`.")
     return 0
 
 
@@ -1656,6 +1763,7 @@ def main() -> int:
         "config", "platform", "run-settings", "migrate", "policy",
         "dedup-policy", "safebrake", "purge-sent", "stats", "ingest", "queue",
         "backfill", "auto-ingest", "local", "download", "sort", "auto-sort",
+        "banned",
     }
     if args.cmd == "reset" and args.reset_cmd in {"failed", "user"}:
         config_only = True
@@ -1700,6 +1808,7 @@ def main() -> int:
             "cookies":      cmd_cookies,
             "loop":         cmd_loop,
             "config":       cmd_config,
+            "banned":       cmd_banned,
             "platform":     cmd_platform,
             "run-settings": cmd_run_settings,
             "policy":       cmd_policy,

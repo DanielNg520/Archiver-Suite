@@ -66,6 +66,81 @@ class AuthError(RuntimeError):
     """Raised by Platform.download when credentials are bad/expired."""
 
 
+class AccountGoneError(RuntimeError):
+    """Raised by Platform.download when the account itself is gone — banned,
+    suspended, or deleted — as opposed to AuthError (our credentials expired).
+    The orchestrator reacts by moving the user to the banned list and dropping
+    it from the active user list, so we stop wasting fetches on it every run.
+
+    Distinct from AuthError on purpose: an auth failure is recoverable (refresh
+    cookies) and trips the circuit breaker; a gone account never comes back and
+    should be retired, not retried."""
+
+
+# Lowercased substrings that, in an extractor's error output, unambiguously mean
+# the ACCOUNT is gone (not merely a single missing item, a format error, or a
+# transient hiccup). Kept conservative on purpose — banning removes a user from
+# the active list, so a false positive is worse than a false negative (a missed
+# ban just wastes one more run's fetch; a wrong ban silently stops archiving a
+# live account). Per-item 404s are NOT in here; gallery-dl signals a gone
+# profile via NotFoundError, which we catch by type instead.
+_ACCOUNT_GONE_SIGNALS = (
+    "account is suspended",
+    "account suspended",
+    "has been suspended",
+    "user not found",
+    "account does not exist",
+    "user does not exist",
+    "no longer exists",
+    "could not find user",
+    "unable to find user",
+    "no longer available",
+    "account is unavailable",
+    "account has been banned",
+    "user has been banned",
+    "account was banned",
+)
+
+
+def _match_account_gone(text: str) -> str:
+    """Return the first matching gone-signal substring (the human-readable
+    reason), or '' if none match. `text` should already be lowercased."""
+    for sig in _ACCOUNT_GONE_SIGNALS:
+        if sig in text:
+            return sig
+    return ""
+
+
+class _ExtractorErrorDetector(logging.Handler):
+    """Sniffs an extractor's log stream for the two terminal conditions we act
+    on: expired auth (→ AuthError) and a gone account (→ AccountGoneError).
+
+    gallery-dl / yt-dlp report these through their own loggers rather than by
+    raising, so a logging.Handler is the only reliable interception point.
+    `auth_signals` differ per platform (IG has checkpoint/challenge wording);
+    the gone signals are shared via _match_account_gone."""
+
+    def __init__(self, auth_signals: tuple[str, ...]):
+        super().__init__()
+        self.auth_signals = auth_signals
+        self.auth_failed  = False
+        self.account_gone = False
+        self.gone_reason  = ""
+
+    def note(self, msg: str) -> None:
+        """Classify a single message. Public so exception handlers can feed in
+        the str(exc) text on the same footing as logged lines."""
+        if any(s in msg for s in self.auth_signals):
+            self.auth_failed = True
+        reason = _match_account_gone(msg.lower())
+        if reason and not self.account_gone:
+            self.account_gone = True
+            self.gone_reason  = msg.strip()[:200] or reason
+
+    def emit(self, record):
+        self.note(record.getMessage())
+
+
 # ── Platform ABC ──────────────────────────────────────────────────────────────
 
 class Platform(abc.ABC):
@@ -367,17 +442,8 @@ class XPlatform(Platform):
         for key, value in extractor_cfg.items():
             gallery_dl.config.set(("extractor", "twitter"), key, value)
 
-        auth_failed = False
-
-        class _AuthDetector(logging.Handler):
-            def emit(_self, record):
-                nonlocal auth_failed
-                msg = record.getMessage()
-                if any(s in msg for s in
-                       ("AuthRequired", "AuthenticationError", "401", "403")):
-                    auth_failed = True
-
-        detector   = _AuthDetector()
+        detector   = _ExtractorErrorDetector(
+            auth_signals=("AuthRequired", "AuthenticationError", "401", "403"))
         gdl_logger = logging.getLogger("gallery_dl")
         gdl_logger.addHandler(detector)
 
@@ -388,20 +454,28 @@ class XPlatform(Platform):
             job = gallery_dl.job.DownloadJob(url)
             job.run()
         except gallery_dl.exception.AuthenticationError as e:
-            auth_failed = True
+            detector.auth_failed = True
             log.error("  gallery-dl auth error: %s", e)
         except Exception as e:
-            msg = str(e)
-            if any(s in msg for s in ("AuthRequired", "AuthenticationError")):
-                auth_failed = True
+            # gallery-dl raises NotFoundError for a gone profile; classify it
+            # (and any auth/gone wording) the same way logged lines are.
+            if type(e).__name__ == "NotFoundError":
+                detector.account_gone = True
+                detector.gone_reason = str(e).strip()[:200] or "profile not found"
+            else:
+                detector.note(str(e))
             log.error("  gallery-dl error for @%s: %s", username, e)
         finally:
             gdl_logger.removeHandler(detector)
 
-        if auth_failed:
+        # Auth failure takes precedence: it's recoverable, so never retire an
+        # account when the real problem is our own expired cookies.
+        if detector.auth_failed:
             raise AuthError(
                 "X cookies appear expired or invalid (gallery-dl reported auth error)."
             )
+        if detector.account_gone:
+            raise AccountGoneError(detector.gone_reason or "account not found")
 
         return _register_new_files(self.name, username, user_dir, before, db)
 
@@ -502,7 +576,8 @@ class TikTokPlatform(Platform):
         profile_url = f"https://www.tiktok.com/@{username}"
         log.info("  yt-dlp → @%s", username)
 
-        auth_failed = False
+        auth_failed   = False
+        account_gone  = ""
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ret = ydl.download([profile_url])
@@ -514,14 +589,24 @@ class TikTokPlatform(Platform):
                    ("login", "unauthorized", "403", "401",
                     "private account", "verify", "captcha")):
                 auth_failed = True
+            else:
+                # Only consider "gone" when it's NOT an auth/private problem —
+                # a private account still exists and may come back.
+                account_gone = _match_account_gone(msg) and str(e).strip()[:200]
             log.error("  yt-dlp DownloadError: %s", e)
         except Exception as e:
             log.error("  yt-dlp unexpected error: %s", e, exc_info=True)
 
-        self._download_photo_posts(username, user_dir)
+        gone_from_photos = self._download_photo_posts(username, user_dir)
 
         if auth_failed:
             raise AuthError("TikTok auth appears expired (yt-dlp reported login failure).")
+        # Require BOTH extractors to agree the account is gone before retiring
+        # it — a TikTok profile that yields nothing from yt-dlp but is found by
+        # the gallery-dl pass (or vice-versa) is alive, just photo-only/video-
+        # only. Agreement makes a false ban very unlikely.
+        if account_gone and gone_from_photos:
+            raise AccountGoneError(account_gone or gone_from_photos)
 
         return _register_new_files(self.name, username, user_dir, before, db)
 
@@ -568,12 +653,32 @@ class TikTokPlatform(Platform):
             opts["daterange"] = DateRange(start=date_after, end=None)
         return opts
 
-    def _download_photo_posts(self, username: str, user_dir: Path) -> None:
+    # Container extensions gallery-dl must NOT fetch here: those are VIDEOS,
+    # which yt-dlp already downloaded in the same cycle. Letting gallery-dl grab
+    # them too is the TikTok double-upload bug at its source — the same clip
+    # lands twice (`<id>.mp4` from yt-dlp, `<id>_0.mp4` from gallery-dl), wasting
+    # bandwidth and leaving an orphan copy on disk. gallery-dl's job in this pass
+    # is photo carousels ONLY.
+    _GDL_SKIP_EXTS = ("mp4", "m4a", "mov", "webm", "mkv", "m4v", "aac", "mp3")
+
+    def _download_photo_posts(self, username: str, user_dir: Path) -> str:
+        """Fetch TikTok photo carousels via gallery-dl. Returns a gone-reason
+        string if gallery-dl's stderr reports the account is suspended/deleted,
+        else '' (including when gallery-dl is unavailable — absence of evidence
+        is not evidence the account is gone)."""
+        # Drop video files BEFORE download via a per-file metadata filter on the
+        # extension. This is extractor-agnostic (every gallery-dl file carries
+        # `extension`) and, unlike `extractor.tiktok.videos=false`, does NOT
+        # substitute a junk cover image for a skipped video — the video file is
+        # simply not written. Photo posts (jpg/png/webp/heic) pass untouched, so
+        # yt-dlp owns videos and gallery-dl owns photos, with no overlap.
+        skip = ",".join(repr(e) for e in self._GDL_SKIP_EXTS)
         cmd = [
             "gallery-dl",
             "--cookies",     self.tt_cfg.cookies_file,
             "--directory",   str(user_dir),
             "--filename",    "{date:%Y%m%d}_{id}_{num}.{extension}",
+            "--filter",      f"extension not in ({skip})",
             # v1 oversight fix: photo carousels now have their OWN archive,
             # preventing re-fetches even when files exist on disk.
             "--download-archive", str(self._photo_archive_path(username)),
@@ -589,12 +694,16 @@ class TikTokPlatform(Platform):
             if result.returncode not in (0, 1):
                 log.warning("  gallery-dl exit %d: %s",
                             result.returncode, result.stderr[:300])
+            reason = _match_account_gone((result.stderr or "").lower())
+            if reason:
+                return result.stderr.strip()[:200] or reason
         except FileNotFoundError:
             log.debug("  gallery-dl not in PATH; skipping photo posts.")
         except subprocess.TimeoutExpired:
             log.warning("  gallery-dl timed out (>10 min)")
         except Exception as e:
             log.error("  gallery-dl error: %s", e)
+        return ""
 
 
 class _YtdlpLogger:
@@ -713,21 +822,12 @@ class InstagramPlatform(Platform):
         for key, value in extractor_cfg.items():
             gallery_dl.config.set(("extractor", "instagram"), key, value)
 
-        auth_failed = False
-
-        class _AuthDetector(logging.Handler):
-            def emit(_self, record):
-                nonlocal auth_failed
-                msg = record.getMessage()
-                if any(s in msg for s in (
-                    "AuthRequired", "AuthenticationError",
-                    "login_required", "challenge_required",
-                    "checkpoint_required",
-                    "401", "403",
-                )):
-                    auth_failed = True
-
-        detector   = _AuthDetector()
+        detector   = _ExtractorErrorDetector(auth_signals=(
+            "AuthRequired", "AuthenticationError",
+            "login_required", "challenge_required",
+            "checkpoint_required",
+            "401", "403",
+        ))
         gdl_logger = logging.getLogger("gallery_dl")
         gdl_logger.addHandler(detector)
 
@@ -738,25 +838,27 @@ class InstagramPlatform(Platform):
             job = gallery_dl.job.DownloadJob(url)
             job.run()
         except gallery_dl.exception.AuthenticationError as e:
-            auth_failed = True
+            detector.auth_failed = True
             log.error("  gallery-dl auth error: %s", e)
         except Exception as e:
-            msg = str(e)
-            if any(s in msg for s in (
-                "AuthRequired", "AuthenticationError",
-                "login_required", "challenge_required",
-            )):
-                auth_failed = True
+            if type(e).__name__ == "NotFoundError":
+                detector.account_gone = True
+                detector.gone_reason = str(e).strip()[:200] or "profile not found"
+            else:
+                detector.note(str(e))
             log.error("  gallery-dl error for @%s: %s", username, e)
         finally:
             gdl_logger.removeHandler(detector)
 
-        if auth_failed:
+        # Auth/challenge is recoverable → never retire on it.
+        if detector.auth_failed:
             raise AuthError(
                 "Instagram cookies appear expired or the account is challenged "
                 "(checkpoint/2FA). Open Firefox → instagram.com, clear any "
                 "pending verification, then re-run."
             )
+        if detector.account_gone:
+            raise AccountGoneError(detector.gone_reason or "account not found")
 
         return _register_new_files(self.name, username, user_dir, before, db)
 
@@ -776,8 +878,15 @@ def _compute_date_min(db: "ItemStore", platform: str, username: str,
       3. Apply slack_days as a safety subtraction (covers timezone slop
          and posts edited late in a day).
 
-    Returns None on first-ever run (no DB knowledge of this user).
+    Returns None on first-ever run (no DB knowledge of this user) AND whenever
+    the user is flagged as needing a full-history walk — a freshly added user,
+    or one re-armed via `run --full-history`. In both cases a None cutoff makes
+    the extractor traverse the entire timeline; its own archive (sqlite) still
+    skips every post already downloaded, so only missing old content arrives.
     """
+    if db.needs_full_history(platform, username):
+        return None
+
     floor_str = db.max_sent_upload_date(platform, username)
     if floor_str:
         try:

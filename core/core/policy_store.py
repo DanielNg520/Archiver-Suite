@@ -54,6 +54,10 @@ class PolicyStore:
       .list_users(platform)
       .add_user(platform, username)
       .remove_user(platform, username)
+      .list_banned(platform)
+      .banned_details(platform)
+      .ban_user(platform, username, *, reason, detected_at)
+      .unban_user(platform, username)
       .iter_user_overrides()
     """
 
@@ -256,6 +260,89 @@ class PolicyStore:
             user_dict = section.get("user", {})
             if username in user_dict:
                 del user_dict[username]
+            self._persist()
+            return True
+
+    # ── Banned-account roster ─────────────────────────────────────────────
+    #
+    # Accounts auto-detected as gone (banned/suspended/deleted) during a run.
+    # Stored under `[platform.<name>.banned]` as a table keyed by username →
+    # {reason, detected_at}, parallel to the `users` array. Separating the two
+    # keeps banned accounts out of the active fetch loop while preserving why
+    # and when each was retired, without losing the username.
+
+    def list_banned(self, platform: str) -> tuple[str, ...]:
+        with self._lock:
+            banned = (self._data.get("platform", {})
+                                .get(platform, {})
+                                .get("banned", {}))
+            return tuple(banned.keys()) if isinstance(banned, dict) else ()
+
+    def banned_details(self, platform: str) -> dict[str, dict[str, Any]]:
+        """username → {reason, detected_at} for every banned account on a
+        platform. Returns a copy; mutating it does not touch the store."""
+        with self._lock:
+            banned = (self._data.get("platform", {})
+                                .get(platform, {})
+                                .get("banned", {}))
+            if not isinstance(banned, dict):
+                return {}
+            return {
+                u: (dict(meta) if isinstance(meta, dict) else {})
+                for u, meta in banned.items()
+            }
+
+    def ban_user(
+        self,
+        platform: str,
+        username: str,
+        *,
+        reason:      str = "",
+        detected_at: str = "",
+    ) -> bool:
+        """Retire an account: remove it from the active `users` list (and drop
+        any per-user overrides), then record it under `banned` with the reason
+        and timestamp. Returns True iff it was NOT already banned (i.e. this is
+        a newly-detected ban) — lets callers distinguish first detection from a
+        repeat. Idempotent: re-banning refreshes reason/detected_at."""
+        with self._lock:
+            section = self._resolve_section(platform, None, create=True)
+
+            users = list(section.get("users", []))
+            if username in users:
+                users.remove(username)
+                section["users"] = users
+
+            user_dict = section.get("user", {})
+            if username in user_dict:
+                del user_dict[username]
+
+            banned = section.setdefault("banned", {})
+            newly = username not in banned
+            entry: dict[str, Any] = {}
+            if reason:
+                entry["reason"] = reason
+            if detected_at:
+                entry["detected_at"] = detected_at
+            banned[username] = entry
+
+            self._persist()
+            return newly
+
+    def unban_user(self, platform: str, username: str) -> bool:
+        """Remove an account from the banned roster. Does NOT re-add it to the
+        active `users` list — restoring an account is a deliberate two-step
+        (unban, then add). Returns True iff a banned entry was removed."""
+        with self._lock:
+            section = self._resolve_section(platform, None, create=False)
+            if section is None:
+                return False
+            banned = section.get("banned", {})
+            if not isinstance(banned, dict) or username not in banned:
+                return False
+            del banned[username]
+            if not banned:
+                del section["banned"]
             self._persist()
             return True
 

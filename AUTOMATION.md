@@ -231,7 +231,16 @@ sleep 5 && ops health
 5. **Dispatcher** claims queued rows (priority 10 before 20), sends each to
    the Telegram chat resolved for that platform/user, marks `sent`, and (if
    the delete policy is on) removes the local file + sidecars.
-6. **You** run `ops health` whenever you want to check, and consult
+6. **Auto-ban of gone accounts** — when an archiver cycle's extractor reports
+   that an account itself is gone (suspended/banned/deleted, distinct from our
+   cookies expiring), the archiver moves that user off the active list into a
+   per-platform banned roster (`config.toml`) and prints a "Banned / deleted
+   accounts this run" block at the end of the run. Already-queued uploads for
+   that user still deliver. Inspect with `archiver banned list`; restore with
+   `archiver banned unban --platform <p> --user <u> --re-add`. Detection is
+   deliberately conservative (auth failures and per-item 404s never ban), so a
+   live account is never retired by mistake.
+7. **You** run `ops health` whenever you want to check, and consult
    `RUNBOOK.md` if something breaks.
 
 ---
@@ -259,6 +268,10 @@ archiver download set --platform instagram --enabled false
 
 # Auto-ingest chat_id folders each cycle (default off)
 archiver auto-ingest set --enabled true
+
+# Banned/deleted accounts (auto-retired during runs)
+archiver banned list
+archiver banned unban --platform x --user someone --re-add
 
 # Upload batching (dispatcher; restart it to apply)
 dispatcher config set min_batch_size 10
