@@ -5,9 +5,12 @@ ops.cli
   ops uninstall        unload + remove the three plists
   ops health           one-shot system health report
   ops watch            health report refreshed every few seconds
-  ops load             launchctl load all three plists
-  ops unload           launchctl unload all three plists
+  ops load [name]      launchctl load managed plists (all, or just one)
+  ops unload [name]    launchctl unload managed plists (all, or just one —
+                       stop a single worker while you edit its config,
+                       then `ops load <name>` to bring it back)
   ops restart <name>   kickstart one service (dispatcher|recorder|archiver)
+  ops logrotate        copytruncate-rotate oversized worker logs (gzip history)
 
 load/unload/restart are thin wrappers over launchctl so you don't have to
 remember the plist paths. They operate on whatever plists are present in
@@ -27,9 +30,15 @@ import time
 from pathlib import Path
 
 from .health import LABELS, render
+from .logrotate import DEFAULT_KEEP, DEFAULT_MAX_BYTES, rotate_logs
 
 LAUNCH_AGENTS = Path("~/Library/LaunchAgents").expanduser()
 LOG_DIR = Path("~/.local/log").expanduser()
+
+# Calendar job (not a daemon): rotates the workers' launchd-captured logs
+# daily so history survives reboots/truncation. Installed/removed alongside
+# the three service plists but never health-checked — it has no liveness.
+LOGROTATE_LABEL = "com.duy.logrotate"
 
 # service name → (CLI command on PATH, subcommand args). Mirrors what each
 # launchd job should run: the dispatcher/recorder drain/listen continuously,
@@ -119,9 +128,56 @@ def _plist_xml(label: str, program: str, sub_args: list[str]) -> str:
 """
 
 
+def _logrotate_plist_xml(ops_bin: str) -> str:
+    """Daily-04:05 calendar job running `ops logrotate`. launchd runs missed
+    intervals on wake, so a sleeping laptop still rotates once a day."""
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
+"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LOGROTATE_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{ops_bin}</string>
+        <string>logrotate</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>5</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{LOG_DIR / 'logrotate.out.log'}</string>
+    <key>StandardErrorPath</key>
+    <string>{LOG_DIR / 'logrotate.err.log'}</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
+"""
+
+
+def cmd_logrotate(args: argparse.Namespace) -> int:
+    actions = rotate_logs(
+        LOG_DIR,
+        max_bytes=int(args.max_mb * 1024 * 1024),
+        keep=args.keep,
+    )
+    for a in actions:
+        print(a)
+    if not actions:
+        print("logrotate: nothing over threshold")
+    return 1 if any(a.startswith("ERROR") for a in actions) else 0
+
+
 def cmd_install(_args: argparse.Namespace) -> int:
-    """Write the three launchd plists into ~/Library/LaunchAgents, generated
-    for this machine. Idempotent — re-running overwrites with fresh paths.
+    """Write the launchd plists into ~/Library/LaunchAgents, generated
+    for this machine: the three services + the daily logrotate calendar job.
+    Idempotent — re-running overwrites with fresh paths.
     Run `ops load` afterward to start them (and at every login)."""
     LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -137,15 +193,38 @@ def cmd_install(_args: argparse.Namespace) -> int:
         path = _plist_path(label)
         path.write_text(_plist_xml(label, program, sub_args))
         print(f"{name}: wrote {path}  →  {program} {' '.join(sub_args)}")
+    ops_bin = _resolve_bin("ops")
+    if ops_bin is None:
+        print("logrotate: 'ops' not found on PATH — plist skipped")
+        rc = 1
+    else:
+        path = _plist_path(LOGROTATE_LABEL)
+        path.write_text(_logrotate_plist_xml(ops_bin))
+        print(f"logrotate: wrote {path}  →  {ops_bin} logrotate (daily 04:05)")
     if rc == 0:
         print("installed. Now run:  ops load")
     return rc
 
 
+def _all_jobs() -> list[tuple[str, str]]:
+    """(display name, launchd label) for every plist ops manages: the three
+    services plus the logrotate calendar job."""
+    return [*LABELS.items(), ("logrotate", LOGROTATE_LABEL)]
+
+
+def _selected_jobs(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """Jobs a load/unload acts on: the single named one, or all of them.
+    The name is validated by argparse choices, so no not-found case here."""
+    name = getattr(args, "service", None)
+    if name:
+        return [(n, l) for n, l in _all_jobs() if n == name]
+    return _all_jobs()
+
+
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    """Unload (if loaded) and remove the three plists."""
+    """Unload (if loaded) and remove every ops-managed plist."""
     cmd_unload(args)
-    for name, label in LABELS.items():
+    for name, label in _all_jobs():
         path = _plist_path(label)
         if path.exists():
             path.unlink()
@@ -153,9 +232,9 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_load(_args: argparse.Namespace) -> int:
+def cmd_load(args: argparse.Namespace) -> int:
     rc = 0
-    for name, label in LABELS.items():
+    for name, label in _selected_jobs(args):
         p = _plist_path(label)
         if not p.exists():
             print(f"{name}: plist missing ({p}) — skipped")
@@ -171,9 +250,9 @@ def cmd_load(_args: argparse.Namespace) -> int:
     return rc
 
 
-def cmd_unload(_args: argparse.Namespace) -> int:
+def cmd_unload(args: argparse.Namespace) -> int:
     rc = 0
-    for name, label in LABELS.items():
+    for name, label in _selected_jobs(args):
         p = _plist_path(label)
         if not p.exists():
             continue
@@ -214,10 +293,26 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("health", help="one-shot health report")
     w = sub.add_parser("watch", help="auto-refreshing health report")
     w.add_argument("--interval", type=float, default=3.0)
-    sub.add_parser("load", help="launchctl load all three plists")
-    sub.add_parser("unload", help="launchctl unload all three plists")
+    job_names = [*LABELS, "logrotate"]
+    ld = sub.add_parser("load", help="launchctl load managed plists "
+                                     "(all, or just one)")
+    ld.add_argument("service", nargs="?", choices=job_names,
+                    help="load only this job (default: all)")
+    ul = sub.add_parser("unload", help="launchctl unload managed plists "
+                                       "(all, or just one — e.g. to edit "
+                                       "its config while it's stopped)")
+    ul.add_argument("service", nargs="?", choices=job_names,
+                    help="unload only this job (default: all)")
     r = sub.add_parser("restart", help="restart one service")
     r.add_argument("service", choices=list(LABELS))
+    lr = sub.add_parser(
+        "logrotate",
+        help="copytruncate-rotate oversized ~/.local/log/*.log (gzip history)")
+    lr.add_argument("--max-mb", type=float,
+                    default=DEFAULT_MAX_BYTES / (1024 * 1024),
+                    help="rotate logs larger than this many MiB")
+    lr.add_argument("--keep", type=int, default=DEFAULT_KEEP,
+                    help="compressed generations to keep per log")
     return p
 
 
@@ -229,6 +324,7 @@ _DISPATCH = {
     "load":      cmd_load,
     "unload":    cmd_unload,
     "restart":   cmd_restart,
+    "logrotate": cmd_logrotate,
 }
 
 

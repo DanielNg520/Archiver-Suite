@@ -30,6 +30,18 @@ FLOODWAIT semantics:
   problem that benefits from operator awareness. The drain loop can
   surface this via logs and status.
 
+STALL WATCHDOG:
+  A half-open TCP connection (sleep/wake, VPN exit dying, NAT timeout)
+  makes Telethon's upload await forever WITHOUT raising — retries only
+  fire on exceptions, so the serial drain loop would freeze for good
+  (observed: a whole night of zero uploads with one row wedged in
+  'sending'). Every send attempt therefore runs under asyncio.wait_for
+  with a size-aware deadline: stall_base_timeout_s of fixed grace plus
+  payload_bytes / stall_min_rate_kib_s. A slow-but-moving link easily
+  beats the assumed floor rate; only a genuine stall hits the deadline.
+  Timeout counts as a normal network attempt, and the client is force-
+  reconnected first — retrying on the same wedged socket cannot succeed.
+
 ERROR shape:
   SendResult.ok=False with flood_wait_s set → "wait then requeue, no
                                               attempt counted"
@@ -52,9 +64,11 @@ from telethon.errors import FloodWaitError, ImageProcessFailedError
 from telethon.tl import types as tg_types
 
 from core.files import media_bucket
+from core import media_prep
 
 from . import image_fix
-from .media_meta import probe_video
+from .media_meta import make_thumbnail, probe_video
+from .progress import ProgressReporter
 
 log = logging.getLogger(__name__)
 
@@ -150,6 +164,9 @@ class TelethonSendStrategy(SendStrategy):
         max_retries:      int   = 4,
         retry_base_delay: float = 2.0,
         max_flood_wait_s: int   = 600,
+        stall_base_timeout_s: float = 600.0,
+        stall_min_rate_kib_s: float = 64.0,
+        progress: ProgressReporter | None = None,
     ):
         self._api_id           = api_id
         self._api_hash         = api_hash
@@ -158,7 +175,58 @@ class TelethonSendStrategy(SendStrategy):
         self._max_retries      = max_retries
         self._retry_base_delay = retry_base_delay
         self._max_flood_wait_s = max_flood_wait_s
+        self._stall_base_timeout_s = stall_base_timeout_s
+        self._stall_min_rate_kib_s = stall_min_rate_kib_s
+        self._progress = progress
         self._client: TelegramClient | None = None
+
+    def _progress_cb(self, file_path: str, *,
+                     batch_pos: int | None = None,
+                     batch_total: int | None = None):
+        """Heartbeat callback for one file upload, or None when reporting is
+        off (tests, fakes). Telethon accepts progress_callback=None."""
+        if self._progress is None:
+            return None
+        return self._progress.callback(
+            file_path, batch_pos=batch_pos, batch_total=batch_total)
+
+    def _progress_done(self) -> None:
+        if self._progress is not None:
+            self._progress.clear()
+
+    def _stall_timeout(self, payload_bytes: int) -> float:
+        """Per-attempt deadline: fixed grace + worst-tolerated transfer time.
+        FloodWait sleeps happen OUTSIDE the attempt, so they never eat into it."""
+        transfer_s = payload_bytes / (self._stall_min_rate_kib_s * 1024.0)
+        return self._stall_base_timeout_s + transfer_s
+
+    @staticmethod
+    def _payload_bytes(file_paths: list[str]) -> int:
+        """Total bytes about to go over the wire; a vanished file counts 0
+        (the send itself will surface the real error)."""
+        total = 0
+        for fp in file_paths:
+            try:
+                total += Path(fp).stat().st_size
+            except OSError:
+                pass
+        return total
+
+    async def _force_reconnect(self) -> None:
+        """Tear down and re-establish the MTProto connection after a stall.
+        Both halves are themselves deadline-bound — a wedged socket can hang
+        disconnect() too — and best-effort: the retry's send will surface any
+        connection problem as a normal network error."""
+        assert self._client is not None
+        try:
+            await asyncio.wait_for(self._client.disconnect(), timeout=30)
+        except Exception as e:
+            log.warning("telethon: disconnect after stall failed: %s", e)
+        try:
+            await asyncio.wait_for(self._client.connect(), timeout=30)
+            log.info("telethon: reconnected after stall")
+        except Exception as e:
+            log.warning("telethon: reconnect after stall failed: %s", e)
 
     async def __aenter__(self) -> "TelethonSendStrategy":
         self._client = TelegramClient(
@@ -169,6 +237,7 @@ class TelethonSendStrategy(SendStrategy):
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._progress_done()
         if self._client is not None:
             await self._client.disconnect()
             log.info("telethon: disconnected")
@@ -200,14 +269,46 @@ class TelethonSendStrategy(SendStrategy):
                 error=f"parent dir unreachable: {Path(file_path).parent}",
             )
 
-        attributes = _video_attributes(file_path)
+        # Safety net for videos that bypassed ingest-time prep (chiefly recorder
+        # recordings, whose remux is allowed to fall back to the raw .flv/.ts so
+        # a recording is never lost). Convert a non-streamable container to a
+        # temp .mp4 and send THAT; None → already streamable / not a video /
+        # conversion failed → send the original unchanged. Off the event loop:
+        # ffmpeg can take seconds to minutes.
+        prepped = await asyncio.to_thread(media_prep.streamable_temp, Path(file_path))
+        send_path = str(prepped) if prepped is not None else file_path
 
-        async def _do():
-            await self._client.send_file(
-                peer, file_path, caption=caption, supports_streaming=True,
-                attributes=attributes,
+        # Both probes shell out to ffprobe/ffmpeg (seconds, worst-case tens) —
+        # off the event loop so signal handling and FloodWait timers stay live.
+        attributes = await asyncio.to_thread(_video_attributes, send_path)
+        # Explicit poster frame so Telegram doesn't auto-grab a black/white
+        # fade-in frame as the inline preview. None → not a video / probe
+        # failed; Telethon falls back to server-side generation (status quo).
+        thumb = await asyncio.to_thread(make_thumbnail, send_path)
+
+        try:
+            async def _do():
+                await self._client.send_file(
+                    peer, send_path, caption=caption, supports_streaming=True,
+                    attributes=attributes, thumb=thumb,
+                    progress_callback=self._progress_cb(file_path),
+                )
+            result = await self._send_with_retries(
+                _do, what=Path(file_path).name,
+                payload_bytes=self._payload_bytes([send_path]),
             )
-        result = await self._send_with_retries(_do, what=Path(file_path).name)
+        finally:
+            self._progress_done()
+            if prepped is not None:
+                try:
+                    os.unlink(prepped)
+                except OSError:
+                    pass
+            if thumb:
+                try:
+                    os.unlink(thumb)
+                except OSError:
+                    pass
         if result.ok or not result.image_process_failed:
             return result
 
@@ -221,11 +322,14 @@ class TelethonSendStrategy(SendStrategy):
             async def _do_retry():
                 await self._client.send_file(
                     peer, safe, caption=caption, supports_streaming=True,
+                    progress_callback=self._progress_cb(file_path),
                 )
             return await self._send_with_retries(
                 _do_retry, what=f"{Path(file_path).name} (converted)",
+                payload_bytes=self._payload_bytes([safe]),
             )
         finally:
+            self._progress_done()
             try:
                 os.unlink(safe)
             except OSError:
@@ -266,19 +370,40 @@ class TelethonSendStrategy(SendStrategy):
         if not is_video_album:
             return await self._send_photo_album(peer, file_paths, captions)
 
-        async def _do():
-            # Telethon's album path (_send_album) doesn't forward an
-            # `attributes=` argument, so bare paths would give every video
-            # the same 1×1 placeholder. Pre-build each item as InputMedia
-            # with explicit attributes — the only way to get correct
-            # per-video geometry in a multi-item album.
-            payload = [await self._build_album_item(fp) for fp in file_paths]
-            await self._client.send_file(
-                peer, payload, caption=captions, supports_streaming=True,
+        # Poster frames for each clip, built once so they survive retries; same
+        # black/white-fade-in fix as the single-send path. fp → thumb-path|None.
+        thumbs = {
+            fp: await asyncio.to_thread(make_thumbnail, fp) for fp in file_paths
+        }
+        try:
+            async def _do():
+                # Telethon's album path (_send_album) doesn't forward an
+                # `attributes=` argument, so bare paths would give every video
+                # the same 1×1 placeholder. Pre-build each item as InputMedia
+                # with explicit attributes — the only way to get correct
+                # per-video geometry in a multi-item album.
+                payload = [
+                    await self._build_album_item(
+                        fp, thumbs.get(fp),
+                        batch_pos=i + 1, batch_total=len(file_paths),
+                    )
+                    for i, fp in enumerate(file_paths)
+                ]
+                await self._client.send_file(
+                    peer, payload, caption=captions, supports_streaming=True,
+                )
+            return await self._send_with_retries(
+                _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
+                payload_bytes=self._payload_bytes(file_paths),
             )
-        return await self._send_with_retries(
-            _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
-        )
+        finally:
+            self._progress_done()
+            for t in thumbs.values():
+                if t:
+                    try:
+                        os.unlink(t)
+                    except OSError:
+                        pass
 
     async def _send_photo_album(
         self,
@@ -319,11 +444,19 @@ class TelethonSendStrategy(SendStrategy):
 
             what = f"album[{len(prepared)}] {Path(file_paths[0]).name}…"
 
+            # One album-level callback (batch_pos=None): Telethon uploads the
+            # list sequentially through this single callback, so per-file
+            # attribution isn't knowable here — the heartbeat still shows
+            # name, album size, and live byte counts.
             async def _do():
                 await self._client.send_file(
                     peer, prepared, caption=captions, supports_streaming=True,
+                    progress_callback=self._progress_cb(
+                        file_paths[0], batch_total=len(prepared)),
                 )
-            result = await self._send_with_retries(_do, what=what)
+            result = await self._send_with_retries(
+                _do, what=what, payload_bytes=self._payload_bytes(prepared),
+            )
             if result.ok or not result.image_process_failed:
                 return result
 
@@ -348,18 +481,24 @@ class TelethonSendStrategy(SendStrategy):
             async def _do_retry():
                 await self._client.send_file(
                     peer, retry_paths, caption=captions, supports_streaming=True,
+                    progress_callback=self._progress_cb(
+                        file_paths[0], batch_total=len(retry_paths)),
                 )
             return await self._send_with_retries(
                 _do_retry, what=f"{what} (converted)",
+                payload_bytes=self._payload_bytes(retry_paths),
             )
         finally:
+            self._progress_done()
             for t in temps:
                 try:
                     os.unlink(t)
                 except OSError:
                     pass
 
-    async def _build_album_item(self, file_path: str):
+    async def _build_album_item(self, file_path: str, thumb: str | None = None,
+                                *, batch_pos: int | None = None,
+                                batch_total: int | None = None):
         """Upload one video and wrap it as an InputMediaUploadedDocument for an
         album send, injecting explicit display geometry when we have it.
 
@@ -368,29 +507,48 @@ class TelethonSendStrategy(SendStrategy):
         which is how we get per-item dimensions the path-list album API can't
         express. If the probe failed for this file, we still upload it as a
         video document — just without the explicit attribute (status quo for
-        that one file), never as a photo."""
+        that one file), never as a photo.
+
+        `thumb` is a local JPEG poster path (or None); when present it is
+        uploaded and baked in so the album item gets a real preview frame
+        instead of a server-picked black/white fade-in frame."""
         assert self._client is not None
-        handle = await self._client.upload_file(file_path)
+        handle = await self._client.upload_file(
+            file_path,
+            progress_callback=self._progress_cb(
+                file_path, batch_pos=batch_pos, batch_total=batch_total),
+        )
+        thumb_handle = (
+            await self._client.upload_file(thumb) if thumb else None
+        )
+        video_attrs = await asyncio.to_thread(_video_attributes, file_path)
         attrs, mime = tg_utils.get_attributes(
             file_path,
-            attributes=_video_attributes(file_path),  # None → no override
+            attributes=video_attrs,  # None → no override
             supports_streaming=True,
         )
         return tg_types.InputMediaUploadedDocument(
-            file=handle, mime_type=mime, attributes=attrs,
+            file=handle, mime_type=mime, attributes=attrs, thumb=thumb_handle,
         )
 
-    async def _send_with_retries(self, send_fn, *, what: str) -> SendResult:
+    async def _send_with_retries(
+        self, send_fn, *, what: str, payload_bytes: int = 0,
+    ) -> SendResult:
         """Shared FloodWait + exponential-backoff envelope for both single
         and album sends. `send_fn` is an async no-arg callable performing
         the actual Telethon send_file; the only thing that differs between
         single and album is that call, so the retry/flood logic lives here
-        once rather than being duplicated (and able to drift)."""
+        once rather than being duplicated (and able to drift).
+
+        Every attempt runs under the stall watchdog (see module docstring):
+        a deadline sized to payload_bytes converts a silent network freeze
+        into a countable, retryable failure instead of an eternal await."""
+        timeout_s = self._stall_timeout(payload_bytes)
         attempts = 0
         last_error: str | None = None
         while attempts < self._max_retries:
             try:
-                await send_fn()
+                await asyncio.wait_for(send_fn(), timeout=timeout_s)
                 return SendResult(ok=True)
 
             except FloodWaitError as e:
@@ -418,6 +576,24 @@ class TelethonSendStrategy(SendStrategy):
                     error=f"{type(e).__name__}: {e}",
                     image_process_failed=True,
                 )
+
+            except (TimeoutError, asyncio.TimeoutError):
+                # Stall watchdog fired: no exception from the socket, just no
+                # progress within the deadline. Must precede the OSError arm —
+                # builtin TimeoutError IS an OSError subclass. The connection
+                # is presumed wedged; recycle it before the next attempt.
+                attempts += 1
+                last_error = (
+                    f"stalled: send incomplete after {timeout_s:.0f}s "
+                    f"({payload_bytes} bytes)"
+                )
+                log.warning(
+                    "telethon: stall attempt %d/%d (%s): no completion in "
+                    "%.0fs — reconnecting",
+                    attempts, self._max_retries, what, timeout_s,
+                )
+                await self._force_reconnect()
+                continue
 
             except (ConnectionError, OSError) as e:
                 attempts += 1

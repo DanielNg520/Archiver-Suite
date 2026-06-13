@@ -58,13 +58,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Same canonical set used elsewhere — kept in sync intentionally; this
-# is the "files we consider media." Sidecars (.json) are excluded.
-MEDIA_EXTENSIONS = {
-    ".mp4", ".mov", ".webm", ".mkv",   # video
-    ".jpg", ".jpeg", ".png", ".webp",  # image
-    ".gif",                            # animated
-}
+# The canonical "files we consider media" set — one definition in core.files.
+# Sidecars (.json) are excluded by construction.
+from core.files import MEDIA_EXTENSIONS  # noqa: E402
 
 ROOT_CLUSTER_MIN_PREFIX = 5
 RECORDER_CONFIG_TOML = Path.home() / ".config" / "recorder" / "config.toml"
@@ -363,29 +359,33 @@ def _reconcile_dir(
             report.skipped_unstable += 1
             continue
 
-        # Convertible containers (.ts/.flv/.m4v/...) — e.g. a crashed recording
-        # that never reached the recorder's remux — are not Telegram-streamable
-        # as-is and were historically skipped here entirely. Run them through
-        # media_prep to get a streamable .mp4 (split if oversize); only its
-        # transformed outputs are registered, then the raw original is retired.
-        # Canonical media keeps the untouched single-file fast path.
-        if convertible:
-            prep = media_prep.prepare(f)
-            if not prep.ok:
-                report.prep_failed += 1
-                log.warning("  reconcile: media_prep failed for %s: %s",
-                            f.name, prep.error)
-                continue
-            if not prep.transformed:
-                # Prep disabled or the file isn't a usable video — skip rather
-                # than enqueue an unplayable container (prior behaviour).
-                report.prep_failed += 1
-                log.warning("  reconcile: %s not converted to a streamable "
-                            "format — skipped", f.name)
-                continue
-            targets, transformed = prep.outputs, True
-        else:
-            targets, transformed = [f], False
+        # Telegram-readiness, decided by PROBE rather than extension. EVERY new
+        # video runs through media_prep.prepare(): a canonical-extension file
+        # whose codecs are already streamable passes through untouched (one
+        # cheap ffprobe, only ever paid for files not yet in the DB), while a
+        # .webm/.mkv container, an HEVC-in-.mp4, or a convertible container
+        # (.ts/.flv/.m4v… — e.g. a crashed recording that never reached the
+        # recorder's remux) is converted to a streamable .mp4 (split if
+        # oversize). Previously only the oddball extensions were converted, so
+        # platform downloads with bad codecs uploaded non-streamable.
+        # Images pass through prepare() untouched by construction.
+        prep = media_prep.prepare(f)
+        if not prep.ok:
+            # Couldn't make it streamable safely. Leave the original on disk
+            # (never lose bytes); it is retried next pass.
+            report.prep_failed += 1
+            log.warning("  reconcile: media_prep failed for %s: %s",
+                        f.name, prep.error)
+            continue
+        if not prep.transformed and convertible:
+            # A convertible container that prep left untouched (prep disabled,
+            # or not a usable video) — skip rather than enqueue an unplayable
+            # container (prior behaviour). Canonical media passes through.
+            report.prep_failed += 1
+            log.warning("  reconcile: %s not converted to a streamable "
+                        "format — skipped", f.name)
+            continue
+        targets, transformed = prep.outputs, prep.transformed
 
         accounted = sum(1 for out in targets if _register(out))
 

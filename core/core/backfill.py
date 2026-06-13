@@ -62,6 +62,8 @@ def backfill_content_hashes(
     ).fetchall()
     total = len(rows)
     rep = BackfillReport()
+    if not total:
+        return rep          # clean DB — stay silent (auto-runs every cycle)
     log.info("backfill: %d row(s) without a content_hash", total)
 
     pending_writes = 0

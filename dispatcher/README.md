@@ -2,7 +2,8 @@
 
 Telegram upload dispatcher. Owns the single Telegram session. Drains
 pending rows from the shared `suite.db` / `items` table populated by
-`archiver` (priority 10) and `recorder` (priority 20). One file at a time;
+`recorder` (priority 5), chat_id folders (priority 6), and `archiver`
+(priority 10). One file at a time;
 FloodWait-aware; crash-safe via a startup watchdog.
 
 Architectural context: see the root `README.md` and

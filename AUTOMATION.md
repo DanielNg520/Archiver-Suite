@@ -227,8 +227,9 @@ sleep 5 && ops health
    TikTok downloads that cycle.
 4. **Recorder** polls its TikTok user list every 60s. When someone's live, it
    acquires the lock, records with yt-dlp until the stream ends, releases the
-   lock, enqueues the file (priority 20), and re-scans.
-5. **Dispatcher** claims queued rows (priority 10 before 20), sends each to
+   lock, enqueues the file (priority 5), and re-scans.
+5. **Dispatcher** claims queued rows in priority order: recorder (5), chat_id
+   folders (6), then normal archive media (10). It sends each to
    the Telegram chat resolved for that platform/user, marks `sent`, and (if
    the delete policy is on) removes the local file + sidecars.
 6. **Auto-ban of gone accounts** — when an archiver cycle's extractor reports

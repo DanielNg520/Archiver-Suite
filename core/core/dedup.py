@@ -75,13 +75,8 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-# Mirrors reconcile.MEDIA_EXTENSIONS and identity.py. Kept in sync
-# intentionally — the canonical set of "what counts as media".
-MEDIA_EXTENSIONS = {
-    ".mp4", ".mov", ".webm", ".mkv",   # video
-    ".jpg", ".jpeg", ".png", ".webp",  # image
-    ".gif",                            # animated
-}
+# Re-exported for existing importers; the one definition lives in core.files.
+from .files import MEDIA_EXTENSIONS  # noqa: E402  (after logger on purpose)
 
 # Canonical filename pattern, identical in shape to identity._FILENAME_RE.
 # Duplicated rather than imported because the convention is a public

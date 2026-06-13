@@ -23,7 +23,7 @@ from .ingest import register_file, IngestResult, IngestOutcome
 from .routing import is_chat_id, CHAT_ID_RE
 from .orphaned import (
     ingest_chat_id_dirs, ingest_folder, OrphanedReport, subfolder_of,
-    ORPHANED_SOURCE, ORPHANED_PLATFORM,
+    ORPHANED_SOURCE, ORPHANED_PLATFORM, CHAT_ID_PRIORITY,
 )
 from .backfill import backfill_content_hashes, BackfillReport
 from .sorter import sort_unsorted, SortReport, extract_username
@@ -41,7 +41,7 @@ __all__ = [
     "register_file", "IngestResult", "IngestOutcome",
     "is_chat_id", "CHAT_ID_RE",
     "ingest_chat_id_dirs", "ingest_folder", "OrphanedReport", "subfolder_of",
-    "ORPHANED_SOURCE", "ORPHANED_PLATFORM",
+    "ORPHANED_SOURCE", "ORPHANED_PLATFORM", "CHAT_ID_PRIORITY",
     "backfill_content_hashes", "BackfillReport",
     "sort_unsorted", "SortReport", "extract_username",
 ]

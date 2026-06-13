@@ -38,10 +38,19 @@ from .send import SendStrategy
 
 log = logging.getLogger(__name__)
 
-# How often the drain loop re-runs failed-row retention GC. The retention
-# WINDOW is config.failed_retention_days; this is just how often we check.
-# A few times a day is ample — failed rows accrue slowly and pruning is cheap.
-_PRUNE_EVERY_S = 6 * 3600
+# How often the drain loop re-runs its housekeeping pair: failed-row retention
+# GC and the stuck-'sending' watchdog. The retention WINDOW is
+# config.failed_retention_days and the stuck threshold config.stuck_claim_min;
+# this is just how often we check. The watchdog used to run only at startup,
+# which left a row wedged in 'sending' (e.g. by a manual `queue cancel` race)
+# stranded until the next dispatcher restart — self-healing should not require
+# a restart. Safe mid-loop: the drain is serial, so at the top of an iteration
+# this process has nothing in flight; only genuinely stale claims match.
+# Cadence: both queries are trivial (indexed UPDATE/DELETE on a local SQLite),
+# so checking every 15 min costs nothing and caps the worst-case time a
+# wedged row waits for rescue at minutes, not the rest of the day (a SIGKILLed
+# upload — e.g. launchd restart mid-send — strands exactly one such row).
+_HOUSEKEEPING_EVERY_S = 15 * 60
 
 
 def is_tiktok_live(item: Item) -> bool:
@@ -95,6 +104,24 @@ def album_caption_for(batch: list[Item]) -> str:
     return with_live_tag(caption) if is_tiktok_live(head) else caption
 
 
+def _suppress_duplicate(store: QueueStore, guard: DeletionGuard,
+                        it: Item, twin_id: int) -> None:
+    """Mark a claimed row as delivered-by-twin and remove its redundant copy.
+    Only legal when the twin's bytes are CONFIRMED delivered (status='sent') —
+    callers own that check. The safebrake still wins: a protected scope keeps
+    even its duplicates."""
+    store.mark_deduplicated(it.id, twin_id=twin_id)
+    try:
+        removed = guard.delete(it.platform, it.username, it.file_path,
+                               reason="dedup-suppressed-duplicate")
+    except Exception as e:
+        log.exception("drain: id=%d dedup-cleanup raised: %s", it.id, e)
+        removed = False
+    log.info("drain: id=%d suppressed as duplicate of id=%d (bytes already "
+             "sent) — redundant copy %s", it.id, twin_id,
+             "deleted" if removed else "kept (safebrake)")
+
+
 async def drain_forever(
     config:        DispatcherConfig,
     store:         QueueStore,
@@ -128,9 +155,9 @@ async def drain_forever(
     # Startup watchdog: revert rows left 'sending' by a crashed predecessor.
     store.reset_stuck_sending(older_than_minutes=config.stuck_claim_min)
 
-    # Retention GC cadence. last_prune=0 makes the first loop iteration run it
-    # immediately (covering startup), then again every _PRUNE_EVERY_S.
-    last_prune = 0.0
+    # Housekeeping cadence. last_housekeeping=0 makes the first loop iteration
+    # run it immediately (covering startup), then every _HOUSEKEEPING_EVERY_S.
+    last_housekeeping = 0.0
 
     while True:
         if stop_event is not None and stop_event.is_set():
@@ -138,13 +165,18 @@ async def drain_forever(
             return
 
         now = time.monotonic()
-        if now - last_prune >= _PRUNE_EVERY_S:
+        if now - last_housekeeping >= _HOUSEKEEPING_EVERY_S:
             try:
                 store.prune_failed(config.failed_retention_days)
+                # Periodic watchdog: recover rows wedged in 'sending' without
+                # waiting for a restart (this loop is serial, so nothing of
+                # ours is in flight here — only stale claims can match).
+                store.reset_stuck_sending(
+                    older_than_minutes=config.stuck_claim_min)
             except Exception as exc:
-                # Retention is housekeeping — never let it kill the daemon.
-                log.exception("drain: retention prune raised: %s", exc)
-            last_prune = now
+                # Housekeeping must never kill the daemon.
+                log.exception("drain: housekeeping raised: %s", exc)
+            last_housekeeping = now
 
         try:
             batch = store.claim_batch(
@@ -192,34 +224,38 @@ async def drain_forever(
         # is not subject to delete_after_upload (that governs the ORIGINAL).
         # Rows without a content_hash are never gated, so nothing is ever
         # wrongly suppressed.
+        #
+        # ORDERING (file-integrity contract): a SENT twin justifies suppressing
+        # immediately — its bytes are already delivered. A twin that is merely
+        # in THIS batch has not delivered anything yet, so an in-batch dupe is
+        # only set aside (not sent), and is suppressed/deleted strictly AFTER
+        # the batch send succeeds. If the send fails or floodwaits, the dupe
+        # follows the same transition as the rest of the batch — its bytes and
+        # file are never given up on the strength of an undelivered twin.
         survivors: list[Item] = []
+        batch_dupes: list[tuple[Item, int]] = []   # (dupe, in-batch twin id)
         batch_hashes: dict[str, int] = {}
         for it in present:
             twin = store.sent_twin(it.content_hash, it.id)
-            if twin is None and it.content_hash in batch_hashes:
-                twin_id = batch_hashes[it.content_hash]
-            else:
-                twin_id = twin.id if twin is not None else None
-            if twin_id is not None:
-                store.mark_deduplicated(it.id, twin_id=twin_id)
-                # Normally a duplicate's redundant copy is deleted regardless of
-                # delete-after-upload (the bytes are already delivered). The
-                # safebrake still wins: a protected scope keeps even its dupes.
-                try:
-                    removed = guard.delete(it.platform, it.username, it.file_path,
-                                           reason="dedup-suppressed-duplicate")
-                except Exception as e:
-                    log.exception("drain: id=%d dedup-cleanup raised: %s", it.id, e)
-                    removed = False
-                log.info("drain: id=%d suppressed as duplicate of id=%d (bytes "
-                         "already sent) — redundant copy %s", it.id, twin_id,
-                         "deleted" if removed else "kept (safebrake)")
+            if twin is not None:
+                _suppress_duplicate(store, guard, it, twin.id)
+                continue
+            if it.content_hash in batch_hashes:
+                batch_dupes.append((it, batch_hashes[it.content_hash]))
                 continue
             if it.content_hash:
                 batch_hashes[it.content_hash] = it.id
             survivors.append(it)
         present = survivors
         if not present:
+            # Only in-batch dupes remained (their anchors were all suppressed
+            # against sent twins, so the dupes now have sent twins too).
+            for it, _twin_id in batch_dupes:
+                twin = store.sent_twin(it.content_hash, it.id)
+                if twin is not None:
+                    _suppress_duplicate(store, guard, it, twin.id)
+                else:
+                    store.requeue(it.id, reason="in-batch twin not delivered")
             continue
 
         head = present[0]
@@ -233,7 +269,11 @@ async def drain_forever(
             for it in present:
                 store.mark_failed(it.id, error=str(exc),
                                   max_retries=config.max_retries)
-            log.error("drain: %d item(s) unroutable — %s", len(present), exc)
+            for it, _twin_id in batch_dupes:   # held dupes share the route
+                store.mark_failed(it.id, error=str(exc),
+                                  max_retries=config.max_retries)
+            log.error("drain: %d item(s) unroutable — %s",
+                      len(present) + len(batch_dupes), exc)
             continue
 
         if len(present) == 1:
@@ -261,6 +301,10 @@ async def drain_forever(
             # so mark every row sent together, then run delete gate per row.
             for it in present:
                 store.mark_sent(it.id)
+            # In-batch dupes were held back from the send; their twin's bytes
+            # are NOW confirmed delivered, so suppression is finally legal.
+            for it, twin_id in batch_dupes:
+                _suppress_duplicate(store, guard, it, twin_id)
             log.info("drain: %s sent (%d item(s))",
                      "album" if len(present) > 1 else f"id={head.id}",
                      len(present))
@@ -284,6 +328,11 @@ async def drain_forever(
                         result.flood_wait_s, len(present))
             for it in present:
                 store.requeue(it.id, reason=f"floodwait {result.flood_wait_s}s")
+            # Held-back dupes never went out either; requeue without burning
+            # a retry, same as the rest of the batch.
+            for it, _twin_id in batch_dupes:
+                store.requeue(it.id, reason=f"floodwait {result.flood_wait_s}s "
+                                            "(held as in-batch duplicate)")
             await asyncio.sleep(result.flood_wait_s + 1)
 
         else:
@@ -296,5 +345,10 @@ async def drain_forever(
                     it.id, error=result.error or "unknown",
                     max_retries=config.max_retries,
                 ))
+            # A held-back dupe's twin did NOT deliver — requeue it untouched
+            # (no attempt burned: it was never sent). Next claim re-evaluates;
+            # if the twin eventually delivers, sent_twin suppresses it then.
+            for it, _twin_id in batch_dupes:
+                store.requeue(it.id, reason="in-batch twin failed to deliver")
             log.warning("drain: %d item(s) failed (%s): %s",
                         len(present), "/".join(sorted(statuses)), result.error)

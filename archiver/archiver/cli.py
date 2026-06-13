@@ -49,7 +49,10 @@ from .reconcile import (
 )
 
 from core import ItemStore, DeletePolicy, RecorderDeletePolicy, DedupPolicy
-from core import AutoIngestPolicy, DownloadPolicy, ProtectionPolicy, DeletionGuard
+from core import (
+    AutoIngestPolicy, CHAT_ID_PRIORITY, DeletionGuard, DownloadPolicy,
+    ProtectionPolicy,
+)
 from core import SortPolicy
 from core import cli as core_cli
 
@@ -127,8 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
              "(folder name = Telegram destination). Dedups + enqueues them.",
     )
     s_ingest.add_argument(
-        "--priority", type=int, default=100,
-        help="Queue priority for ingested files (default 100).")
+        "--priority", type=int, default=CHAT_ID_PRIORITY,
+        help=f"Queue priority for ingested files (default {CHAT_ID_PRIORITY}).")
     s_ingest.add_argument(
         "--path", metavar="DIR",
         help="Ingest an arbitrary folder (not just chat_id dirs under "
@@ -518,16 +521,16 @@ def cmd_ingest(args, config: Config, db: ItemStore) -> int:
         if not folder.is_dir():
             log.error("ingest --path %s is not a directory", folder)
             return 2
-        rep = ingest_folder(db, folder, chat_id=args.chat,
-                            priority=args.priority, guard=guard)
+        rep = ingest_folder(
+            db, folder, chat_id=args.chat, priority=args.priority, guard=guard)
         print(rep)
         return 0
 
     reports = ingest_chat_id_dirs(
         db, config.output_dir,
-        known_platforms = list(PLATFORM_CHOICES) + list(config.local_platforms),
-        priority        = args.priority,
-        guard           = guard,
+        known_platforms=list(PLATFORM_CHOICES) + list(config.local_platforms),
+        priority=args.priority,
+        guard=guard,
     )
     if not reports:
         print("No chat_id folders found under", config.output_dir)

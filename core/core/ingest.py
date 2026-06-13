@@ -81,14 +81,21 @@ def register_file(
     source:    str,
     platform:  str,
     username:  str,
-    chat_id:   str | None = None,
-    group_key: str | None = None,
-    caption:   str | None = None,
-    priority:  int = 100,
+    chat_id:    str | None = None,
+    group_key:  str | None = None,
+    caption:    str | None = None,
+    priority:   int = 100,
+    identifier: str | None = None,
 ) -> IngestResult:
     """Register one finished media file as a pending upload. Never raises for
     an expected condition (unstable / unreadable / duplicate) — it reports the
-    outcome so a bulk scan can keep going."""
+    outcome so a bulk scan can keep going.
+
+    `identifier` overrides the resolver's identifier (date/title still come
+    from the resolver chain). Producers with their own stable identity scheme
+    — the recorder's `recorder_<stem>` — pass it so a file registered live and
+    the same file re-registered by a sweep collide on UNIQUE(platform,
+    identifier) instead of duplicating."""
     path = Path(path)
 
     # 1. stabilize — refuse to register a file that's still being written.
@@ -109,7 +116,8 @@ def register_file(
     if twin is not None:
         return _collapse(store, path, twin, digest)
 
-    # 4. resolve identity (sidecar > filename > path-hash fallback).
+    # 4. resolve identity (sidecar > filename > path-hash fallback). An
+    #    explicit producer identifier wins; date/title still resolve normally.
     ident = identity.resolve(path)
 
     # 5. insert — writing the row IS the enqueue.
@@ -117,7 +125,7 @@ def register_file(
         source          = source,
         platform        = platform,
         username        = username,
-        identifier      = ident.identifier,
+        identifier      = identifier or ident.identifier,
         file_path       = str(path),
         upload_date     = ident.upload_date,
         title           = ident.title,

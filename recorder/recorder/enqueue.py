@@ -21,8 +21,8 @@ import logging
 import os
 from pathlib import Path
 
-from core import ItemStore
-from core.hashing import full_hash
+from core import ItemStore, register_file
+from core.ingest import IngestOutcome
 
 log = logging.getLogger(__name__)
 
@@ -72,37 +72,44 @@ class EnqueueClient:
         caption:   str | None,
         priority:  int = RECORDER_PRIORITY,
     ) -> bool:
-        """Insert one job. Returns True if inserted, False if it already
-        existed (idempotent on file_path / synthesized identifier)."""
-        # Stamp content_hash so a finished recording is a first-class citizen of
-        # the global-dedup guarantee — exactly like the archiver's download and
-        # reconcile paths, and core.ingest (startup-sweep). The recorder is the
-        # only producer that enqueued NULL-hash rows; that left live recordings
-        # invisible to the dispatcher's sent_twin suppression and the
-        # re-introduction guard. The stream has ended and yt-dlp has exited, so
-        # the file is complete; this is a one-time whole-file read per recording.
-        # A read failure must NOT drop the recording — fall back to NULL (the
-        # prior behavior), and `archiver backfill` can fill it in later.
-        digest = full_hash(Path(file_path))
-        if digest is None:
-            log.warning("enqueue: could not hash %s — enqueuing without "
-                        "content_hash (dedup guarantee won't cover it until "
-                        "backfilled)", Path(file_path).name)
+        """Register one finished recording. Returns True if it became newly
+        claimable (inserted, or a failed twin was re-armed).
+
+        Goes through core.ingest.register_file — the SAME primitive the
+        startup sweep and every other producer use — so a live enqueue gets
+        the full skeleton (stabilize → hash → dedup-collapse → insert) instead
+        of a bespoke add_item: a still-flushing file is refused rather than
+        registered, and bytes already tracked under another path collapse
+        onto one row instead of duplicating. The recorder's identifier scheme
+        (`recorder_<stem>`) is preserved via the explicit override.
+
+        Self-healing contract: an UNSTABLE / HASH_FAILED outcome leaves the
+        file on disk untouched — the startup sweep re-registers it on the
+        next `recorder start`, so a refused enqueue can delay an upload but
+        never lose a recording."""
+        path = Path(file_path)
         store = ItemStore.open(self._db_path)
         try:
-            inserted = store.add_item(
-                source       = "recorder",
-                platform     = platform,
-                username     = username,
-                identifier   = _recorder_identifier(file_path),
-                file_path    = file_path,
-                caption      = caption,
-                priority     = priority,
-                content_hash = digest,
+            result = register_file(
+                store, path,
+                source     = "recorder",
+                platform   = platform,
+                username   = username,
+                caption    = caption,
+                priority   = priority,
+                identifier = _recorder_identifier(file_path),
             )
-            log.info("enqueue: %s @%s %s → %s",
-                     platform, username, Path(file_path).name,
-                     "queued" if inserted else "already queued")
-            return inserted
         finally:
             store.close()
+
+        if result.outcome in (IngestOutcome.UNSTABLE, IngestOutcome.HASH_FAILED):
+            log.warning(
+                "enqueue: %s @%s %s refused (%s) — file kept on disk; the "
+                "startup sweep will register it on the next recorder start",
+                platform, username, path.name, result.outcome.value,
+            )
+            return False
+        log.info("enqueue: %s @%s %s → %s",
+                 platform, username, path.name,
+                 "queued" if result.inserted else result.outcome.value)
+        return result.inserted

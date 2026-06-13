@@ -26,6 +26,12 @@ log = logging.getLogger(__name__)
 PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv"}
 
+# THE definition of "a media file this suite manages". Every scanner —
+# archiver reconcile, recorder startup sweep, orphaned ingest, dedup, sorter —
+# imports this set. It was previously copy-pasted into four packages; any
+# drift meant one worker ignoring a file another worker had enqueued.
+MEDIA_EXTENSIONS = PHOTO_EXTS | VIDEO_EXTS | {".gif"}
+
 ALBUM_MAX = 10  # Telegram's hard limit on items per album
 
 

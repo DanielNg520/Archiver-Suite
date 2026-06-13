@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +41,20 @@ log = logging.getLogger(__name__)
 # ffprobe should answer in well under a second; cap it so a wedged probe can
 # never stall the drain loop. A timeout just means "no attributes this time".
 _PROBE_TIMEOUT_S = 20.0
+
+# Generating a single thumbnail frame is cheap, but the `thumbnail` filter has
+# to decode a window of frames to score them, so allow a little more headroom
+# than the probe. A timeout just means "upload without an explicit thumbnail".
+_THUMB_TIMEOUT_S = 60.0
+
+# Telegram thumbnails are small JPEGs; 320px on the long edge is the documented
+# ceiling. The `thumbnail` filter scores a window of frames and picks the most
+# representative one, which is what skips the solid black/white fade-in frames
+# Telegram's server would otherwise grab as frame 0 (the "black/white poster"
+# bug). The window covers the first ~300 frames (~10s at 30fps) — long enough
+# to clear a typical fade-in.
+_THUMB_WINDOW_FRAMES = 300
+_THUMB_MAX_EDGE = 320
 
 
 @dataclass(frozen=True)
@@ -160,3 +176,63 @@ def probe_video(file_path: str) -> VideoMeta | None:
     return VideoMeta(
         width=width, height=height, duration=_duration(stream, data.get("format", {})),
     )
+
+
+def make_thumbnail(file_path: str) -> str | None:
+    """Render a representative JPEG thumbnail for a video, or None.
+
+    WHY THIS EXISTS
+      With no explicit thumbnail, Telegram's server auto-generates the inline
+      poster from frame 0 of the upload. Clips that open on a fade-in (solid
+      black) or a blank/white leader therefore show an all-black/all-white
+      preview even though the video itself plays fine — the "black/white poster"
+      bug. We hand Telegram a frame chosen by ffmpeg's `thumbnail` filter, which
+      scores a window of frames and rejects uniform outliers, so the poster
+      lands on real picture content.
+
+    Returns the path to a temp .jpg the CALLER must delete, or None if this
+    isn't a video / ffmpeg is unavailable or fails. Never raises — a thumbnail
+    problem degrades to "upload without an explicit thumbnail", never a failed
+    send."""
+    if media_bucket(file_path) != "video":
+        return None
+
+    fd, out = tempfile.mkstemp(prefix="tgthumb_", suffix=".jpg")
+    os.close(fd)
+
+    # thumbnail=N picks the most representative frame from each N-frame window;
+    # scale fits it inside the Telegram size ceiling while preserving aspect.
+    vf = (
+        f"thumbnail={_THUMB_WINDOW_FRAMES},"
+        f"scale={_THUMB_MAX_EDGE}:{_THUMB_MAX_EDGE}:"
+        f"force_original_aspect_ratio=decrease"
+    )
+    cmd = [
+        "ffmpeg", "-y", "-v", "error",
+        "-i", file_path,
+        "-vf", vf,
+        "-frames:v", "1",
+        "-f", "mjpeg",
+        out,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=_THUMB_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("thumbnail: %s: ffmpeg failed (%s) — uploading without an "
+                    "explicit thumbnail", Path(file_path).name, e)
+        _discard(out)
+        return None
+    if r.returncode != 0 or not Path(out).exists() or Path(out).stat().st_size == 0:
+        log.warning("thumbnail: %s: ffmpeg produced no frame (rc=%d) — uploading "
+                    "without an explicit thumbnail", Path(file_path).name,
+                    r.returncode)
+        _discard(out)
+        return None
+    return out
+
+
+def _discard(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass

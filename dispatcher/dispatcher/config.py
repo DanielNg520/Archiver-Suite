@@ -41,6 +41,14 @@ def _opt(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
 
 
+def session_name_or_default() -> str:
+    """Session name as `dispatcher start` would resolve it, without requiring
+    the full Telegram credentials. Lets read-only commands (status) locate the
+    instance lock even when creds aren't loadable."""
+    return _opt("TELEGRAM_SESSION",
+                os.path.expanduser("~/.config/dispatcher/session"))
+
+
 # ── Telegram credentials ──────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -53,13 +61,13 @@ class TelegramCreds:
 
     @classmethod
     def from_env(cls) -> "TelegramCreds":
-        default_session = os.path.expanduser("~/.config/dispatcher/session")
-        os.makedirs(os.path.dirname(default_session), exist_ok=True)
+        session = session_name_or_default()
+        os.makedirs(os.path.dirname(session) or ".", exist_ok=True)
         return cls(
             api_id       = int(_req("TELEGRAM_API_ID")),
             api_hash     = _req("TELEGRAM_API_HASH"),
             phone        = _req("TELEGRAM_PHONE"),
-            session_name = _opt("TELEGRAM_SESSION", default_session),
+            session_name = session,
         )
 
 
@@ -81,6 +89,15 @@ class DispatcherConfig:
     # (e.g. tombstones for files deleted off disk and never restored). 0
     # disables. Tune via FAILED_RETENTION_DAYS in ~/.config/dispatcher/.env.
     failed_retention_days: float = 7.0
+    # Stall watchdog: per-attempt send deadline = base + bytes/rate. Catches
+    # silent TCP freezes (sleep/wake, VPN drop) that raise nothing and would
+    # otherwise hang the serial drain loop forever. Tune via
+    # STALL_BASE_TIMEOUT_S / STALL_MIN_RATE_KIB_S in .env.
+    # The floor rate must sit WELL below the link's real worst case (observed
+    # ~115 KiB/s through the VPN path) — a floor that's too optimistic kills
+    # and re-uploads legitimately slow transfers from scratch.
+    stall_base_timeout_s: float = 600.0
+    stall_min_rate_kib_s: float = 64.0
 
     @classmethod
     def load(cls, *, require_telegram: bool = True) -> "DispatcherConfig":
@@ -106,6 +123,8 @@ class DispatcherConfig:
             inter_album_sleep = float(_opt("INTER_ALBUM_SLEEP", "2.0")),
             stuck_claim_min   = int(_opt("STUCK_CLAIM_MIN", "10")),
             failed_retention_days = float(_opt("FAILED_RETENTION_DAYS", "7")),
+            stall_base_timeout_s  = float(_opt("STALL_BASE_TIMEOUT_S", "600")),
+            stall_min_rate_kib_s  = float(_opt("STALL_MIN_RATE_KIB_S", "64")),
         )
 
     def config_toml_path(self) -> Path:

@@ -296,6 +296,29 @@ def _convert(src: Path, p: _Probe) -> Path | None:
     return dst
 
 
+def streamable_temp(path: Path) -> Path | None:
+    """Send-time safety net: if `path` is a video Telegram can't stream inline
+    (wrong container and/or codec), produce a streamable .mp4 next to it and
+    return that temp path; otherwise return None.
+
+    Returns None for the common cases that need no work — a probe failure (not
+    a readable video: image, audio-only, ffprobe missing), an already-streamable
+    video, or a conversion that fails — so the caller simply sends the original.
+    The caller owns the returned temp and must unlink it after sending.
+
+    Unlike prepare(), this never splits: it is a last-line guard for producers
+    that bypass ingest-time prep (chiefly the recorder, whose remux is allowed
+    to fall back to the raw container so a recording is never lost). Oversize
+    handling stays prepare()'s job; a too-large remux fails to send exactly as
+    the raw file would have, which is no worse than the status quo."""
+    if not prep_enabled():
+        return None
+    p = _probe(path)
+    if p is None or _is_streamable(p):
+        return None
+    return _convert(path, p)
+
+
 # ── Split (AutoSplitter) ──────────────────────────────────────────────────────
 #
 # AutoSplitter ships two ways and we support both. Typically it is installed

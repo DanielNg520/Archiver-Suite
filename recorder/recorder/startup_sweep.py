@@ -44,13 +44,18 @@ from .enqueue import RECORDER_PRIORITY
 
 log = logging.getLogger(__name__)
 
-# "What we consider a recording." Mirrors archiver.reconcile.MEDIA_EXTENSIONS;
-# sidecars (.json) and logs (.log) are intentionally excluded.
-MEDIA_EXTENSIONS = {
-    ".mp4", ".mov", ".webm", ".mkv",   # video
-    ".jpg", ".jpeg", ".png", ".webp",  # image
-    ".gif",                            # animated
-}
+# "What we consider a recording" on a recovery sweep. Canonical media (core.files)
+# PLUS the raw capture containers a crashed recording can leave behind before its
+# live remux ran (.flv/.ts/…). Without the second set those orphans match no
+# filter and are stranded on disk forever; with it they are re-enqueued raw and
+# the dispatcher's send-time net converts them to streamable .mp4. Mirrors the
+# archiver reconcile policy (MEDIA_EXTENSIONS | CONVERTIBLE_VIDEO_EXTS) so both
+# recovery paths recognise exactly the same files. Sidecars (.json) and logs
+# (.log) are excluded by construction.
+from core.files import MEDIA_EXTENSIONS  # noqa: E402
+from core import media_prep  # noqa: E402
+
+_RECORDING_EXTS = MEDIA_EXTENSIONS | media_prep.CONVERTIBLE_VIDEO_EXTS
 
 
 @dataclass
@@ -163,7 +168,7 @@ def sweep(output_dir: str, db_path: str | None = None,
         for f in sorted(root.rglob("*")):
             if not f.is_file() or f.name.startswith("."):
                 continue
-            if f.suffix.lower() not in MEDIA_EXTENSIONS:
+            if f.suffix.lower() not in _RECORDING_EXTS:
                 continue
 
             path_str = str(f)

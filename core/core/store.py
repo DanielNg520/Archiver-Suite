@@ -809,6 +809,16 @@ class ItemStore:
         ).fetchall()
         return {r["status"]: r["n"] for r in rows}
 
+    def last_sent_at(self) -> str | None:
+        """ISO-8601 UTC timestamp of the most recent successful send, or None.
+        The one-line liveness signal for `status` displays: a healthy drain
+        keeps this fresh, a wedged one lets it age — which is how a stalled
+        pipeline gets noticed before the queue depth does."""
+        row = self.conn.execute(
+            "SELECT MAX(sent_at) AS t FROM items WHERE status='sent'",
+        ).fetchone()
+        return row["t"]
+
     def list_items(self, *, status: str | None = None,
                    limit: int = 50, offset: int = 0) -> list[Item]:
         sql = "SELECT * FROM items"

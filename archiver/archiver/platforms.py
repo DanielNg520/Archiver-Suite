@@ -42,11 +42,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-MEDIA_EXTENSIONS = {
-    ".mp4", ".mov", ".webm", ".mkv",
-    ".jpg", ".jpeg", ".png", ".webp",
-    ".gif",
-}
+from core.files import MEDIA_EXTENSIONS  # one definition, shared suite-wide
 
 
 # ── Status types ──────────────────────────────────────────────────────────────
@@ -630,6 +626,10 @@ class TikTokPlatform(Platform):
             "impersonate":         ImpersonateTarget.from_str("chrome"),
             "writeinfojson":       True,
             "overwrites":          False,
+            # TikTok photo carousels appear in profile playlists but have no
+            # video formats. gallery-dl owns those entries in the second pass,
+            # so do not abort the whole yt-dlp profile walk when one is found.
+            "ignore_no_formats_error": True,
             # Tell yt-dlp about its archive — same one we seed during reconcile.
             "download_archive":    str(self.archive_path(username)),
             "sleep_interval":              self.config.sleep_min,
@@ -707,11 +707,29 @@ class TikTokPlatform(Platform):
 
 
 class _YtdlpLogger:
+    _EXPECTED_PHOTO_MESSAGES = (
+        "no video formats found",
+        "requested format is not available",
+    )
+
+    @classmethod
+    def _is_expected_photo_message(cls, msg: str) -> bool:
+        lower = msg.lower()
+        return any(fragment in lower for fragment in cls._EXPECTED_PHOTO_MESSAGES)
+
     def debug(self,   msg: str):
         if not msg.startswith("[debug]"):
             log.debug("yt-dlp: %s", msg)
-    def warning(self, msg: str): log.warning("yt-dlp: %s", msg)
-    def error(self,   msg: str): log.error("yt-dlp: %s", msg)
+    def warning(self, msg: str):
+        if self._is_expected_photo_message(msg):
+            log.debug("yt-dlp: TikTok photo post delegated to gallery-dl: %s", msg)
+        else:
+            log.warning("yt-dlp: %s", msg)
+    def error(self, msg: str):
+        if self._is_expected_photo_message(msg):
+            log.debug("yt-dlp: TikTok photo post delegated to gallery-dl: %s", msg)
+        else:
+            log.error("yt-dlp: %s", msg)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

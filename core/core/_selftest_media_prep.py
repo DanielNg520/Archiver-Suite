@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core import ItemStore, media_prep                      # noqa: E402
 from core.orphaned import (                                  # noqa: E402
-    ingest_folder, ORPHANED_PLATFORM, _PREPPED_META_KEY,
+    CHAT_ID_PRIORITY, ORPHANED_PLATFORM, _PREPPED_META_KEY, ingest_folder,
 )
 
 OK = "✓"
@@ -208,6 +208,8 @@ def test_ingest_folder(tmp: Path) -> None:
     check(rep.inserted == 2, f"inserted 2 rows (got {rep.inserted})")
     rows = {Path(r.file_path).name: r for r in rows_for(store, chat_id)}
     check(len(rows) == 2, "two pending rows present")
+    check(all(r.priority == CHAT_ID_PRIORITY for r in rows.values()),
+          "default ingest priority is second only to live recordings")
 
     # The mkv was replaced on disk by a streamable .mp4 and the original is gone.
     check(not (folder / "album" / "clip.mkv").exists(),

@@ -67,6 +67,10 @@ ORPHANED_SOURCE = "orphaned"
 # out of the archiver's per-platform reconcile loop.
 ORPHANED_PLATFORM = "orphaned"
 
+# Lower numbers drain first. Live recordings default to 5 and normal archive
+# items to 10, so chat_id-folder uploads sit directly between them.
+CHAT_ID_PRIORITY = 6
+
 
 @dataclass
 class OrphanedReport:
@@ -96,7 +100,7 @@ def ingest_chat_id_dirs(
     output_dir:      str | Path,
     *,
     known_platforms: list[str] | set[str],
-    priority:        int = 100,
+    priority:        int = CHAT_ID_PRIORITY,
     guard:           DeletionGuard | None = None,
 ) -> list[OrphanedReport]:
     """Scan output_dir's top-level folders; ingest every chat_id-named one.
@@ -148,7 +152,8 @@ _OUTCOME_TALLY = {
 
 
 def ingest_folder(
-    store: ItemStore, folder: Path, *, chat_id: str, priority: int = 100,
+    store: ItemStore, folder: Path, *, chat_id: str,
+    priority: int = CHAT_ID_PRIORITY,
     guard: DeletionGuard | None = None,
 ) -> OrphanedReport:
     """Ingest every media file under `folder`, routed to `chat_id`. Two shapes:

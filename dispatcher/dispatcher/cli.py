@@ -33,8 +33,10 @@ from core import (
 )
 from core import cli as core_cli
 
-from .config import DispatcherConfig
+from .config import DispatcherConfig, session_name_or_default
 from .drain import drain_forever
+from .instance_lock import DispatcherAlreadyRunning, DispatcherInstanceLock
+from .progress import ProgressReporter, describe, read_progress
 from .send import TelethonSendStrategy
 from .tg_router import TelegramRouter
 
@@ -82,6 +84,9 @@ async def _run_drain(config: DispatcherConfig) -> None:
         max_retries      = config.max_retries,
         retry_base_delay = config.retry_base_delay,
         max_flood_wait_s = config.max_flood_wait_s,
+        stall_base_timeout_s = config.stall_base_timeout_s,
+        stall_min_rate_kib_s = config.stall_min_rate_kib_s,
+        progress         = ProgressReporter(),
     ) as send_strategy:
         try:
             await drain_forever(
@@ -105,7 +110,11 @@ def cmd_start(args: argparse.Namespace) -> int:
     log.info("cli: db=%s session=%s",
              config.db_path, config.telegram.session_name)
     try:
-        asyncio.run(_run_drain(config))
+        with DispatcherInstanceLock(config.telegram.session_name):
+            asyncio.run(_run_drain(config))
+    except DispatcherAlreadyRunning as exc:
+        log.error("cli: %s", exc)
+        return 1
     except KeyboardInterrupt:
         # add_signal_handler should normally swallow SIGINT, but if asyncio
         # is in early startup before the handler is registered, KeyboardInterrupt
@@ -118,10 +127,25 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 def cmd_status(args: argparse.Namespace) -> int:
     config = DispatcherConfig.load(require_telegram=False)
+
+    # Liveness first: the question behind most `status` invocations is
+    # "is a drain daemon actually running?" — answered via the instance
+    # lock's holder, not by guessing from queue counts.
+    pid = DispatcherInstanceLock(session_name_or_default()).holder_pid()
+    if pid is not None:
+        print(f"daemon: running (pid {pid})")
+        prog = read_progress()
+        if prog:
+            print(f"uploading: {describe(prog)}")
+    else:
+        print("daemon: NOT running")
+
     store = ItemStore.open(config.db_path)
     try:
         counts = store.counts_by_status()
         total = sum(counts.values())
+        last = store.last_sent_at()
+        print(f"last sent: {last or 'never'}")
         print(f"db: {config.db_path}")
         print(f"  total: {total}")
         for st in ("pending", "sending", "sent", "failed"):
@@ -225,6 +249,8 @@ def cmd_config_show(args: argparse.Namespace) -> int:
     print(f"retry base delay: {config.retry_base_delay}s")
     print(f"max flood wait:   {config.max_flood_wait_s}s")
     print(f"stuck claim:      {config.stuck_claim_min}m")
+    print(f"stall watchdog:   {config.stall_base_timeout_s:.0f}s base "
+          f"+ payload @ {config.stall_min_rate_kib_s:.0f} KiB/s floor")
     return 0
 
 

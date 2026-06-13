@@ -54,6 +54,7 @@ log = logging.getLogger(__name__)
 # currently disabled (no config block this run). Auto-adoption is only for
 # genuinely foreign folder names.
 _BUILTIN_PLATFORM_NAMES = frozenset({"x", "tiktok", "instagram"})
+_RESERVED_OUTPUT_DIR_NAMES = _BUILTIN_PLATFORM_NAMES | {"unsorted"}
 
 
 def build_platforms(config: Config) -> list[Platform]:
@@ -109,7 +110,7 @@ def _local_platform_names(config: Config) -> list[str]:
             nm = d.name
             if nm.startswith(".") or nm in seen:
                 continue
-            if nm in _BUILTIN_PLATFORM_NAMES or is_chat_id(nm):
+            if nm in _RESERVED_OUTPUT_DIR_NAMES or is_chat_id(nm):
                 continue
             seen.add(nm)
             discovered.append(nm)
@@ -199,8 +200,26 @@ class Archiver:
                 if not self._fetches(platform):
                     await self._reconcile_one_platform(platform, user_filter)
         self._maybe_ingest_orphaned(known_platform_names)
+        self._maybe_backfill_hashes()
         self._report_banned()
         return results
+
+    def _maybe_backfill_hashes(self) -> None:
+        """Self-healing pass for the dedup guarantee: fill content_hash on any
+        row that lacks one (a recorder hash-read failure, or a legacy row), so
+        no file stays invisible to sent_twin / re-introduction guards until
+        someone remembers to run `archiver backfill` by hand. Resumable and a
+        no-op (one indexed SELECT) when every row is already hashed; never
+        fatal — a failed backfill just retries next run."""
+        from core import backfill_content_hashes
+
+        try:
+            rep = backfill_content_hashes(self.db)
+        except Exception as e:
+            log.warning("auto-backfill: failed (%s) — will retry next run", e)
+            return
+        if rep.scanned:
+            log.info("auto-backfill: %s", rep)
 
     def _ban_account(self, platform: str, username: str, reason: str) -> None:
         """Persist a banned/deleted account: drop it from the active user list

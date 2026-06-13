@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -99,6 +100,7 @@ def test_lock_seam(tmp: Path) -> None:
 def test_producer_table_seam(tmp: Path) -> None:
     section("Seam 2: producers → one items table (priority + content_hash)")
     from recorder.enqueue import EnqueueClient, RECORDER_PRIORITY, _recorder_identifier
+    from core import CHAT_ID_PRIORITY
 
     db = _fresh_db()
     try:
@@ -108,6 +110,13 @@ def test_producer_table_seam(tmp: Path) -> None:
         db.add_item(source="archiver", platform="x", username="alice",
                     identifier="x_1", file_path=str(af), priority=10,
                     content_hash=full_hash(af))
+
+        # chat_id-folder files are urgent, but live recordings still win.
+        of = _write_media(tmp / "-100123" / "loose.mp4", b"CHAT-ID-BYTES")
+        db.add_item(source="orphaned", platform="orphaned", username="-100123",
+                    identifier="orphaned_1", file_path=str(of),
+                    priority=CHAT_ID_PRIORITY, chat_id="-100123",
+                    content_hash=full_hash(of))
 
         # Recorder LIVE enqueue (priority 5). This is the seam the fix touched:
         # the recorder must now stamp content_hash like every other producer.
@@ -126,17 +135,77 @@ def test_producer_table_seam(tmp: Path) -> None:
            "stamped hash equals core.hashing.full_hash (one definition of bytes)")
         ok(rec.identifier == _recorder_identifier(str(rf)),
            "recorder identifier scheme is recorder_<stem>")
-        ok(RECORDER_PRIORITY < 10, "recorder priority drains before archiver's")
+        ok(RECORDER_PRIORITY < CHAT_ID_PRIORITY < 10,
+           "priority order is recorder, chat_id folder, archiver")
 
-        # The dispatcher claims lowest-priority-number first → recorder wins.
+        # The dispatcher claims lowest-priority-number first.
         first = db.claim_next()
         ok(first.source == "recorder",
-           "claim_next picks the recorder row first (priority 5 < 10)")
+           "claim_next picks the recorder row first")
         second = db.claim_next()
-        ok(second.source == "archiver", "then the archiver row (priority 10)")
+        ok(second.source == "orphaned", "then the chat_id-folder row")
+        third = db.claim_next()
+        ok(third.source == "archiver", "then the archiver row")
         ok(db.claim_next() is None, "queue drained — nothing left to claim")
     finally:
         db.close()
+
+
+def test_local_platform_discovery_seam(tmp: Path) -> None:
+    section("Seam 13: local-platform discovery excludes reserved routes")
+    from types import SimpleNamespace
+    from archiver.orchestrator import _local_platform_names
+
+    for name in ("x", "tiktok", "instagram", "unsorted", "-100123", "library"):
+        (tmp / name).mkdir(parents=True, exist_ok=True)
+    config = SimpleNamespace(output_dir=str(tmp), local_platforms=())
+
+    names = _local_platform_names(config)
+    ok(names == ["library"],
+       "only a genuine local platform is auto-discovered")
+
+
+def test_dispatcher_instance_lock_seam(tmp: Path) -> None:
+    section("Seam 14: one dispatcher owns each Telethon session")
+    from dispatcher.instance_lock import DispatcherInstanceLock
+
+    session = str(tmp / "telegram-session")
+    code = (
+        "import sys,time;"
+        "sys.path.insert(0,'dispatcher');"
+        "from dispatcher.instance_lock import DispatcherInstanceLock;"
+        f"lock=DispatcherInstanceLock({session!r});"
+        "lock.__enter__();print('locked',flush=True);time.sleep(30)"
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", code],
+        cwd=Path(__file__).resolve().parents[1],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ok(child.stdout.readline().strip() == "locked",
+           "first dispatcher process acquires the session lock")
+        probe = DispatcherInstanceLock(session)
+        ok(probe.holder_pid() == child.pid,
+           "holder_pid() probe names the owning process")
+        err = ""
+        try:
+            with DispatcherInstanceLock(session):
+                acquired = True
+        except RuntimeError as e:
+            acquired, err = False, str(e)
+        ok(not acquired, "second dispatcher process is rejected")
+        ok(str(child.pid) in err,
+           "rejection message names the holding pid (diagnosable, not opaque)")
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+    ok(DispatcherInstanceLock(session).holder_pid() is None,
+       "holder_pid() reports no owner once the process is gone")
+    with DispatcherInstanceLock(session):
+        ok(True, "lock is recoverable after the owner exits")
 
 
 def _db_file(store) -> str:
@@ -311,6 +380,14 @@ def test_startup_sweep_seam(tmp: Path) -> None:
         # (d) a per-recording .log → sweep deletes it.
         (out / "alice" / "alice_sent_ytdlp.log").write_text("yt-dlp log\n")
 
+        # (e) an orphaned RAW .flv: a capture that crashed before its live remux
+        #     ran, leaving a non-canonical container with no DB row. It is NOT in
+        #     MEDIA_EXTENSIONS, so the sweep must recognise it via the convertible
+        #     set or it is stranded forever. Recovered raw here; the dispatcher's
+        #     send-time net (Seam 20) makes it streamable at upload.
+        orphan_flv = _write_media(out / "dave" / "dave_crash.flv",
+                                  b"ORPHANED-RAW-FLV-NEVER-ENQUEUED")
+
         db.close()   # sweep opens its own ItemStore on the same file
 
         # Policy ON so the sent leftover is actually removed (uses a temp config).
@@ -329,6 +406,8 @@ def test_startup_sweep_seam(tmp: Path) -> None:
             ok(db2.get(fid).status == "pending", "failed recording re-armed to pending")
             ok(db2.has_file_path(str(out / "carol" / "carol_new.mp4")),
                "brand-new recording registered into the shared table")
+            ok(db2.has_file_path(str(orphan_flv)),
+               "orphaned raw .flv recovered by the sweep (not stranded on disk)")
         finally:
             db2.close()
     finally:
@@ -709,6 +788,396 @@ def test_full_history_gate_seam() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Seam 15 — in-batch dedup must not suppress before its twin DELIVERS.
+# Two byte-identical pending files claimed in one batch: the dupe is held back
+# from the send. If the send FAILS, the dupe's bytes/file must be untouched
+# (its twin never delivered); only after a successful send may it be
+# suppressed and its redundant copy removed. Regression guard for the
+# file-integrity bug where a dupe was marked 'sent' + deleted pre-send.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _FlakySend(_FakeSend):
+    """Fails the first N album/single sends, then succeeds. `on_failure` (if
+    set) runs at the moment of each failure — the deterministic point to
+    assert what the world looks like while the twin has NOT delivered."""
+    def __init__(self, fail_first: int, on_failure=None):
+        super().__init__()
+        self._failures_left = fail_first
+        self._on_failure = on_failure
+
+    def _maybe_fail(self):
+        from dispatcher.send import SendResult
+        if self._failures_left > 0:
+            self._failures_left -= 1
+            if self._on_failure:
+                self._on_failure()
+            return SendResult(ok=False, error="simulated network failure")
+        return None
+
+    async def send(self, *, peer, file_path, caption):
+        return self._maybe_fail() or await super().send(
+            peer=peer, file_path=file_path, caption=caption)
+
+    async def send_album(self, *, peer, file_paths, caption):
+        return self._maybe_fail() or await super().send_album(
+            peer=peer, file_paths=file_paths, caption=caption)
+
+
+def test_in_batch_dedup_integrity_seam(tmp: Path) -> None:
+    section("Seam 15: in-batch dup survives a failed twin send")
+    from core import (ItemStore, PolicyStore, DeletePolicy, RecorderDeletePolicy,
+                      BatchPolicy, DeletionGuard)
+    from core.hashing import full_hash
+    from dispatcher.drain import drain_forever
+    from dispatcher.config import DispatcherConfig
+    from dispatcher.tg_router import TelegramRouter
+
+    db = _fresh_db()
+    db_path = _db_file(db)
+    store = None
+    try:
+        ps = PolicyStore()
+        ps.set(BatchPolicy.SIZE_KEY, 1)
+
+        # Two byte-identical photos in ONE album group → claimed together.
+        a = _write_media(tmp / "x" / "al" / "a.jpg", b"SAME")
+        b = _write_media(tmp / "x" / "al" / "b.jpg", b"SAME")
+        for f, ident in ((a, "a"), (b, "b")):
+            db.add_item(source="archiver", platform="x", username="al",
+                        identifier=ident, file_path=str(f), priority=10,
+                        caption="A", content_hash=full_hash(f))
+        db.close()
+
+        cfg = DispatcherConfig(
+            telegram=None, default_chat_id="-100123", db_path=db_path,
+            policy_store=ps, poll_interval_s=0.01, max_retries=5,
+            inter_album_sleep=0.0, stuck_claim_min=10, failed_retention_days=0,
+        )
+        store = ItemStore.open(db_path)
+        # At each failure instant the twin has NOT delivered — both files must
+        # still be on disk and no row may be terminal 'sent'. Captured inside
+        # the sender so the check is deterministic, not poll-timing-dependent.
+        failure_snapshots: list[bool] = []
+
+        def _at_failure():
+            c = store.counts_by_status()
+            failure_snapshots.append(
+                a.exists() and b.exists() and c.get("sent", 0) == 0)
+
+        fake = _FlakySend(fail_first=2, on_failure=_at_failure)
+        router = TelegramRouter(default_chat_id="-100123")
+        stop = asyncio.Event()
+
+        async def _run():
+            task = asyncio.create_task(drain_forever(
+                cfg, store, fake, router,
+                DeletePolicy(ps), RecorderDeletePolicy(ps), BatchPolicy(ps),
+                DeletionGuard(ps), stop_event=stop,
+            ))
+            for _ in range(600):
+                await asyncio.sleep(0.01)
+                c = store.counts_by_status()
+                if c.get("pending", 0) == 0 and c.get("sending", 0) == 0 \
+                        and c.get("sent", 0) == 2:
+                    break
+            stop.set()
+            await task
+
+        asyncio.run(_run())
+
+        ok(len(failure_snapshots) == 2 and all(failure_snapshots),
+           "during failed sends, no file was deleted and nothing marked sent")
+        counts = store.counts_by_status()
+        ok(counts.get("sent", 0) == 2 and counts.get("failed", 0) == 0,
+           "after the sender recovered, both rows are terminal 'sent'")
+        sent_files = [Path(p).name for batch in fake.sent_albums for p in batch] \
+            + [Path(p).name for p in fake.sent_singles]
+        ok(len(sent_files) == 1,
+           "exactly ONE physical upload happened (the dupe never re-sent)")
+        dup_row = store.get(store.id_of(str(b)))
+        ok("deduped" in (dup_row.last_error or ""),
+           "held-back dupe was suppressed only AFTER its twin delivered")
+        ok(not b.exists(),
+           "redundant copy removed once (and only once) the bytes shipped")
+    finally:
+        for s in (store, db):
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 16 — instance lock is CWD-independent. A bare session name must resolve
+# to the SAME lock file no matter where the process was started (launchd CWD=/
+# vs manual CWD=~ previously took two different locks and both ran).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_lock_cwd_independence_seam(tmp: Path) -> None:
+    section("Seam 16: instance lock path is CWD-independent")
+    from dispatcher.instance_lock import DispatcherInstanceLock
+
+    tmp.mkdir(parents=True, exist_ok=True)
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        lock_a = DispatcherInstanceLock("bare-session-name")
+        os.chdir("/")
+        lock_b = DispatcherInstanceLock("bare-session-name")
+    finally:
+        os.chdir(cwd)
+    ok(lock_a.path == lock_b.path and lock_a.path.is_absolute(),
+       "bare session name → one absolute lock path from any CWD")
+
+    abs_session = tmp / "explicit" / "session"
+    lock_c = DispatcherInstanceLock(str(abs_session))
+    ok(lock_c.path.parent == abs_session.parent,
+       "path-style session name keeps the lock beside the session file")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 17 — recorder live enqueue goes through core.ingest with the recorder's
+# identifier scheme intact, and inherits ingest's dedup-collapse: bytes already
+# tracked under another path never become a second row.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_recorder_enqueue_ingest_seam(tmp: Path) -> None:
+    section("Seam 17: recorder enqueue ↔ core.ingest")
+    from recorder.enqueue import EnqueueClient
+
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        rec = _write_media(tmp / "alice" / "alice_live.mp4", b"LIVE")
+        # Age the mtime past the stability quiescent window so the test
+        # doesn't pay the 1.5s probe sleep.
+        old = __import__("time").time() - 60
+        os.utime(rec, (old, old))
+
+        client = EnqueueClient(db_path)
+        ok(client.enqueue(platform="tiktok", username="alice",
+                          file_path=str(rec), caption="c"),
+           "live enqueue registers a fresh recording")
+        row = db.get(db.id_of(str(rec)))
+        ok(row.identifier == f"recorder_{rec.stem}",
+           "recorder identifier scheme preserved through core.ingest")
+        ok(row.content_hash is not None,
+           "live enqueue stamps content_hash (dedup guarantee intact)")
+
+        # Same bytes under a second path → collapsed, never a second row.
+        twin = _write_media(tmp / "alice" / "alice_live_copy.mp4", b"LIVE")
+        os.utime(twin, (old, old))
+        inserted = client.enqueue(platform="tiktok", username="alice",
+                                  file_path=str(twin), caption="c")
+        ok(not inserted, "byte-identical second path does not insert")
+        ok(db.id_of(str(twin)) is None or db.id_of(str(twin)) == row.id,
+           "no second row for identical bytes (dedup-collapse applied)")
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 18 — the stall watchdog. A silent TCP freeze raises nothing, so without
+# a per-attempt deadline the serial drain loop awaits forever (observed: a
+# whole night of zero uploads, one row wedged in 'sending'). The retry
+# envelope must convert "no progress" into a counted, retryable failure and
+# recycle the presumed-wedged connection between attempts.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_send_stall_watchdog_seam() -> None:
+    section("Seam 18: send stall watchdog (deadline + reconnect)")
+    from dispatcher.send import TelethonSendStrategy
+
+    strategy = TelethonSendStrategy(
+        api_id=0, api_hash="", phone="", session_name="stub",
+        max_retries=2, retry_base_delay=0.01,
+        stall_base_timeout_s=0.05, stall_min_rate_kib_s=128.0,
+    )
+
+    class _StubClient:
+        def __init__(self):
+            self.disconnects = 0
+            self.connects = 0
+        async def disconnect(self):
+            self.disconnects += 1
+        async def connect(self):
+            self.connects += 1
+
+    stub = _StubClient()
+    strategy._client = stub  # bypass __aenter__: no network in tests
+
+    # deadline math: fixed grace + payload at the floor rate
+    ok(strategy._stall_timeout(0) == 0.05,
+       "empty payload → base timeout only")
+    ok(abs(strategy._stall_timeout(128 * 1024 * 10) - (0.05 + 10.0)) < 1e-6,
+       "payload timeout scales by the floor-rate assumption")
+
+    # a send that never completes must fail after max_retries, not hang
+    calls = {"n": 0}
+    async def _hang():
+        calls["n"] += 1
+        await asyncio.sleep(60)
+
+    result = asyncio.run(
+        strategy._send_with_retries(_hang, what="stub", payload_bytes=0))
+    ok(not result.ok and "stalled" in (result.error or ""),
+       "eternal stall becomes a counted failure, not an eternal await")
+    ok(calls["n"] == 2, "each retry got its own deadline")
+    ok(stub.disconnects == 2 and stub.connects == 2,
+       "wedged connection is recycled before every retry")
+
+    # first attempt stalls, second succeeds → retry actually recovers
+    state = {"n": 0}
+    async def _flaky():
+        state["n"] += 1
+        if state["n"] == 1:
+            await asyncio.sleep(60)
+
+    result = asyncio.run(
+        strategy._send_with_retries(_flaky, what="stub", payload_bytes=0))
+    ok(result.ok, "one stalled attempt then success → SendResult.ok")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 19 — upload-progress heartbeat. The drain's send strategy WRITES a JSON
+# heartbeat; `dispatcher status` and `ops health` READ it from other processes.
+# The seam contract: atomic, throttled-but-never-misses-the-final-tick, and
+# self-expiring (stale timestamp or dead writer pid reads as "idle", so a
+# crashed dispatcher can't leave a lying status line behind).
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_upload_progress_seam(tmp: Path) -> None:
+    section("Seam 19: upload progress heartbeat (writer ↔ readers)")
+    import json
+    import subprocess as sp
+    from dispatcher.progress import ProgressReporter, read_progress, describe
+
+    tmp.mkdir(parents=True, exist_ok=True)
+    pf = tmp / "progress.json"
+
+    rep = ProgressReporter(path=pf, min_interval_s=0.0)
+    cb = rep.callback("/x/video.mp4", batch_pos=3, batch_total=10)
+    cb(52_428_800, 140_826_032)
+    p = read_progress(pf)
+    ok(p is not None and p["file"] == "/x/video.mp4" and p["sent"] == 52_428_800,
+       "heartbeat written and readable cross-call")
+    desc = describe(p)
+    ok("video.mp4" in desc and "[file 3/10]" in desc and "37%" in desc,
+       f"describe() is human-readable ({desc})")
+
+    # rate + ETA derive from byte/timestamp deltas
+    fake = {"file": "/x/a.mp4", "sent": 50, "total": 100,
+            "started_at": 0.0, "updated_at": 50.0}
+    ok("1.0KB" not in describe(fake) and "ETA 50s" in describe(fake),
+       "describe() derives rate and ETA from the heartbeat")
+
+    # throttle: mid ticks suppressed, final tick never dropped
+    rep2 = ProgressReporter(path=pf, min_interval_s=9999)
+    cb2 = rep2.callback("/x/video.mp4")
+    cb2(1, 100)            # first write (throttle window opens)
+    cb2(2, 100)            # suppressed
+    ok(read_progress(pf)["sent"] == 1, "mid-upload ticks are throttled")
+    cb2(100, 100)          # sent == total bypasses the throttle
+    ok(read_progress(pf)["sent"] == 100, "final tick always lands (100%)")
+
+    # staleness self-expiry
+    data = json.loads(pf.read_text())
+    data["updated_at"] -= 3600
+    pf.write_text(json.dumps(data))
+    ok(read_progress(pf) is None, "stale heartbeat reads as idle")
+
+    # dead-writer self-expiry: a just-exited child's pid is guaranteed dead
+    dead_pid = int(sp.run(
+        [sys.executable, "-c", "import os; print(os.getpid())"],
+        capture_output=True, text=True).stdout.strip())
+    data["updated_at"] = __import__("time").time()
+    data["pid"] = dead_pid
+    pf.write_text(json.dumps(data))
+    ok(read_progress(pf) is None, "dead writer pid reads as idle")
+
+    # clear() removes the artifact entirely
+    cb(1, 2)
+    rep.clear()
+    ok(read_progress(pf) is None, "clear() leaves no heartbeat behind")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 20 — the send-time streamable net. A recording whose recorder remux fell
+# back to the raw container (.flv/.ts), or any video that bypassed ingest-time
+# prep, reaches the dispatcher non-streamable. The send strategy must convert it
+# to a streamable .mp4 BEFORE handing it to Telegram, send the converted bytes,
+# and clean the temp up — while leaving an already-streamable file untouched
+# (no needless re-encode) and never mutating the on-disk original.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _ffmpeg_present() -> bool:
+    from shutil import which
+    return which("ffmpeg") is not None and which("ffprobe") is not None
+
+
+def _make_video(path: Path, *, container: str) -> Path:
+    """A real, tiny H.264/AAC clip in the requested container. Codecs are always
+    Telegram-friendly, so streamability is decided purely by the container —
+    .mp4 streams inline, .flv does not (forcing the remux path)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-y", "-v", "error",
+         "-f", "lavfi", "-i", "testsrc=duration=1:size=160x120:rate=15",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+         "-c:v", "libx264", "-c:a", "aac", "-shortest", str(path)],
+        check=True, capture_output=True)
+    return path
+
+
+def test_send_streamable_net_seam(tmp: Path) -> None:
+    section("Seam 20: send-time streamable net (non-streamable video → mp4)")
+    if not _ffmpeg_present():
+        ok(True, "ffmpeg/ffprobe absent — net seam skipped (toolchain missing)")
+        return
+    from dispatcher.send import TelethonSendStrategy
+
+    strategy = TelethonSendStrategy(
+        api_id=0, api_hash="", phone="", session_name="stub")
+
+    class _CaptureClient:
+        """Records exactly what path the strategy hands to Telegram."""
+        def __init__(self):
+            self.files: list[str] = []
+        async def send_file(self, peer, file, **kw):
+            self.files.append(str(file))
+        async def disconnect(self): ...
+        async def connect(self): ...
+
+    # (a) a non-streamable .flv → Telegram receives a CONVERTED .mp4.
+    flv = _make_video(tmp / "u" / "clip.flv", container="flv")
+    cap = _CaptureClient()
+    strategy._client = cap                      # bypass __aenter__: no network
+    res = asyncio.run(strategy.send(peer="p", file_path=str(flv), caption="c"))
+    ok(res.ok, "non-streamable .flv send succeeded")
+    ok(len(cap.files) == 1 and cap.files[0].endswith(".mp4"),
+       "dispatcher converted .flv → streamable .mp4 before the Telegram send")
+    ok(cap.files[0] != str(flv),
+       "the raw container is NOT what went over the wire")
+    ok(flv.exists() and flv.suffix == ".flv",
+       "the on-disk original recording is left untouched (never lose bytes)")
+    ok(not list((tmp / "u").glob("*.tgprep.mp4")),
+       "the converted temp was cleaned up after the send")
+
+    # (b) an already-streamable .mp4 → passthrough: sent untouched, no temp.
+    mp4 = _make_video(tmp / "u" / "ok.mp4", container="mp4")
+    cap2 = _CaptureClient()
+    strategy._client = cap2
+    res2 = asyncio.run(strategy.send(peer="p", file_path=str(mp4), caption="c"))
+    ok(res2.ok and cap2.files == [str(mp4)],
+       "already-streamable .mp4 is sent as-is (no needless re-encode)")
+    ok(not list((tmp / "u").glob("*.tgprep.mp4")),
+       "no temp artifact produced for a passthrough send")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
     print("cross-worker seam integration tests")
@@ -722,6 +1191,8 @@ def main() -> int:
         tmp = Path(d)
         test_lock_seam(tmp / "s1")
         test_producer_table_seam(tmp / "s2")
+        test_local_platform_discovery_seam(tmp / "s13")
+        test_dispatcher_instance_lock_seam(tmp / "s14")
         test_album_batching_seam(tmp / "s3")
         test_content_hash_dedup_seam(tmp / "s4")
         test_min_batch_gate_seam(tmp / "s5")
@@ -737,6 +1208,13 @@ def main() -> int:
         _reset_config()
         test_full_history_gate_seam()
         test_full_drain_seam(tmp / "s10")
+        _reset_config()
+        test_in_batch_dedup_integrity_seam(tmp / "s15")
+        test_lock_cwd_independence_seam(tmp / "s16")
+        test_recorder_enqueue_ingest_seam(tmp / "s17")
+        test_send_stall_watchdog_seam()
+        test_upload_progress_seam(tmp / "s19")
+        test_send_streamable_net_seam(tmp / "s20")
 
     print(f"\nALL PASS ({_checks} checks)")
     return 0
