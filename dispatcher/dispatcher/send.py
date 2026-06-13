@@ -281,6 +281,15 @@ class TelethonSendStrategy(SendStrategy):
         # Both probes shell out to ffprobe/ffmpeg (seconds, worst-case tens) —
         # off the event loop so signal handling and FloodWait timers stay live.
         attributes = await asyncio.to_thread(_video_attributes, send_path)
+        if prepped is not None:
+            # Telethon names the upload after the file on disk, which for a
+            # converted send is the internal "<stem>.tgprep.mp4" temp. Override
+            # with a clean name derived from the ORIGINAL recording (always .mp4
+            # — the bytes are now mp4) so Telegram never shows the .tgprep tag.
+            # A user-supplied DocumentAttributeFilename wins in get_attributes().
+            clean_name = Path(file_path).stem + ".mp4"
+            attributes = (attributes or []) + [
+                tg_types.DocumentAttributeFilename(clean_name)]
         # Explicit poster frame so Telegram doesn't auto-grab a black/white
         # fade-in frame as the inline preview. None → not a video / probe
         # failed; Telethon falls back to server-side generation (status quo).

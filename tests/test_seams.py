@@ -1142,12 +1142,22 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
     strategy = TelethonSendStrategy(
         api_id=0, api_hash="", phone="", session_name="stub")
 
+    from telethon.tl import types as tg_types
+
+    def _sent_filename(kw) -> str | None:
+        for a in (kw.get("attributes") or []):
+            if isinstance(a, tg_types.DocumentAttributeFilename):
+                return a.file_name
+        return None
+
     class _CaptureClient:
-        """Records exactly what path the strategy hands to Telegram."""
+        """Records what path + filename attribute the strategy hands to Telegram."""
         def __init__(self):
             self.files: list[str] = []
+            self.names: list[str | None] = []
         async def send_file(self, peer, file, **kw):
             self.files.append(str(file))
+            self.names.append(_sent_filename(kw))
         async def disconnect(self): ...
         async def connect(self): ...
 
@@ -1161,6 +1171,8 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
        "dispatcher converted .flv → streamable .mp4 before the Telegram send")
     ok(cap.files[0] != str(flv),
        "the raw container is NOT what went over the wire")
+    ok(cap.names[0] == "clip.mp4",
+       "upload filename is the clean original stem + .mp4 (no .tgprep tag)")
     ok(flv.exists() and flv.suffix == ".flv",
        "the on-disk original recording is left untouched (never lose bytes)")
     ok(not list((tmp / "u").glob("*.tgprep.mp4")),
