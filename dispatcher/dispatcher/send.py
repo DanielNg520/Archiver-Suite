@@ -130,6 +130,7 @@ class SendStrategy(abc.ABC):
         peer: Any,
         file_path: str,
         caption: str | None,
+        ensure_streamable: bool = True,
     ) -> SendResult: ...
 
     @abc.abstractmethod
@@ -248,9 +249,17 @@ class TelethonSendStrategy(SendStrategy):
         peer: Any,
         file_path: str,
         caption: str | None,
+        ensure_streamable: bool = True,
     ) -> SendResult:
         """
         Single-file send with FloodWait + exponential-backoff retry.
+
+        ensure_streamable gates the send-time conversion net. It is the safety
+        net for producers that DON'T prep at ingest (the recorder, whose remux
+        is fail-soft). Items from sources that already ran media_prep.prepare()
+        at ingest pass ensure_streamable=False, so an intentionally non-streamable
+        file — e.g. a .mkv kept as a full-quality document alongside its .mp4
+        preview — ships as-is instead of being re-converted here.
 
         Returns SendResult; never raises (caller logic is simpler if it
         can branch on .ok / .flood_wait_s instead of try/except).
@@ -275,7 +284,10 @@ class TelethonSendStrategy(SendStrategy):
         # temp .mp4 and send THAT; None → already streamable / not a video /
         # conversion failed → send the original unchanged. Off the event loop:
         # ffmpeg can take seconds to minutes.
-        prepped = await asyncio.to_thread(media_prep.streamable_temp, Path(file_path))
+        prepped = None
+        if ensure_streamable:
+            prepped = await asyncio.to_thread(
+                media_prep.streamable_temp, Path(file_path))
         send_path = str(prepped) if prepped is not None else file_path
 
         # Both probes shell out to ffprobe/ffmpeg (seconds, worst-case tens) —

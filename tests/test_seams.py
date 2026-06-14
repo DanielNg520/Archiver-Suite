@@ -612,10 +612,12 @@ class _FakeSend:
     def __init__(self):
         self.sent_singles: list[str] = []
         self.sent_albums: list[list[str]] = []
+        self.sent_ensure_streamable: list[bool] = []
 
-    async def send(self, *, peer, file_path, caption):
+    async def send(self, *, peer, file_path, caption, ensure_streamable=True):
         from dispatcher.send import SendResult
         self.sent_singles.append(file_path)
+        self.sent_ensure_streamable.append(ensure_streamable)
         return SendResult(ok=True)
 
     async def send_album(self, *, peer, file_paths, caption):
@@ -656,6 +658,14 @@ def test_full_drain_seam(tmp: Path) -> None:
                     identifier="rec_bo_1", file_path=str(rec), priority=5,
                     content_hash=full_hash(rec))
 
+        # An orphaned single (already prepped at ingest). It must send with the
+        # streamable net DISABLED — proves source-keyed net gating end-to-end.
+        orph = _write_media(tmp / "orph" / "o1.mp4", b"ORPH")
+        db.add_item(source="orphaned", platform="orphaned", username="-100999",
+                    identifier="orph_o1", file_path=str(orph), priority=6,
+                    caption="o1.mp4", chat_id="-100999",
+                    content_hash=full_hash(orph))
+
         # A byte-duplicate of p1 that must be SUPPRESSED + its copy deleted.
         dup = _write_media(tmp / "x" / "al" / "p1_dup.jpg", b"P1")
         db.add_item(source="archiver", platform="x", username="al",
@@ -692,13 +702,21 @@ def test_full_drain_seam(tmp: Path) -> None:
 
         counts = store.counts_by_status()
         ok(counts.get("pending", 0) == 0, "drain emptied the pending queue")
-        ok(counts.get("sent", 0) == 4,
-           "all 4 rows terminal as 'sent' (2 album + 1 single + 1 dedup-suppressed)")
+        ok(counts.get("sent", 0) == 5,
+           "all 5 rows terminal as 'sent' (2 album + 2 single + 1 dedup-suppressed)")
         ok(fake.sent_albums and sorted(Path(p).name for p in fake.sent_albums[0])
            == ["p1.jpg", "p2.jpg"],
            "the two photos went up as ONE album (homogeneous batch)")
-        ok([Path(p).name for p in fake.sent_singles] == ["bo_1.mp4"],
-           "the recorder file sent as a single (recorder never albums)")
+        ok(sorted(Path(p).name for p in fake.sent_singles) == ["bo_1.mp4", "o1.mp4"],
+           "recorder + orphaned files each sent as singles (never albumed)")
+        # Source-keyed streamable-net gating: the recorder (fail-soft producer)
+        # asks for the net; the orphaned row (prepped at ingest) opts out.
+        net = dict(zip((Path(p).name for p in fake.sent_singles),
+                       fake.sent_ensure_streamable))
+        ok(net.get("bo_1.mp4") is True,
+           "recorder single requests the send-time streamable net")
+        ok(net.get("o1.mp4") is False,
+           "orphaned single (already prepped at ingest) opts out of the net")
         ok(not p1.exists() and not p2.exists() and not rec.exists(),
            "delete-after-upload removed the originals post-send")
         ok(not dup.exists(),
@@ -814,9 +832,10 @@ class _FlakySend(_FakeSend):
             return SendResult(ok=False, error="simulated network failure")
         return None
 
-    async def send(self, *, peer, file_path, caption):
+    async def send(self, *, peer, file_path, caption, ensure_streamable=True):
         return self._maybe_fail() or await super().send(
-            peer=peer, file_path=file_path, caption=caption)
+            peer=peer, file_path=file_path, caption=caption,
+            ensure_streamable=ensure_streamable)
 
     async def send_album(self, *, peer, file_paths, caption):
         return self._maybe_fail() or await super().send_album(
@@ -1175,7 +1194,7 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
        "upload filename is the clean original stem + .mp4 (no .tgprep tag)")
     ok(flv.exists() and flv.suffix == ".flv",
        "the on-disk original recording is left untouched (never lose bytes)")
-    ok(not list((tmp / "u").glob("*.tgprep.mp4")),
+    ok(not (tmp / "u" / "clip.mp4").exists(),
        "the converted temp was cleaned up after the send")
 
     # (b) an already-streamable .mp4 → passthrough: sent untouched, no temp.
@@ -1185,8 +1204,20 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
     res2 = asyncio.run(strategy.send(peer="p", file_path=str(mp4), caption="c"))
     ok(res2.ok and cap2.files == [str(mp4)],
        "already-streamable .mp4 is sent as-is (no needless re-encode)")
-    ok(not list((tmp / "u").glob("*.tgprep.mp4")),
-       "no temp artifact produced for a passthrough send")
+    ok(sorted(p.name for p in (tmp / "u").iterdir()) == ["clip.flv", "ok.mp4"],
+       "no temp artifacts left behind by either send")
+
+    # (c) ensure_streamable=False (a source that prepped at ingest, e.g. an
+    # orphaned .mkv kept as a document) → the net is skipped, raw bytes ship.
+    mkv = _make_video(tmp / "u" / "keep.mkv", container="matroska")
+    cap3 = _CaptureClient()
+    strategy._client = cap3
+    res3 = asyncio.run(strategy.send(
+        peer="p", file_path=str(mkv), caption="c", ensure_streamable=False))
+    ok(res3.ok and cap3.files == [str(mkv)],
+       "ensure_streamable=False ships the original .mkv as-is (no conversion)")
+    ok(not (tmp / "u" / "keep.mp4").exists(),
+       "no conversion temp created when the net is skipped")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

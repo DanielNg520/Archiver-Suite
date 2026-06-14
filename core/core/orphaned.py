@@ -71,6 +71,14 @@ ORPHANED_PLATFORM = "orphaned"
 # items to 10, so chat_id-folder uploads sit directly between them.
 CHAT_ID_PRIORITY = 6
 
+# Containers whose ORIGINAL we upload alongside the streamable conversion rather
+# than deleting it: the user wants the full-quality source archived in Telegram
+# AND a previewable .mp4. The kept original is sent as an individual document
+# (never albumed with its own preview) and the dispatcher skips its streamable
+# net for source='orphaned', so the bytes go up as-is. .mkv is the one case
+# today; the set is the single knob if more are ever wanted.
+KEEP_ORIGINAL_EXTS = {".mkv"}
+
 
 @dataclass
 class OrphanedReport:
@@ -278,6 +286,36 @@ def ingest_folder(
             elif key in quarantine:
                 del quarantine[key]
                 q_dirty = True
+            continue
+
+        # KEEP-ORIGINAL: for configured containers (.mkv) upload the source as a
+        # full-quality document IN ADDITION to its streamable conversion, instead
+        # of deleting it. Registered individually (group_key=NULL) so it never
+        # albums with its own converted preview — both are the 'video' bucket.
+        # The dispatcher skips the streamable net for source='orphaned', so the
+        # original ships as-is rather than being re-converted at send.
+        if f.suffix.lower() in KEEP_ORIGINAL_EXTS:
+            try:
+                res = register_file(
+                    store, f,
+                    source    = ORPHANED_SOURCE,
+                    platform  = ORPHANED_PLATFORM,
+                    username  = chat_id,
+                    chat_id   = chat_id,
+                    group_key = None,
+                    caption   = f.name,
+                    priority  = priority,
+                )
+                setattr(rep, _OUTCOME_TALLY[res.outcome],
+                        getattr(rep, _OUTCOME_TALLY[res.outcome]) + 1)
+            except Exception as e:           # pragma: no cover — defensive
+                rep.errors.append(f"{f.name}: keep-original {e}")
+                log.exception("orphaned: register_file (keep-original) on %s", f)
+            # Never delete a kept original; memoize (mtime-keyed) so the next
+            # sweep skips it even if its row was dedup-collapsed onto a twin.
+            if mtime is not None:
+                prepped[key] = mtime
+                p_dirty = True
             continue
 
         # Transformed: the original has been replaced by its output(s). Only

@@ -204,22 +204,30 @@ def test_ingest_folder(tmp: Path) -> None:
     store = ItemStore.open(str(tmp / "t.db"))
     rep = ingest_folder(store, folder, chat_id=chat_id, guard=None)
 
+    # mkv is KEPT (uploaded as a document) AND converted, so it yields TWO rows
+    # on top of loose.mp4: clip.mp4 (streamable preview) + clip.mkv (original).
     check(rep.scanned == 2, f"scanned both files (got {rep.scanned})")
-    check(rep.inserted == 2, f"inserted 2 rows (got {rep.inserted})")
+    check(rep.inserted == 3, f"inserted 3 rows (got {rep.inserted})")
     rows = {Path(r.file_path).name: r for r in rows_for(store, chat_id)}
-    check(len(rows) == 2, "two pending rows present")
+    check(len(rows) == 3, "three pending rows present (loose + mp4 + kept mkv)")
     check(all(r.priority == CHAT_ID_PRIORITY for r in rows.values()),
           "default ingest priority is second only to live recordings")
 
-    # The mkv was replaced on disk by a streamable .mp4 and the original is gone.
-    check(not (folder / "album" / "clip.mkv").exists(),
-          "incompatible original (.mkv) deleted after prep")
-    check((folder / "album" / "clip.tgprep.mp4").exists(),
-          "converted .mp4 sits beside where the .mkv was")
-    conv = rows.get("clip.tgprep.mp4")
+    # The mkv is KEPT on disk and the converted .mp4 sits beside it with a CLEAN
+    # name (no internal .tgprep tag — that is what Telegram names the upload).
+    check((folder / "album" / "clip.mkv").exists(),
+          "kept original .mkv stays on disk for the full-quality upload")
+    check((folder / "album" / "clip.mp4").exists()
+          and not (folder / "album" / "clip.tgprep.mp4").exists(),
+          "converted file is the clean clip.mp4 (no .tgprep tag)")
+    conv = rows.get("clip.mp4")
     check(conv is not None and conv.group_key == f"{chat_id}/album"
           and conv.caption is None,
-          "converted file keeps subfolder album routing")
+          "converted preview keeps subfolder album routing")
+    kept = rows.get("clip.mkv")
+    check(kept is not None and kept.group_key is None
+          and kept.caption == "clip.mkv",
+          "kept original sends individually (never albums with its own preview)")
     loose = rows.get("loose.mp4")
     check(loose is not None and loose.group_key is None
           and loose.caption == "loose.mp4",
@@ -228,7 +236,7 @@ def test_ingest_folder(tmp: Path) -> None:
     # Idempotency: a second sweep enqueues nothing new and adds no rows.
     rep2 = ingest_folder(store, folder, chat_id=chat_id, guard=None)
     check(rep2.inserted == 0, "second sweep inserts nothing (idempotent)")
-    check(len(rows_for(store, chat_id)) == 2, "still exactly two rows")
+    check(len(rows_for(store, chat_id)) == 3, "still exactly three rows")
     store.close()
 
 
@@ -237,17 +245,19 @@ def test_delete_after_split_off(tmp: Path) -> None:
     chat_id = "100200301"
     folder = tmp / chat_id
     folder.mkdir(parents=True)
-    make_video(folder / "keep.mkv", seconds=2, vcodec="libx264", acodec="aac")
+    # A .ts (convertible, NOT a keep-original container) so this exercises the
+    # delete-after-split policy path rather than the .mkv keep-original branch.
+    make_video(folder / "keep.ts", seconds=2, vcodec="libx264", acodec="aac")
 
     store = ItemStore.open(str(tmp / "k.db"))
     os.environ["ARCHIVER_DELETE_AFTER_SPLIT"] = "0"
     try:
         rep = ingest_folder(store, folder, chat_id=chat_id, guard=None)
         check(rep.inserted == 1, "converted file enqueued")
-        check((folder / "keep.mkv").exists(),
+        check((folder / "keep.ts").exists(),
               "original KEPT when delete-after-split=0")
         memo = store.meta_get(_PREPPED_META_KEY)
-        check(memo and "keep.mkv" in memo,
+        check(memo and "keep.ts" in memo,
               "kept original is memoized so it won't be reprocessed")
         # Second sweep must NOT re-convert (memo hit) → no new rows.
         rep2 = ingest_folder(store, folder, chat_id=chat_id, guard=None)

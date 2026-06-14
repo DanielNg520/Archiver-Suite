@@ -38,6 +38,14 @@ from .send import SendStrategy
 
 log = logging.getLogger(__name__)
 
+# Producers whose videos are already run through media_prep.prepare() at INGEST
+# (archiver reconcile, orphaned chat_id folders). The dispatcher's send-time
+# streamable net is the backstop for producers that DON'T prep — chiefly the
+# recorder, whose remux is fail-soft. So for these sources a non-streamable file
+# reaching the queue is intentional (e.g. an .mkv kept as a full-quality document
+# beside its .mp4 preview) and must ship as-is, not be re-converted at send.
+_PREPPED_AT_INGEST_SOURCES = {"archiver", ORPHANED_SOURCE}
+
 # How often the drain loop re-runs its housekeeping pair: failed-row retention
 # GC and the stuck-'sending' watchdog. The retention WINDOW is
 # config.failed_retention_days and the stuck threshold config.stuck_claim_min;
@@ -284,6 +292,7 @@ async def drain_forever(
                      it.platform, it.file_path, it.attempts)
             result = await send_strategy.send(
                 peer=peer, file_path=it.file_path, caption=caption_for(it),
+                ensure_streamable=it.source not in _PREPPED_AT_INGEST_SOURCES,
             )
         else:
             # album send (homogeneous photo/video batch, all same producer)

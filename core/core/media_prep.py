@@ -248,9 +248,15 @@ def _convert(src: Path, p: _Probe) -> Path | None:
     """Produce a streamable mp4 next to `src`. Lossless remux when the codecs
     already pass; otherwise a visually-lossless libx264/aac re-encode. Returns
     the output path, or None on failure (output cleaned up)."""
-    dst = src.with_name(f"{src.stem}{_PREP_TAG}.mp4")
-    # Don't collide with the source if it is itself an .mp4 (incompatible codec
-    # in an mp4 container): the _PREP_TAG suffix already prevents that.
+    # Prefer a clean "<stem>.mp4" so the UPLOADED filename carries no internal
+    # marker — the output path is what every send path names the Telegram file
+    # after. Fall back to the "<stem>.tgprep.mp4" tag only when the clean name
+    # would clobber bytes we don't own: the source itself (an incompatible-codec
+    # .mp4) or a pre-existing sibling. The tag stays a defensive last resort, not
+    # the default, so it never reaches Telegram in the common case.
+    clean = src.with_name(f"{src.stem}.mp4")
+    dst = (clean if clean != src and not clean.exists()
+           else src.with_name(f"{src.stem}{_PREP_TAG}.mp4"))
     if _codecs_copyable(p):
         ok = _run_ffmpeg(
             ["ffmpeg", "-y", "-v", "error", "-i", str(src),
