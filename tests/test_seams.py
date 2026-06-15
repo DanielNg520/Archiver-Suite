@@ -1237,6 +1237,93 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Seam 21 — keep-original documents end-to-end: orphaned.ingest_folder (core)
+# → claim_batch grouping → the full drain → fake send. Proves the cross-worker
+# contract for a mixed folder: a non-streamable original ships as its OWN single
+# (so send() documents it) while its converted preview albums with the sibling
+# streamable videos, and an excluded .flv contributes only its converted copy.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_keep_original_document_seam(tmp: Path) -> None:
+    section("Seam 21: keep-original documents (ingest → drain → send)")
+    if not _ffmpeg_present():
+        ok(True, "ffmpeg/ffprobe absent — keep-original seam skipped")
+        return
+    from core import (ItemStore, PolicyStore, DeletePolicy,
+                      RecorderDeletePolicy, BatchPolicy, DeletionGuard)
+    from core.orphaned import ingest_folder
+    from dispatcher.drain import drain_forever
+    from dispatcher.config import DispatcherConfig
+    from dispatcher.tg_router import TelegramRouter
+
+    chat_id = "-100555"
+    folder = tmp / chat_id
+    album = folder / "album"
+    album.mkdir(parents=True)
+    # A subfolder so the streamable copies album together. Three sources:
+    #   keep.mkv  — non-streamable → converted (album) + kept as a DOCUMENT
+    #   plain.mp4 — already streamable → album as-is
+    #   raw.flv   — non-streamable but EXCLUDED → only its converted copy ships
+    _make_video(album / "keep.mkv", container="matroska")
+    _make_video(album / "plain.mp4", container="mp4")
+    _make_video(album / "raw.flv", container="flv")
+
+    db_file = str(tmp / "seam21.db")
+    store = ItemStore.open(db_file)
+    rep = ingest_folder(store, folder, chat_id=chat_id, guard=None)
+    ok(rep.inserted == 4,
+       "4 rows: keep.mp4 + plain.mp4 + raw.mp4 (album) + keep.mkv (document)")
+    ok((album / "keep.mkv").exists() and not (album / "raw.flv").exists(),
+       "kept .mkv stays on disk; excluded .flv original is deleted")
+    store.close()
+
+    ps = PolicyStore()
+    ps.set("delete_after_upload", False)        # keep originals; we assert sends
+    ps.set(BatchPolicy.SIZE_KEY, 1)             # don't defer the small album
+    cfg = DispatcherConfig(
+        telegram=None, default_chat_id=chat_id, db_path=db_file,
+        policy_store=ps, poll_interval_s=0.01, max_retries=3,
+        inter_album_sleep=0.0, stuck_claim_min=10, failed_retention_days=0,
+    )
+    store = ItemStore.open(db_file)
+    fake = _FakeSend()
+    router = TelegramRouter(default_chat_id=chat_id)
+    stop = asyncio.Event()
+
+    async def _run():
+        task = asyncio.create_task(drain_forever(
+            cfg, store, fake, router,
+            DeletePolicy(ps), RecorderDeletePolicy(ps), BatchPolicy(ps),
+            DeletionGuard(ps), stop_event=stop,
+        ))
+        for _ in range(400):
+            await asyncio.sleep(0.01)
+            c = store.counts_by_status()
+            if c.get("pending", 0) == 0 and c.get("sending", 0) == 0:
+                break
+        stop.set()
+        await task
+
+    asyncio.run(_run())
+
+    # The converted previews (keep/plain/raw → .mp4) went up as ONE album.
+    album_names = sorted(Path(p).name for p in fake.sent_albums[0]) \
+        if fake.sent_albums else []
+    ok(album_names == ["keep.mp4", "plain.mp4", "raw.mp4"],
+       "the three streamable copies ship as one album (converted + native)")
+    # The kept .mkv shipped as its OWN single with the streamable net DISABLED,
+    # so send() takes the force_document branch — never albumed with its preview.
+    singles = {Path(p).name: net for p, net in
+               zip(fake.sent_singles, fake.sent_ensure_streamable)}
+    ok(singles == {"keep.mkv": False},
+       "only the kept .mkv sent as a single, net off (→ document at send)")
+    ok(all("raw.flv" != Path(p).name for p in
+            fake.sent_singles + [f for a in fake.sent_albums for f in a]),
+       "the excluded .flv original is never sent (convert-only)")
+    store.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
     print("cross-worker seam integration tests")
@@ -1274,6 +1361,7 @@ def main() -> int:
         test_send_stall_watchdog_seam()
         test_upload_progress_seam(tmp / "s19")
         test_send_streamable_net_seam(tmp / "s20")
+        test_keep_original_document_seam(tmp / "s21")
 
     print(f"\nALL PASS ({_checks} checks)")
     return 0
