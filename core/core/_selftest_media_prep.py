@@ -241,21 +241,29 @@ def test_ingest_folder(tmp: Path) -> None:
 
 
 def test_delete_after_split_off(tmp: Path) -> None:
-    print("\n── delete-after-split=0 keeps original + memoizes ──")
+    print("\n── non-streamable original kept as a document + memoized ──")
     chat_id = "100200301"
     folder = tmp / chat_id
     folder.mkdir(parents=True)
-    # A .ts (convertible, NOT a keep-original container) so this exercises the
-    # delete-after-split policy path rather than the .mkv keep-original branch.
+    # A .ts is non-streamable, so it is converted for the album AND its original
+    # is kept and uploaded as a full-quality document — regardless of the
+    # delete-after-split policy, which now governs only true oversize splits.
     make_video(folder / "keep.ts", seconds=2, vcodec="libx264", acodec="aac")
 
     store = ItemStore.open(str(tmp / "k.db"))
-    os.environ["ARCHIVER_DELETE_AFTER_SPLIT"] = "0"
+    # delete-after-split ON (the default) must NOT delete a converted original.
+    os.environ["ARCHIVER_DELETE_AFTER_SPLIT"] = "1"
     try:
         rep = ingest_folder(store, folder, chat_id=chat_id, guard=None)
-        check(rep.inserted == 1, "converted file enqueued")
+        check(rep.inserted == 2,
+              "two rows: converted .mp4 preview + kept .ts document")
         check((folder / "keep.ts").exists(),
-              "original KEPT when delete-after-split=0")
+              "non-streamable original KEPT on disk for the document upload")
+        rows = {Path(r.file_path).name: r for r in rows_for(store, chat_id)}
+        doc = rows.get("keep.ts")
+        check(doc is not None and doc.group_key is None
+              and doc.caption == "keep.ts",
+              "kept .ts is an individual document (never albums with its preview)")
         memo = store.meta_get(_PREPPED_META_KEY)
         check(memo and "keep.ts" in memo,
               "kept original is memoized so it won't be reprocessed")

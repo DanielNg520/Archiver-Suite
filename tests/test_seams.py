@@ -1174,9 +1174,11 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
         def __init__(self):
             self.files: list[str] = []
             self.names: list[str | None] = []
+            self.docs: list[bool] = []
         async def send_file(self, peer, file, **kw):
             self.files.append(str(file))
             self.names.append(_sent_filename(kw))
+            self.docs.append(bool(kw.get("force_document")))
         async def disconnect(self): ...
         async def connect(self): ...
 
@@ -1218,6 +1220,20 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
        "ensure_streamable=False ships the original .mkv as-is (no conversion)")
     ok(not (tmp / "u" / "keep.mp4").exists(),
        "no conversion temp created when the net is skipped")
+    ok(cap3.docs == [True],
+       "the non-streamable kept .mkv is sent as a DOCUMENT, not a 2nd video "
+       "(otherwise Telegram shows the recording twice)")
+
+    # (d) ensure_streamable=False on an ALREADY-streamable .mp4 (the common
+    # prepped-at-ingest case) keeps the normal streaming-video path — only
+    # non-streamable kept originals become documents.
+    mp4b = _make_video(tmp / "u" / "ingested.mp4", container="mp4")
+    cap4 = _CaptureClient()
+    strategy._client = cap4
+    res4 = asyncio.run(strategy.send(
+        peer="p", file_path=str(mp4b), caption="c", ensure_streamable=False))
+    ok(res4.ok and cap4.docs == [False],
+       "a streamable as-is .mp4 still ships as a normal video, not a document")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

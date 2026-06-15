@@ -134,12 +134,18 @@ class PrepResult:
     transformed — True when the original was replaced (caller deletes it).
     individual  — True when each output must be its own message (split parts),
                   False when normal subfolder→album grouping applies.
+    converted   — True when a FORMAT conversion happened (the original was
+                  non-streamable). Distinct from a pure oversize split: it tells
+                  the caller the original is a full-quality non-streamable source
+                  worth keeping and uploading as a document alongside the
+                  streamable copy. False for passthroughs and split-only outputs.
     ok / error  — ok=False means "could not prepare safely"; the original is
                   left on disk and outputs is empty. Caller quarantines.
     """
     outputs:     list[Path]
     transformed: bool       = False
     individual:  bool       = False
+    converted:   bool       = False
     ok:          bool       = True
     error:       str | None = None
     temps:       list[Path] = field(default_factory=list)  # intermediates to clean
@@ -323,6 +329,19 @@ def streamable_temp(path: Path) -> Path | None:
     if p is None or _is_streamable(p):
         return None
     return _convert(path, p)
+
+
+def is_nonstreamable_video(path: Path) -> bool:
+    """True when `path` is a readable video Telegram CAN'T stream inline (wrong
+    container/codec). Used by producers that deliberately ship a non-streamable
+    file as-is (a .mkv kept as a full-quality document alongside its .mp4
+    preview): such a file should go up as a downloadable DOCUMENT, not as a
+    half-broken streaming video that just duplicates its own preview.
+
+    False for non-videos (images/audio/probe failure) and already-streamable
+    videos — those keep the normal streaming-video send path."""
+    p = _probe(path)
+    return p is not None and not _is_streamable(p)
 
 
 # ── Split (AutoSplitter) ──────────────────────────────────────────────────────
@@ -523,11 +542,13 @@ def prepare(path: Path) -> PrepResult:
             return PrepResult.failed(f"split failed: {path.name}")
         if converted is not None:
             _unlink(converted)                     # intermediate consumed by split
-        return PrepResult(outputs=parts, transformed=True, individual=True)
+        return PrepResult(outputs=parts, transformed=True, individual=True,
+                          converted=converted is not None)
 
     # Converted but within size → single streamable output.
     assert converted is not None
-    return PrepResult(outputs=[converted], transformed=True, individual=False)
+    return PrepResult(outputs=[converted], transformed=True, individual=False,
+                      converted=True)
 
 
 def _unlink(path: Path | None) -> None:

@@ -71,13 +71,15 @@ ORPHANED_PLATFORM = "orphaned"
 # items to 10, so chat_id-folder uploads sit directly between them.
 CHAT_ID_PRIORITY = 6
 
-# Containers whose ORIGINAL we upload alongside the streamable conversion rather
-# than deleting it: the user wants the full-quality source archived in Telegram
-# AND a previewable .mp4. The kept original is sent as an individual document
-# (never albumed with its own preview) and the dispatcher skips its streamable
-# net for source='orphaned', so the bytes go up as-is. .mkv is the one case
-# today; the set is the single knob if more are ever wanted.
-KEEP_ORIGINAL_EXTS = {".mkv"}
+# Any NON-STREAMABLE video original (its container/codec won't play inline) is
+# uploaded alongside its streamable conversion rather than being deleted: the
+# user wants the full-quality source archived in Telegram AND a previewable
+# .mp4 in the folder's album. The kept original is sent as an individual
+# document (never albumed with its own preview); the dispatcher skips its
+# streamable net for source='orphaned', so the bytes go up as-is. The signal is
+# prep.converted (a format conversion happened), not the extension — see
+# ingest_folder; media_prep.is_nonstreamable_video makes the matching send-side
+# call.
 
 
 @dataclass
@@ -252,6 +254,35 @@ def ingest_folder(
             rep.errors.append(f"{f.name}: {prep.error}")
             continue
 
+        # KEEP-ORIGINAL: a NON-STREAMABLE source (its container/codec won't play
+        # inline) is converted for the album AND uploaded as its own full-quality
+        # downloadable document. Register the document FIRST and individually
+        # (group_key=NULL): a 'single' send waits for no min-batch, so it goes out
+        # BEFORE its converted copy is batched with the folder's already-
+        # streamable videos. The dispatcher skips the streamable net for
+        # source='orphaned' and ships the non-streamable bytes as a document
+        # (send: is_nonstreamable_video). Pure oversize splits (streamable but too
+        # big) are NOT kept here — prep.converted is False — and fall through to
+        # the delete-after-split policy below.
+        keep_original_as_doc = prep.converted
+        if keep_original_as_doc:
+            try:
+                res = register_file(
+                    store, f,
+                    source    = ORPHANED_SOURCE,
+                    platform  = ORPHANED_PLATFORM,
+                    username  = chat_id,
+                    chat_id   = chat_id,
+                    group_key = None,
+                    caption   = f.name,
+                    priority  = priority,
+                )
+                setattr(rep, _OUTCOME_TALLY[res.outcome],
+                        getattr(rep, _OUTCOME_TALLY[res.outcome]) + 1)
+            except Exception as e:           # pragma: no cover — defensive
+                rep.errors.append(f"{f.name}: keep-original {e}")
+                log.exception("orphaned: register_file (keep-original) on %s", f)
+
         # Register every output. For split parts each is its own message; for a
         # passthrough or single conversion the file's location decides grouping.
         outcomes: list[IngestOutcome] = []
@@ -288,31 +319,10 @@ def ingest_folder(
                 q_dirty = True
             continue
 
-        # KEEP-ORIGINAL: for configured containers (.mkv) upload the source as a
-        # full-quality document IN ADDITION to its streamable conversion, instead
-        # of deleting it. Registered individually (group_key=NULL) so it never
-        # albums with its own converted preview — both are the 'video' bucket.
-        # The dispatcher skips the streamable net for source='orphaned', so the
-        # original ships as-is rather than being re-converted at send.
-        if f.suffix.lower() in KEEP_ORIGINAL_EXTS:
-            try:
-                res = register_file(
-                    store, f,
-                    source    = ORPHANED_SOURCE,
-                    platform  = ORPHANED_PLATFORM,
-                    username  = chat_id,
-                    chat_id   = chat_id,
-                    group_key = None,
-                    caption   = f.name,
-                    priority  = priority,
-                )
-                setattr(rep, _OUTCOME_TALLY[res.outcome],
-                        getattr(rep, _OUTCOME_TALLY[res.outcome]) + 1)
-            except Exception as e:           # pragma: no cover — defensive
-                rep.errors.append(f"{f.name}: keep-original {e}")
-                log.exception("orphaned: register_file (keep-original) on %s", f)
-            # Never delete a kept original; memoize (mtime-keyed) so the next
-            # sweep skips it even if its row was dedup-collapsed onto a twin.
+        # A kept non-streamable original (registered as a document above) is the
+        # archive copy — never delete it at ingest; memoize (mtime-keyed) so the
+        # next sweep skips it even if its row was dedup-collapsed onto a twin.
+        if keep_original_as_doc:
             if mtime is not None:
                 prepped[key] = mtime
                 p_dirty = True

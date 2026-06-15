@@ -285,10 +285,37 @@ class TelethonSendStrategy(SendStrategy):
         # conversion failed → send the original unchanged. Off the event loop:
         # ffmpeg can take seconds to minutes.
         prepped = None
+        as_document = False
         if ensure_streamable:
             prepped = await asyncio.to_thread(
                 media_prep.streamable_temp, Path(file_path))
+        else:
+            # Shipping as-is (producer prepped at ingest). If this is a video
+            # Telegram can't stream inline, it's a deliberately-kept full-quality
+            # original — chiefly a .mkv kept alongside its .mp4 preview. Send it
+            # as a downloadable DOCUMENT, not as a streaming video: otherwise
+            # Telegram renders the .mkv as a second playable video and the chat
+            # shows the same recording twice instead of one preview + one
+            # archival download.
+            as_document = await asyncio.to_thread(
+                media_prep.is_nonstreamable_video, Path(file_path))
         send_path = str(prepped) if prepped is not None else file_path
+
+        if as_document:
+            # A pure document send: no video attributes, no poster thumb, no
+            # streaming flag. Telegram stores the bytes verbatim for download.
+            try:
+                async def _do_doc():
+                    await self._client.send_file(
+                        peer, send_path, caption=caption, force_document=True,
+                        progress_callback=self._progress_cb(file_path),
+                    )
+                return await self._send_with_retries(
+                    _do_doc, what=f"{Path(file_path).name} (document)",
+                    payload_bytes=self._payload_bytes([send_path]),
+                )
+            finally:
+                self._progress_done()
 
         # Both probes shell out to ffprobe/ffmpeg (seconds, worst-case tens) —
         # off the event loop so signal handling and FloodWait timers stay live.
