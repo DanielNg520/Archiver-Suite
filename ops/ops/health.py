@@ -337,18 +337,25 @@ def queue_health() -> dict | None:
 def archive_volume_path() -> str | None:
     """A path ON the archive volume, so disk-free is measured where the files
     actually live (often an external drive) instead of on /. Derived from the
-    most recent item's file_path — ops deliberately reads no worker config."""
+    file_path of recent items — ops deliberately reads no worker config.
+
+    Walk back through recent rows rather than trusting the single newest one:
+    recordings stage under records/<user>/ and that dir is cleaned up after
+    the converted upload, so the newest row often points at a vanished path.
+    Skip those and land on the first parent that still exists."""
     conn = _connect_ro(SUITE_DB)
     if conn is None:
         return None
     try:
-        row = conn.execute(
-            "SELECT file_path FROM items ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        if not row:
-            return None
-        parent = Path(row["file_path"]).parent
-        return str(parent) if parent.exists() else None
+        for row in conn.execute(
+            "SELECT file_path FROM items ORDER BY id DESC LIMIT 50"
+        ):
+            if not row["file_path"]:
+                continue
+            parent = Path(row["file_path"]).parent
+            if parent.exists():
+                return str(parent)
+        return None
     except sqlite3.Error:
         return None
     finally:
