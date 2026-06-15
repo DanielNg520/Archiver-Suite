@@ -276,6 +276,26 @@ def test_delete_after_split_off(tmp: Path) -> None:
     store.close()
 
 
+def test_flv_not_kept_as_document(tmp: Path) -> None:
+    print("\n── low-value .flv original is converted, NOT kept as a document ──")
+    chat_id = "100200302"
+    folder = tmp / chat_id
+    folder.mkdir(parents=True)
+    # .flv is non-streamable but excluded from keep-original: only the converted
+    # .mp4 is uploaded; the raw stream dump is deleted, not archived.
+    make_video(folder / "stream.flv", seconds=2, vcodec="libx264", acodec="aac")
+
+    store = ItemStore.open(str(tmp / "f.db"))
+    rep = ingest_folder(store, folder, chat_id=chat_id, guard=None)
+    check(rep.inserted == 1, "only the converted .mp4 is enqueued (no document)")
+    rows = {Path(r.file_path).name: r for r in rows_for(store, chat_id)}
+    check("stream.flv" not in rows, "the .flv original is NOT registered")
+    check((folder / "stream.mp4").exists(), "converted .mp4 sits in the folder")
+    check(not (folder / "stream.flv").exists(),
+          "the raw .flv original is deleted, not kept on disk")
+    store.close()
+
+
 def main() -> None:
     print("media_prep self-test")
     with tempfile.TemporaryDirectory() as d:
@@ -285,6 +305,7 @@ def main() -> None:
         test_split_via_cli(tmp)
         test_ingest_folder(tmp)
         test_delete_after_split_off(tmp)
+        test_flv_not_kept_as_document(tmp)
     print(f"\nALL PASS ({_checks} checks)")
 
 

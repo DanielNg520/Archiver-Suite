@@ -80,6 +80,11 @@ CHAT_ID_PRIORITY = 6
 # prep.converted (a format conversion happened), not the extension — see
 # ingest_folder; media_prep.is_nonstreamable_video makes the matching send-side
 # call.
+#
+# EXCEPT these containers: they are transient/low-value wrappers (e.g. raw .flv
+# stream dumps) where only the converted .mp4 is worth keeping. The original is
+# converted and then deleted as usual — no document upload.
+KEEP_ORIGINAL_SKIP_EXTS = {".flv"}
 
 
 @dataclass
@@ -263,8 +268,10 @@ def ingest_folder(
         # source='orphaned' and ships the non-streamable bytes as a document
         # (send: is_nonstreamable_video). Pure oversize splits (streamable but too
         # big) are NOT kept here — prep.converted is False — and fall through to
-        # the delete-after-split policy below.
-        keep_original_as_doc = prep.converted
+        # the delete-after-split policy below. Low-value containers (.flv) are
+        # excluded: only their converted .mp4 is kept, the original is deleted.
+        keep_original_as_doc = (
+            prep.converted and f.suffix.lower() not in KEEP_ORIGINAL_SKIP_EXTS)
         if keep_original_as_doc:
             try:
                 res = register_file(
