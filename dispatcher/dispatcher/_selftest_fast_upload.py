@@ -41,6 +41,7 @@ class _FakeSender:
     def __init__(self, fail_on: int | None = None):
         self.parts: list[tuple[int, bytes]] = []
         self.fail_on = fail_on
+        self.disconnected = False
 
     async def send(self, req):
         if self.fail_on is not None and req.file_part == self.fail_on:
@@ -49,28 +50,45 @@ class _FakeSender:
         self.parts.append((req.file_part, bytes(req.bytes)))
         return True
 
+    async def disconnect(self):
+        self.disconnected = True
+
 
 class _FakeClient:
-    def __init__(self, *, dc_id: int = 2, fail_on: int | None = None):
-        self.session = SimpleNamespace(dc_id=dc_id)
-        self._fail_on = fail_on
-        self.borrowed: list[_FakeSender] = []
-        self.returned: list[_FakeSender] = []
+    """Exposes the internals _internals_present checks; the actual sender
+    creation is monkeypatched (see _patch_senders) so no real network/auth is
+    needed."""
+    def __init__(self, *, dc_id: int = 2):
+        self.session = SimpleNamespace(dc_id=dc_id, auth_key=b"fake-auth-key")
+        self._log = None
+        self._proxy = None
         self.serial_calls: list[str] = []
 
-    async def _borrow_exported_sender(self, dc_id):
-        s = _FakeSender(fail_on=self._fail_on)
-        self.borrowed.append(s)
-        return s
+    async def _get_dc(self, dc_id):                       # pragma: no cover
+        return SimpleNamespace(ip_address="0.0.0.0", port=443, id=dc_id)
 
-    async def _return_exported_sender(self, sender):
-        self.returned.append(sender)
+    def _connection(self, *a, **k):                       # pragma: no cover
+        return SimpleNamespace()
 
     async def upload_file(self, path, *, file_name=None, progress_callback=None):
         self.serial_calls.append(str(path))
         if progress_callback:
             progress_callback(os.path.getsize(path), os.path.getsize(path))
         return ("SERIAL", str(path))
+
+
+def _patch_senders(fail_on: int | None = None) -> list[_FakeSender]:
+    """Replace fast_upload._connect_sender with one that yields fake senders,
+    returning the list they're collected into for assertions."""
+    created: list[_FakeSender] = []
+
+    async def _fake_connect(_client):
+        s = _FakeSender(fail_on=fail_on)
+        created.append(s)
+        return s
+
+    fast_upload._connect_sender = _fake_connect
+    return created
 
 
 def _make_file(path: Path, size: int) -> bytes:
@@ -89,6 +107,7 @@ def test_big_file_parallel(tmp: Path) -> None:
     size = 11 * 1024 * 1024 + 777          # >10 MiB, not part-aligned
     data = _make_file(tmp / "big.bin", size)
     client = _FakeClient()
+    senders = _patch_senders()
 
     progress: list[tuple[int, int]] = []
     handle = asyncio.run(fast_upload.upload_file(
@@ -100,15 +119,14 @@ def test_big_file_parallel(tmp: Path) -> None:
     expected_parts = (size + fast_upload.PART_SIZE - 1) // fast_upload.PART_SIZE
     check(handle.parts == expected_parts, "handle part_count matches the file")
 
-    all_parts = [p for s in client.borrowed for p in s.parts]
+    all_parts = [p for s in senders for p in s.parts]
     indices = sorted(i for i, _ in all_parts)
     check(indices == list(range(expected_parts)),
           "every part 0..N-1 sent exactly once (no gaps, no dupes)")
-    check(_reassemble(client.borrowed) == data,
+    check(_reassemble(senders) == data,
           "reassembled bytes are identical to the source file")
-    check(len(client.borrowed) == 4
-          and set(map(id, client.returned)) == set(map(id, client.borrowed)),
-          "all 4 borrowed senders were returned (even on success)")
+    check(len(senders) == 4 and all(s.disconnected for s in senders),
+          "all 4 home-DC senders were connected AND disconnected")
     check(progress and progress[-1] == (size, size),
           "progress callback ends at 100% (sent == total)")
     check([c for c, _ in progress] == sorted(c for c, _ in progress),
@@ -119,21 +137,23 @@ def test_small_file_serial(tmp: Path) -> None:
     print("\n── small file → serial uploader (md5 path) ──")
     _make_file(tmp / "small.bin", 1024 * 1024)     # 1 MiB, under threshold
     client = _FakeClient()
+    senders = _patch_senders()
     handle = asyncio.run(fast_upload.upload_file(
         client, tmp / "small.bin", connections=4))
     check(client.serial_calls == [str(tmp / "small.bin")],
           "delegated to client.upload_file")
     check(handle == ("SERIAL", str(tmp / "small.bin")),
           "returns the serial handle unchanged")
-    check(not client.borrowed, "no senders borrowed for a small file")
+    check(not senders, "no senders created for a small file")
 
 
 def test_connections_one_is_serial(tmp: Path) -> None:
     print("\n── connections=1 → serial even for a big file ──")
     _make_file(tmp / "b.bin", 11 * 1024 * 1024)
     client = _FakeClient()
+    senders = _patch_senders()
     asyncio.run(fast_upload.upload_file(client, tmp / "b.bin", connections=1))
-    check(client.serial_calls and not client.borrowed,
+    check(client.serial_calls and not senders,
           "connections=1 opts out of the parallel path")
 
 
@@ -142,6 +162,7 @@ def test_missing_internals_serial(tmp: Path) -> None:
     _make_file(tmp / "b.bin", 11 * 1024 * 1024)
 
     class _Bare:
+        # No _get_dc / _connection / session.auth_key ⇒ internals absent.
         session = SimpleNamespace(dc_id=2)
         def __init__(self): self.serial_calls = []
         async def upload_file(self, path, *, file_name=None, progress_callback=None):
@@ -151,19 +172,20 @@ def test_missing_internals_serial(tmp: Path) -> None:
     handle = asyncio.run(fast_upload.upload_file(
         client, tmp / "b.bin", connections=4))
     check(client.serial_calls and handle[0] == "SERIAL",
-          "absent _borrow_exported_sender ⇒ serial path, no crash")
+          "absent Telethon internals ⇒ serial path, no crash")
 
 
 def test_part_failure_falls_back(tmp: Path) -> None:
-    print("\n── a rejected part → fallback to serial, senders returned ──")
+    print("\n── a rejected part → fallback to serial, senders disconnected ──")
     _make_file(tmp / "b.bin", 11 * 1024 * 1024)
-    client = _FakeClient(fail_on=3)            # sender raises on part 3
+    client = _FakeClient()
+    senders = _patch_senders(fail_on=3)        # sender raises on part 3
     handle = asyncio.run(fast_upload.upload_file(
         client, tmp / "b.bin", connections=4))
     check(client.serial_calls and handle[0] == "SERIAL",
           "parallel failure transparently falls back to the serial uploader")
-    check(set(map(id, client.returned)) == set(map(id, client.borrowed)),
-          "borrowed senders are returned even when a part fails mid-flight")
+    check(senders and all(s.disconnected for s in senders),
+          "every connected sender is disconnected even when a part fails")
 
 
 def main() -> int:

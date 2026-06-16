@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from telethon import helpers
+from telethon.network import MTProtoSender
 from telethon.tl import functions, types
 
 log = logging.getLogger(__name__)
@@ -54,11 +55,33 @@ def _internals_present(client: Any) -> bool:
     """The fast path reaches into Telethon internals. If a library upgrade
     moved any of them, degrade to the public serial uploader rather than crash
     the send."""
+    session = getattr(client, "session", None)
     return (
-        hasattr(client, "_borrow_exported_sender")
-        and hasattr(client, "_return_exported_sender")
-        and getattr(getattr(client, "session", None), "dc_id", None) is not None
+        hasattr(client, "_get_dc")
+        and hasattr(client, "_connection")
+        and getattr(session, "dc_id", None) is not None
+        and getattr(session, "auth_key", None) is not None
     )
+
+
+async def _connect_sender(client: Any) -> MTProtoSender:
+    """A fresh MTProtoSender connected to the HOME data-centre, reusing the
+    session's existing auth key.
+
+    Uploads always target the home DC, and Telegram REJECTS exporting auth for
+    the DC you're already connected to — so unlike Telethon's
+    _borrow_exported_sender (which exports auth and fails here), we hand the
+    sender the session auth_key directly and skip the export entirely. Telegram
+    permits many concurrent connections sharing one auth key; that is exactly
+    what makes the parallel fan-out possible. Caller disconnects it."""
+    dc = await client._get_dc(client.session.dc_id)
+    sender = MTProtoSender(client.session.auth_key, loggers=client._log)
+    await sender.connect(client._connection(
+        dc.ip_address, dc.port, dc.id,
+        loggers=client._log, proxy=client._proxy,
+        local_addr=getattr(client, "_local_addr", None),
+    ))
+    return sender
 
 
 async def upload_file(
@@ -104,7 +127,6 @@ async def _parallel_upload(
     file_id = helpers.generate_random_long()
     part_count = (size + part_size - 1) // part_size
     workers = max(1, min(connections, MAX_CONNECTIONS, part_count))
-    dc_id = client.session.dc_id
 
     # maxsize gives backpressure: the producer blocks once a couple of parts per
     # worker are queued, so memory stays bounded no matter the file size.
@@ -141,8 +163,8 @@ async def _parallel_upload(
     async with AsyncExitStack() as stack:
         senders = []
         for _ in range(workers):
-            sender = await client._borrow_exported_sender(dc_id)
-            stack.push_async_callback(client._return_exported_sender, sender)
+            sender = await _connect_sender(client)
+            stack.push_async_callback(sender.disconnect)
             senders.append(sender)
 
         tasks = [asyncio.create_task(produce())]
