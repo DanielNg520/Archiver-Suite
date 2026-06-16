@@ -276,6 +276,18 @@ def test_delete_after_split_off(tmp: Path) -> None:
     store.close()
 
 
+def test_clean_upload_name() -> None:
+    print("\n── clean_upload_name strips the internal .tgprep marker ──")
+    cun = media_prep.clean_upload_name
+    check(cun("clip.tgprep.mp4") == "clip.mp4",
+          "the .tgprep marker is stripped from the upload name")
+    check(cun("/a/b/My Clip.tgprep.mp4") == "My Clip.mp4",
+          "works on a full path, returns basename only")
+    check(cun("clip.mp4") == "clip.mp4", "a clean name is returned unchanged")
+    check(cun("keep.mkv") == "keep.mkv", "a non-mp4 original is untouched")
+    check(cun("a.tgprep.mp4") == cun(cun("a.tgprep.mp4")), "idempotent")
+
+
 def test_flv_not_kept_as_document(tmp: Path) -> None:
     print("\n── low-value .flv original is converted, NOT kept as a document ──")
     chat_id = "100200302"
@@ -306,6 +318,7 @@ def main() -> None:
         test_ingest_folder(tmp)
         test_delete_after_split_off(tmp)
         test_flv_not_kept_as_document(tmp)
+    test_clean_upload_name()
     print(f"\nALL PASS ({_checks} checks)")
 
 

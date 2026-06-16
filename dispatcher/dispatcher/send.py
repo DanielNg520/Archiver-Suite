@@ -320,15 +320,16 @@ class TelethonSendStrategy(SendStrategy):
         # Both probes shell out to ffprobe/ffmpeg (seconds, worst-case tens) —
         # off the event loop so signal handling and FloodWait timers stay live.
         attributes = await asyncio.to_thread(_video_attributes, send_path)
-        if prepped is not None:
-            # Telethon names the upload after the file on disk, which for a
-            # converted send is the internal "<stem>.tgprep.mp4" temp. Override
-            # with a clean name derived from the ORIGINAL recording (always .mp4
-            # — the bytes are now mp4) so Telegram never shows the .tgprep tag.
-            # A user-supplied DocumentAttributeFilename wins in get_attributes().
-            clean_name = Path(file_path).stem + ".mp4"
+        # Telethon names the upload after the file on disk. Whenever that name
+        # carries the internal ".tgprep" marker — a send-time conversion temp OR
+        # an as-is file converted in place at ingest (an incompatible-codec .mp4
+        # stored as "<stem>.tgprep.mp4") — override it with the clean name so the
+        # tag never reaches Telegram. A user-supplied filename still wins in
+        # get_attributes().
+        display = media_prep.clean_upload_name(send_path)
+        if display != Path(send_path).name:
             attributes = (attributes or []) + [
-                tg_types.DocumentAttributeFilename(clean_name)]
+                tg_types.DocumentAttributeFilename(display)]
         # Explicit poster frame so Telegram doesn't auto-grab a black/white
         # fade-in frame as the inline preview. None → not a video / probe
         # failed; Telethon falls back to server-side generation (status quo).
@@ -570,9 +571,15 @@ class TelethonSendStrategy(SendStrategy):
             await self._client.upload_file(thumb) if thumb else None
         )
         video_attrs = await asyncio.to_thread(_video_attributes, file_path)
+        # Strip any ".tgprep" marker from the album item's filename too (same
+        # reason as the single path) — an explicit DocumentAttributeFilename
+        # overrides the basename get_attributes would otherwise derive.
+        display = media_prep.clean_upload_name(file_path)
+        name_attr = ([tg_types.DocumentAttributeFilename(display)]
+                     if display != Path(file_path).name else [])
         attrs, mime = tg_utils.get_attributes(
             file_path,
-            attributes=video_attrs,  # None → no override
+            attributes=(video_attrs or []) + name_attr,  # [] → no override
             supports_streaming=True,
         )
         return tg_types.InputMediaUploadedDocument(

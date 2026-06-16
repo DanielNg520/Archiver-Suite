@@ -331,6 +331,19 @@ def streamable_temp(path: Path) -> Path | None:
     return _convert(path, p)
 
 
+def clean_upload_name(path: "str | Path") -> str:
+    """The basename to show on Telegram, with the internal '.tgprep' marker
+    stripped. _convert stores its output as '<stem>.tgprep.mp4' whenever the
+    clean '<stem>.mp4' would clobber bytes we don't own — chiefly an
+    incompatible-codec .mp4 source (clean name == source) or a pre-existing
+    sibling. That on-disk tag is fine, but it must NEVER reach the upload, so
+    every send path names the Telegram file after this. Idempotent for names
+    that already carry no tag."""
+    name = Path(path).name
+    tag = f"{_PREP_TAG}."
+    return name.replace(tag, ".", 1) if tag in name else name
+
+
 def is_nonstreamable_video(path: Path) -> bool:
     """True when `path` is a readable video Telegram CAN'T stream inline (wrong
     container/codec). Used by producers that deliberately ship a non-streamable

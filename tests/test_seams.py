@@ -1192,7 +1192,11 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
        "dispatcher converted .flv → streamable .mp4 before the Telegram send")
     ok(cap.files[0] != str(flv),
        "the raw container is NOT what went over the wire")
-    ok(cap.names[0] == "clip.mp4",
+    # The effective upload name (explicit attribute if set, else the on-disk
+    # basename) is the clean .mp4 — here the temp is already clean so no
+    # override is needed; the .tgprep-override path is covered by case (e).
+    eff_name = cap.names[0] or Path(cap.files[0]).name
+    ok(eff_name == "clip.mp4",
        "upload filename is the clean original stem + .mp4 (no .tgprep tag)")
     ok(flv.exists() and flv.suffix == ".flv",
        "the on-disk original recording is left untouched (never lose bytes)")
@@ -1234,6 +1238,19 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
         peer="p", file_path=str(mp4b), caption="c", ensure_streamable=False))
     ok(res4.ok and cap4.docs == [False],
        "a streamable as-is .mp4 still ships as a normal video, not a document")
+
+    # (e) an as-is streamable file stored with the internal ".tgprep" marker
+    # (an incompatible-codec .mp4 converted in place at ingest) must upload with
+    # a CLEAN name — the tag never reaches Telegram, even on the as-is path.
+    tagged = _make_video(tmp / "u" / "show.tgprep.mp4", container="mp4")
+    cap5 = _CaptureClient()
+    strategy._client = cap5
+    res5 = asyncio.run(strategy.send(
+        peer="p", file_path=str(tagged), caption="c", ensure_streamable=False))
+    ok(res5.ok and cap5.files == [str(tagged)],
+       "the real .tgprep file on disk is what gets uploaded")
+    ok(cap5.names == ["show.mp4"],
+       "but Telegram is told the clean name 'show.mp4' (no .tgprep leak)")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
