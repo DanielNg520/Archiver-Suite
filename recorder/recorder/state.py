@@ -40,6 +40,7 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Callable
 
+from . import ui
 from .capture import StreamCapture
 from .config import RecorderConfig
 from .lock import TikTokLock
@@ -103,7 +104,7 @@ def _remux_for_telegram(src: Path) -> Path:
                         tmp.name, final.name, e)
             return tmp
 
-    log.info("remux: %s → %s (telegram-ready mp4)", src.name, final.name)
+    log.info("remux → %s", final.name, extra={"ev": "remux"})
     return final
 
 
@@ -152,8 +153,10 @@ class StateMachine:
             target=self._uploader_loop, daemon=True, name="uploader",
         )
         uploader_thread.start()
-        log.info("recorder: state machine started (%d tiktok users, poll=%.0fs)",
-                 len(self.config.tiktok_users), self.config.poll_interval_s)
+        log.info("watching %d user%s — listening for live streams",
+                 len(self.config.tiktok_users),
+                 "" if len(self.config.tiktok_users) == 1 else "s",
+                 extra={"ev": "start"})
         try:
             while not self._stop.is_set():
                 try:
@@ -177,11 +180,11 @@ class StateMachine:
                 log.warning("recorder: uploader still draining after shutdown; "
                             "remaining files stay on disk for manual recovery")
             self.state = RecorderState.STOPPED
-            log.info("recorder: stopped")
+            log.info("stopped", extra={"ev": "stop"})
 
     def request_stop(self) -> None:
         """Signal a clean shutdown. Safe to call from a signal handler."""
-        log.info("recorder: stop requested")
+        log.info("stop requested — finishing up", extra={"ev": "stop"})
         self._stop.set()
 
     def record_once(self, username: str) -> bool:
@@ -203,12 +206,12 @@ class StateMachine:
             log.error("record-once: is_live(@%s) failed: %s", username, e)
             return False
         if not live:
-            log.info("record-once: @%s is not live right now — nothing to record",
-                     username)
+            log.info("@%s is not live right now — nothing to record",
+                     username, extra={"ev": "listen"})
             return False
 
-        log.info("record-once: @%s is LIVE — recording until the stream ends "
-                 "(Ctrl-C to stop early)", username)
+        log.info("@%s is LIVE — recording until the stream ends "
+                 "(Ctrl-C to stop early)", username, extra={"ev": "live"})
         self._start_recording(username)
         if self.state != RecorderState.RECORDING:
             return False                    # stream_url/capture failed (logged)
@@ -226,7 +229,8 @@ class StateMachine:
                 drained += 1
             except queue.Empty:
                 break
-        log.info("record-once: done — %d file(s) enqueued for upload", drained)
+        log.info("done — %d file%s queued for upload", drained,
+                 "" if drained == 1 else "s", extra={"ev": "queued"})
         self.state = RecorderState.STOPPED
         return True
 
@@ -247,7 +251,7 @@ class StateMachine:
             if self._stop.is_set():
                 return
             if self.platform.is_live(username):
-                log.info("recorder: @%s is LIVE — starting recording", username)
+                log.info("@%s is LIVE — recording", username, extra={"ev": "live"})
                 self._start_recording(username)
                 return
         # Nobody live — sleep, but wake on stop.
@@ -279,12 +283,27 @@ class StateMachine:
         # may resume TikTok downloads during our handoff scan + upload.
         self._release_lock_if_held()
 
+        elapsed = self.capture.elapsed_s()
         files = self.capture.output_files()
         # Pair the yt-dlp log with the recording (or drop it if the stream was
         # dead) so it's cleaned up with the media instead of piling up forever.
         self.capture.finalize()
-        log.info("recorder: recording of @%s ended (rc=%d, %d file(s))",
-                 self.current_user, rc, len(files))
+        user = self.current_user or "?"
+        if files:
+            total = 0
+            for f in files:
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+            log.info("@%s ended — %s · %d file%s · %s",
+                     user, ui.human_duration(elapsed), len(files),
+                     "" if len(files) == 1 else "s", ui.human_size(total),
+                     extra={"ev": "rec_end"})
+        else:
+            # rc=-2 is the dead-stream guard (no bytes ever arrived).
+            log.info("@%s ended — %s · no data (dead stream)",
+                     user, ui.human_duration(elapsed), extra={"ev": "rec_end"})
         for f in files:
             self._upload_q.put(_Job(username=self.current_user or "", file_path=f))
 
@@ -299,8 +318,8 @@ class StateMachine:
             if self._stop.is_set():
                 return
             if self.platform.is_live(username):
-                log.info("recorder: handoff → @%s is live, recording next",
-                         username)
+                log.info("handoff → @%s is live, recording next",
+                         username, extra={"ev": "handoff"})
                 self._start_recording(username)
                 return
         self.state = RecorderState.LISTENING

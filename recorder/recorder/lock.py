@@ -54,13 +54,13 @@ class TikTokLock:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload))
         os.replace(tmp, self.path)
-        log.info("tiktok lock acquired (pid=%d) at %s", self.pid, self.path)
+        log.debug("tiktok lock acquired (pid=%d) at %s", self.pid, self.path)
         return self
 
     def __exit__(self, *exc) -> None:
         try:
             self.path.unlink(missing_ok=True)
-            log.info("tiktok lock released")
+            log.debug("tiktok lock released")
         except OSError as e:
             log.warning("failed to remove lockfile %s — manual cleanup "
                         "may be needed: %s", self.path, e)

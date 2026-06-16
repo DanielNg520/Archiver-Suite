@@ -31,6 +31,7 @@ import tomli_w
 from core import ItemStore
 from core import cli as core_cli
 
+from . import ui
 from .config import CONFIG_TOML, RecorderConfig
 
 log = logging.getLogger(__name__)
@@ -48,11 +49,7 @@ def cmd_stats(args: argparse.Namespace) -> int:
 
 
 def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    ui.setup_logging(verbose)
 
 
 def _pid_path(config: RecorderConfig) -> Path:
@@ -98,6 +95,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     if args.daemon:
         _daemonize(config)
 
+    ui.banner(config)
+
     pid_path = _pid_path(config)
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(os.getpid()))
@@ -108,9 +107,9 @@ def cmd_start(args: argparse.Namespace) -> int:
     from .startup_sweep import sweep
     try:
         report = sweep(config.output_dir, config.db_path)
-        log.info("startup-sweep: %s", report)
+        log.info("startup sweep — %s", report, extra={"ev": "sweep"})
     except Exception as e:
-        log.warning("startup-sweep: skipped after error: %s", e)
+        log.warning("startup sweep skipped after error: %s", e)
 
     platform = TikTokLivePlatform(config.tiktok_cookies_file, config.state_dir)
     capture  = StreamCapture(config.output_dir, config.tiktok_cookies_file)
@@ -126,7 +125,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     machine = StateMachine(config, platform, capture, _enqueue, lock)
 
     def _on_signal(signum, _frame):
-        log.info("cli: signal %s — requesting stop", signum)
+        log.info("signal %s — requesting stop", signum, extra={"ev": "stop"})
         machine.request_stop()
 
     signal.signal(signal.SIGINT, _on_signal)
@@ -200,7 +199,7 @@ def cmd_record(args: argparse.Namespace) -> int:
     machine = StateMachine(config, platform, capture, _enqueue, lock)
 
     def _on_signal(signum, _frame):
-        log.info("cli: signal %s — requesting stop", signum)
+        log.info("signal %s — requesting stop", signum, extra={"ev": "stop"})
         machine.request_stop()
 
     signal.signal(signal.SIGINT, _on_signal)
@@ -244,24 +243,30 @@ def cmd_stop(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     config = RecorderConfig.load()
     pid_path = _pid_path(config)
+
     running = False
+    state_line, accent = "not running", "dim"
     if pid_path.exists():
         try:
             pid = int(pid_path.read_text().strip())
             os.kill(pid, 0)
             running = True
-            print(f"recorder: running (pid {pid})")
+            state_line, accent = f"running · pid {pid}", "green"
         except (OSError, ValueError, ProcessLookupError):
-            print("recorder: not running (stale pid file)")
-    else:
-        print("recorder: not running")
+            state_line, accent = "not running (stale pid file)", "yellow"
 
-    lock_path = Path(config.lock_path).expanduser()
-    print(f"tiktok.lock: {'held' if lock_path.exists() else 'not held'}")
-    print(f"users (priority order): {', '.join(config.tiktok_users) or '(none)'}")
-    print(f"output dir: {config.output_dir}")
-    print(f"suite db: {config.db_path}")
-    return 0 if running or not pid_path.exists() else 0
+    lock_held = Path(config.lock_path).expanduser().exists()
+    roster = "  ".join(f"@{u}" for u in config.tiktok_users) or "(none)"
+
+    print()
+    ui.field("recorder", state_line, accent=accent)
+    ui.field("recording", "yes — tiktok.lock held" if lock_held else "no",
+             accent="green" if lock_held else None)
+    ui.field("users", roster)
+    ui.field("output", str(config.output_dir))
+    ui.field("queue", str(config.db_path))
+    print()
+    return 0
 
 
 # ── config ────────────────────────────────────────────────────────────────

@@ -93,7 +93,7 @@ class StreamCapture:
             cmd += ["--cookies", self.cookies_file]
         cmd.append(stream_url)
 
-        log.info("capture: starting yt-dlp for @%s → %s", username, self._run_dir)
+        log.debug("capture: starting yt-dlp for @%s → %s", username, self._run_dir)
         log.debug("capture cmd: %s", " ".join(cmd))
         # yt-dlp/ffmpeg emit continuous progress on stderr while recording.
         # Capturing with subprocess.PIPE and never reading it fills the OS
@@ -110,6 +110,11 @@ class StreamCapture:
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def elapsed_s(self) -> float:
+        """Wall-clock seconds since this run's yt-dlp was launched (0 if it
+        never started). Used for the recording-ended summary line."""
+        return max(0.0, time.time() - self._started_at) if self._started_at else 0.0
+
     def wait(self, stop_event: threading.Event) -> int:
         """Block until yt-dlp exits OR stop_event is set.
 
@@ -120,7 +125,7 @@ class StreamCapture:
             return -1
         while self.is_running():
             if stop_event.wait(timeout=2.0):
-                log.info("capture: stop requested — terminating yt-dlp")
+                log.debug("capture: stop requested — terminating yt-dlp")
                 self._terminate()
                 self._close_log()
                 return -1
@@ -140,7 +145,7 @@ class StreamCapture:
                 self._close_log()
                 return -2
         rc = self._proc.returncode
-        log.info("capture: yt-dlp exited rc=%d", rc)
+        log.debug("capture: yt-dlp exited rc=%d", rc)
         self._close_log()
         return rc
 

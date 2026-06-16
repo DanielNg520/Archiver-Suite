@@ -109,7 +109,7 @@ class EnqueueClient:
                 platform, username, path.name, result.outcome.value,
             )
             return False
-        log.info("enqueue: %s @%s %s → %s",
-                 platform, username, path.name,
-                 "queued" if result.inserted else result.outcome.value)
+        log.info("@%s queued for upload (%s)", username,
+                 "new" if result.inserted else result.outcome.value,
+                 extra={"ev": "queued"})
         return result.inserted
