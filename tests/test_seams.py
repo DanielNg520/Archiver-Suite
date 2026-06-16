@@ -1163,39 +1163,49 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
 
     from telethon.tl import types as tg_types
 
-    def _sent_filename(kw) -> str | None:
-        for a in (kw.get("attributes") or []):
+    # Video sends now funnel through the parallel uploader: the strategy
+    # upload_file()s the bytes (→ a handle) and send_file()s an
+    # InputMediaUploadedDocument. The fake records every upload and the media so
+    # we can introspect what actually went to Telegram.
+    class _Handle:
+        def __init__(self, path): self.path = str(path)
+
+    class _CaptureClient:
+        def __init__(self):
+            self.uploaded: list[str] = []   # every upload_file path (file+thumbs)
+            self.sent: list = []            # InputMedia objects → send_file
+        async def upload_file(self, file, **kw):
+            self.uploaded.append(str(file))
+            return _Handle(file)
+        async def send_file(self, peer, file, **kw):
+            self.sent.append(file)
+        async def disconnect(self): ...
+        async def connect(self): ...
+
+    def media_file(m) -> str | None:        # the uploaded bytes behind a media
+        return getattr(getattr(m, "file", None), "path", None)
+
+    def media_name(m) -> str | None:        # explicit DocumentAttributeFilename
+        for a in (getattr(m, "attributes", None) or []):
             if isinstance(a, tg_types.DocumentAttributeFilename):
                 return a.file_name
         return None
 
-    class _CaptureClient:
-        """Records what path + filename attribute the strategy hands to Telegram."""
-        def __init__(self):
-            self.files: list[str] = []
-            self.names: list[str | None] = []
-            self.docs: list[bool] = []
-        async def send_file(self, peer, file, **kw):
-            self.files.append(str(file))
-            self.names.append(_sent_filename(kw))
-            self.docs.append(bool(kw.get("force_document")))
-        async def disconnect(self): ...
-        async def connect(self): ...
+    def is_document(m) -> bool:             # a document has NO video attribute
+        attrs = getattr(m, "attributes", None) or []
+        return not any(isinstance(a, tg_types.DocumentAttributeVideo)
+                       for a in attrs)
 
     # (a) a non-streamable .flv → Telegram receives a CONVERTED .mp4.
     flv = _make_video(tmp / "u" / "clip.flv", container="flv")
     cap = _CaptureClient()
     strategy._client = cap                      # bypass __aenter__: no network
     res = asyncio.run(strategy.send(peer="p", file_path=str(flv), caption="c"))
-    ok(res.ok, "non-streamable .flv send succeeded")
-    ok(len(cap.files) == 1 and cap.files[0].endswith(".mp4"),
+    ok(res.ok and len(cap.sent) == 1, "non-streamable .flv send succeeded")
+    wire = media_file(cap.sent[0])
+    ok(wire and wire.endswith(".mp4") and wire != str(flv),
        "dispatcher converted .flv → streamable .mp4 before the Telegram send")
-    ok(cap.files[0] != str(flv),
-       "the raw container is NOT what went over the wire")
-    # The effective upload name (explicit attribute if set, else the on-disk
-    # basename) is the clean .mp4 — here the temp is already clean so no
-    # override is needed; the .tgprep-override path is covered by case (e).
-    eff_name = cap.names[0] or Path(cap.files[0]).name
+    eff_name = media_name(cap.sent[0]) or Path(wire).name
     ok(eff_name == "clip.mp4",
        "upload filename is the clean original stem + .mp4 (no .tgprep tag)")
     ok(flv.exists() and flv.suffix == ".flv",
@@ -1208,7 +1218,7 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
     cap2 = _CaptureClient()
     strategy._client = cap2
     res2 = asyncio.run(strategy.send(peer="p", file_path=str(mp4), caption="c"))
-    ok(res2.ok and cap2.files == [str(mp4)],
+    ok(res2.ok and media_file(cap2.sent[0]) == str(mp4),
        "already-streamable .mp4 is sent as-is (no needless re-encode)")
     ok(sorted(p.name for p in (tmp / "u").iterdir()) == ["clip.flv", "ok.mp4"],
        "no temp artifacts left behind by either send")
@@ -1220,11 +1230,11 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
     strategy._client = cap3
     res3 = asyncio.run(strategy.send(
         peer="p", file_path=str(mkv), caption="c", ensure_streamable=False))
-    ok(res3.ok and cap3.files == [str(mkv)],
+    ok(res3.ok and media_file(cap3.sent[0]) == str(mkv),
        "ensure_streamable=False ships the original .mkv as-is (no conversion)")
     ok(not (tmp / "u" / "keep.mp4").exists(),
        "no conversion temp created when the net is skipped")
-    ok(cap3.docs == [True],
+    ok(is_document(cap3.sent[0]),
        "the non-streamable kept .mkv is sent as a DOCUMENT, not a 2nd video "
        "(otherwise Telegram shows the recording twice)")
 
@@ -1236,7 +1246,7 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
     strategy._client = cap4
     res4 = asyncio.run(strategy.send(
         peer="p", file_path=str(mp4b), caption="c", ensure_streamable=False))
-    ok(res4.ok and cap4.docs == [False],
+    ok(res4.ok and not is_document(cap4.sent[0]),
        "a streamable as-is .mp4 still ships as a normal video, not a document")
 
     # (e) an as-is streamable file stored with the internal ".tgprep" marker
@@ -1247,9 +1257,9 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
     strategy._client = cap5
     res5 = asyncio.run(strategy.send(
         peer="p", file_path=str(tagged), caption="c", ensure_streamable=False))
-    ok(res5.ok and cap5.files == [str(tagged)],
+    ok(res5.ok and media_file(cap5.sent[0]) == str(tagged),
        "the real .tgprep file on disk is what gets uploaded")
-    ok(cap5.names == ["show.mp4"],
+    ok(media_name(cap5.sent[0]) == "show.mp4",
        "but Telegram is told the clean name 'show.mp4' (no .tgprep leak)")
 
 

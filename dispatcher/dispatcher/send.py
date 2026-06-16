@@ -66,7 +66,7 @@ from telethon.tl import types as tg_types
 from core.files import media_bucket
 from core import media_prep
 
-from . import image_fix
+from . import fast_upload, image_fix
 from .media_meta import make_thumbnail, probe_video
 from .progress import ProgressReporter
 
@@ -167,6 +167,7 @@ class TelethonSendStrategy(SendStrategy):
         max_flood_wait_s: int   = 600,
         stall_base_timeout_s: float = 600.0,
         stall_min_rate_kib_s: float = 64.0,
+        upload_connections: int = 4,
         progress: ProgressReporter | None = None,
     ):
         self._api_id           = api_id
@@ -178,6 +179,7 @@ class TelethonSendStrategy(SendStrategy):
         self._max_flood_wait_s = max_flood_wait_s
         self._stall_base_timeout_s = stall_base_timeout_s
         self._stall_min_rate_kib_s = stall_min_rate_kib_s
+        self._upload_connections = upload_connections
         self._progress = progress
         self._client: TelegramClient | None = None
 
@@ -304,12 +306,14 @@ class TelethonSendStrategy(SendStrategy):
         if as_document:
             # A pure document send: no video attributes, no poster thumb, no
             # streaming flag. Telegram stores the bytes verbatim for download.
+            # The parallel upload happens INSIDE _do_doc so a retry re-uploads.
             try:
                 async def _do_doc():
-                    await self._client.send_file(
-                        peer, send_path, caption=caption, force_document=True,
-                        progress_callback=self._progress_cb(file_path),
-                    )
+                    media = await self._upload_document(
+                        send_path, attributes=None, thumb_path=None,
+                        supports_streaming=False, force_document=True,
+                        progress_cb=self._progress_cb(file_path))
+                    await self._client.send_file(peer, media, caption=caption)
                 return await self._send_with_retries(
                     _do_doc, what=f"{Path(file_path).name} (document)",
                     payload_bytes=self._payload_bytes([send_path]),
@@ -335,13 +339,27 @@ class TelethonSendStrategy(SendStrategy):
         # failed; Telethon falls back to server-side generation (status quo).
         thumb = await asyncio.to_thread(make_thumbnail, send_path)
 
+        # Videos go up via the parallel multi-connection uploader (big-file
+        # speedup); photos/gifs keep Telethon's path-based send so its photo
+        # handling — and the image-reprocess retry below — stays intact. Both
+        # build the upload INSIDE _do so a FloodWait/stall retry re-uploads.
+        is_video = media_bucket(send_path) == "video"
+
         try:
-            async def _do():
-                await self._client.send_file(
-                    peer, send_path, caption=caption, supports_streaming=True,
-                    attributes=attributes, thumb=thumb,
-                    progress_callback=self._progress_cb(file_path),
-                )
+            if is_video:
+                async def _do():
+                    media = await self._upload_document(
+                        send_path, attributes=attributes, thumb_path=thumb,
+                        supports_streaming=True, force_document=False,
+                        progress_cb=self._progress_cb(file_path))
+                    await self._client.send_file(peer, media, caption=caption)
+            else:
+                async def _do():
+                    await self._client.send_file(
+                        peer, send_path, caption=caption, supports_streaming=True,
+                        attributes=attributes, thumb=thumb,
+                        progress_callback=self._progress_cb(file_path),
+                    )
             result = await self._send_with_retries(
                 _do, what=Path(file_path).name,
                 payload_bytes=self._payload_bytes([send_path]),
@@ -545,6 +563,37 @@ class TelethonSendStrategy(SendStrategy):
                 except OSError:
                     pass
 
+    async def _upload_document(
+        self, send_path: str, *, attributes, thumb_path: str | None,
+        supports_streaming: bool, force_document: bool, progress_cb,
+    ):
+        """Upload one file via the parallel multi-connection uploader and wrap
+        it as an InputMediaUploadedDocument ready for send_file.
+
+        The single choke point for every big-file send — single videos, kept
+        originals (force_document), and album items all funnel through here, so
+        the FastTelethon fan-out and the InputMedia construction live in ONE
+        place. `attributes` is passed straight to get_attributes (an explicit
+        DocumentAttributeFilename there wins over the derived basename); the
+        thumb is uploaded and baked in when present."""
+        assert self._client is not None
+        handle = await fast_upload.upload_file(
+            self._client, send_path,
+            connections=self._upload_connections, progress_callback=progress_cb,
+        )
+        thumb_handle = (
+            await self._client.upload_file(thumb_path) if thumb_path else None
+        )
+        attrs, mime = tg_utils.get_attributes(
+            send_path,
+            attributes=attributes,
+            supports_streaming=supports_streaming,
+            force_document=force_document,
+        )
+        return tg_types.InputMediaUploadedDocument(
+            file=handle, mime_type=mime, attributes=attrs, thumb=thumb_handle,
+        )
+
     async def _build_album_item(self, file_path: str, thumb: str | None = None,
                                 *, batch_pos: int | None = None,
                                 batch_total: int | None = None):
@@ -561,15 +610,6 @@ class TelethonSendStrategy(SendStrategy):
         `thumb` is a local JPEG poster path (or None); when present it is
         uploaded and baked in so the album item gets a real preview frame
         instead of a server-picked black/white fade-in frame."""
-        assert self._client is not None
-        handle = await self._client.upload_file(
-            file_path,
-            progress_callback=self._progress_cb(
-                file_path, batch_pos=batch_pos, batch_total=batch_total),
-        )
-        thumb_handle = (
-            await self._client.upload_file(thumb) if thumb else None
-        )
         video_attrs = await asyncio.to_thread(_video_attributes, file_path)
         # Strip any ".tgprep" marker from the album item's filename too (same
         # reason as the single path) — an explicit DocumentAttributeFilename
@@ -577,13 +617,12 @@ class TelethonSendStrategy(SendStrategy):
         display = media_prep.clean_upload_name(file_path)
         name_attr = ([tg_types.DocumentAttributeFilename(display)]
                      if display != Path(file_path).name else [])
-        attrs, mime = tg_utils.get_attributes(
+        return await self._upload_document(
             file_path,
             attributes=(video_attrs or []) + name_attr,  # [] → no override
-            supports_streaming=True,
-        )
-        return tg_types.InputMediaUploadedDocument(
-            file=handle, mime_type=mime, attributes=attrs, thumb=thumb_handle,
+            thumb_path=thumb, supports_streaming=True, force_document=False,
+            progress_cb=self._progress_cb(
+                file_path, batch_pos=batch_pos, batch_total=batch_total),
         )
 
     async def _send_with_retries(

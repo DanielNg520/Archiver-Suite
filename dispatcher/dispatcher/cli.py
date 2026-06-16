@@ -86,6 +86,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
         max_flood_wait_s = config.max_flood_wait_s,
         stall_base_timeout_s = config.stall_base_timeout_s,
         stall_min_rate_kib_s = config.stall_min_rate_kib_s,
+        upload_connections   = config.upload_connections,
         progress         = ProgressReporter(),
     ) as send_strategy:
         try:

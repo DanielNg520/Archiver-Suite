@@ -156,6 +156,37 @@ def human_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
+def _short_time(iso_ts: str) -> str:
+    """'HH:MM:SS' from an ISO timestamp; the raw string if it can't be parsed."""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).strftime("%H:%M:%S")
+    except (ValueError, TypeError, AttributeError):
+        return str(iso_ts)
+
+
+def _age(iso_ts: str | None) -> str:
+    """'just now' / '6m ago' / '3h ago' / '2d ago' from an ISO timestamp."""
+    from datetime import datetime, timezone
+    if not iso_ts:
+        return "never"
+    try:
+        ts = iso_ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        secs = (datetime.now(timezone.utc) - dt).total_seconds()
+    except (ValueError, TypeError):
+        return str(iso_ts)
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    return f"{int(secs // 86400)}d ago"
+
+
 def human_size(num_bytes: int) -> str:
     """Bytes → '1.2 GB' / '840 MB' / '12 KB' (SI, one decimal above MB)."""
     n = float(max(0, num_bytes))

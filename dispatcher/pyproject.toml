@@ -6,6 +6,11 @@ requires-python = ">=3.13"
 dependencies = [
     # Telegram MTProto (NOT Bot API — 2GB upload limit, native albums)
     "telethon>=1.36.0,<2.0",
+    # Native AES-NI for MTProto. Without it Telethon falls back to pure-Python
+    # AES, which CPU-bottlenecks every up/download to a few hundred KB/s. This
+    # is the single biggest upload-speed lever; pair it with the parallel
+    # uploader (fast_upload.py) for app-grade throughput on big files.
+    "cryptg>=0.4",
     # Config / env
     "python-dotenv>=1.0.0",
     # TOML writer for PolicyStore (tomllib is stdlib for reading)

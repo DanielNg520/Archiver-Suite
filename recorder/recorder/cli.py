@@ -23,6 +23,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -31,7 +32,7 @@ import tomli_w
 from core import ItemStore
 from core import cli as core_cli
 
-from . import ui
+from . import ui, watch
 from .config import CONFIG_TOML, RecorderConfig
 
 log = logging.getLogger(__name__)
@@ -269,6 +270,36 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+# ── watch ─────────────────────────────────────────────────────────────────
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    """Live dashboard: clear + re-render every `interval` seconds, the same
+    loop as `ops watch`. Successive snapshots are diffed to show the active
+    recording's live write-rate."""
+    config = RecorderConfig.load()
+    prev: tuple[str, int, float] | None = None    # (path, size, wall-clock)
+    try:
+        while True:
+            snap = watch.snapshot(config)
+            now = time.monotonic()
+            rate = None
+            if snap.active and prev and prev[0] == snap.active.path:
+                dt = now - prev[2]
+                if dt > 0:
+                    rate = max(0.0, (snap.active.size - prev[1]) / dt)
+            prev = (snap.active.path, snap.active.size, now) if snap.active else None
+
+            print("\033[2J\033[H", end="")        # clear screen, home cursor
+            print(f"recorder watch  ({time.strftime('%H:%M:%S')})\n")
+            print(watch.render(snap, rate_bps=rate))
+            footer = f"refreshing every {args.interval:.0f}s · Ctrl-C to exit"
+            print(f"\n  {ui._paint(footer, 'dim', on=ui.color_enabled())}")
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
 # ── config ────────────────────────────────────────────────────────────────
 
 def _load_toml() -> dict:
@@ -369,6 +400,9 @@ def _build_parser() -> argparse.ArgumentParser:
                           help="username to check and record once")
     sub.add_parser("stop", help="stop a running recorder via pid file")
     sub.add_parser("status", help="show state + lock + user list")
+    p_watch = sub.add_parser("watch", help="live auto-refreshing dashboard")
+    p_watch.add_argument("--interval", type=float, default=2.0,
+                         help="seconds between refreshes (default 2)")
     core_cli.add_stats_parser(sub)   # shared `stats` noun (DB counts)
 
     p_cfg = sub.add_parser("config", help="manage the user list")
@@ -389,6 +423,7 @@ _DISPATCH = {
     ("record", None):             cmd_record,
     ("stop", None):               cmd_stop,
     ("status", None):             cmd_status,
+    ("watch", None):              cmd_watch,
     ("stats", None):              cmd_stats,
     ("config", "add"):            cmd_config_add,
     ("config", "remove"):         cmd_config_remove,
