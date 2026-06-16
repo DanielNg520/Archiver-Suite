@@ -55,6 +55,7 @@ from core import (
 )
 from core import SortPolicy
 from core import cli as core_cli
+from core import termui
 
 
 PLATFORM_CHOICES = ["x", "tiktok", "instagram"]
@@ -63,20 +64,7 @@ PLATFORM_CHOICES = ["x", "tiktok", "instagram"]
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 def setup_logging(log_file: str, verbose: bool = False) -> None:
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level   = level,
-        format  = "%(asctime)s [%(levelname)-7s] %(name)s — %(message)s",
-        datefmt = "%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(log_file, encoding="utf-8"),
-        ],
-    )
-    for lib in ("httpx", "httpcore", "urllib3", "asyncio"):
-        logging.getLogger(lib).setLevel(logging.WARNING if not verbose else logging.INFO)
+    termui.setup_logging(verbose, log_file=log_file)
 
 
 log = logging.getLogger("archiver")
@@ -492,7 +480,16 @@ def build_parser() -> argparse.ArgumentParser:
 def cmd_start(args, config: Config, db: ItemStore) -> int:
     """Harmonized run verb: continuous by default, single cycle with --once.
     Delegates to the existing run/loop implementations."""
-    if getattr(args, "once", False):
+    once = getattr(args, "once", False)
+    plats = [f"{name} ({len(pc.users)})"
+             for name in ("x", "tiktok", "instagram")
+             if (pc := getattr(config, name)) is not None]
+    termui.banner("archiver", [
+        ("platforms", "  ".join(plats) or "(none configured)"),
+        ("output", config.output_dir),
+        ("mode", "single cycle" if once else "continuous loop"),
+    ], subtitle="multi-platform → telegram")
+    if once:
         return cmd_run(args, config, db)
     return cmd_loop(args, config, db)
 

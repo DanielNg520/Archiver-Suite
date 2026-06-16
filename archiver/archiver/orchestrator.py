@@ -219,7 +219,7 @@ class Archiver:
             log.warning("auto-backfill: failed (%s) — will retry next run", e)
             return
         if rep.scanned:
-            log.info("auto-backfill: %s", rep)
+            log.info("auto-backfill — %s", rep, extra={"ev": "backfill"})
 
     def _ban_account(self, platform: str, username: str, reason: str) -> None:
         """Persist a banned/deleted account: drop it from the active user list
@@ -235,29 +235,22 @@ class Archiver:
             "reason": reason, "newly": newly,
         })
         if newly:
-            log.warning("[%s/%s] account appears banned/deleted — removed from "
-                        "active users and added to the banned list: %s",
-                        platform, username, reason)
+            log.warning("@%s [%s] appears banned/deleted — removed from active "
+                        "users: %s", username, platform, reason,
+                        extra={"ev": "banned"})
         else:
-            log.warning("[%s/%s] account banned/deleted (already on banned "
-                        "list): %s", platform, username, reason)
+            log.warning("@%s [%s] banned/deleted (already listed): %s",
+                        username, platform, reason, extra={"ev": "banned"})
 
     def _report_banned(self) -> None:
         """End-of-run summary of accounts retired this run. Logged at WARNING so
         it stands out in the run output and the loop log."""
         if not self._banned_this_run:
             return
-        log.warning("")
-        log.warning("──────────── Banned / deleted accounts this run ──────────")
-        for b in self._banned_this_run:
-            flag = "NEW" if b["newly"] else "already-listed"
-            log.warning("  ✗ [%s] @%s (%s) — %s",
-                        b["platform"], b["username"], flag, b["reason"])
-        log.warning("Removed from the active user list; their queued uploads "
-                    "still deliver. Inspect with `archiver banned list`; "
-                    "restore with `archiver banned unban --platform <p> "
-                    "--user <u> --re-add`.")
-        log.warning("──────────────────────────────────────────────────────────")
+        n = len(self._banned_this_run)
+        log.warning("%d account%s retired this run — their queued uploads still "
+                    "deliver; manage with `archiver banned`", n,
+                    "" if n == 1 else "s", extra={"ev": "banned"})
 
     def _fetches(self, platform: Platform) -> bool:
         """Does this platform download new media this run? False for a
@@ -280,7 +273,7 @@ class Archiver:
                             platform=policy.target_platform())
         if rep.moved or rep.skipped_no_username or rep.skipped_collision \
                 or rep.errors:
-            log.info("auto-sort: %s", rep)
+            log.info("auto-sort — %s", rep, extra={"ev": "sort"})
 
     def _maybe_ingest_orphaned(self, known_platform_names: set[str]) -> None:
         """When the auto_ingest_orphaned policy is on, scan output_dir's
@@ -297,8 +290,8 @@ class Archiver:
         )
         total = sum(r.inserted for r in reports)
         if total:
-            log.info("auto-ingest: enqueued %d loose file(s) from chat_id folders",
-                     total)
+            log.info("auto-ingest — enqueued %d loose file(s) from chat_id "
+                     "folders", total, extra={"ev": "ingest"})
         for r in reports:
             if not r.skipped_dir and (r.inserted or r.deduped):
                 log.info("  %s", r)
@@ -387,7 +380,7 @@ class Archiver:
     ) -> None:
         """Optional final disk sweep: dedup user folders, then queue any
         stable media files missing from the shared DB."""
-        log.info("post-run reconcile: starting")
+        log.info("reconciling files against the queue", extra={"ev": "reconcile"})
         total_inserted = 0
         total_deleted = 0
         total_bytes_freed = 0
@@ -533,8 +526,7 @@ class Archiver:
         username: str,
         run_time: datetime,
     ) -> dict:
-        log.info("━━━ [%s] @%s ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-                 platform.name, username)
+        log.debug("━━━ [%s] @%s ━━━", platform.name, username)
 
         # 4a. Reconcile disk → DB (Reconcile v2: stability + identity)
         report = await asyncio.to_thread(
@@ -542,18 +534,23 @@ class Archiver:
             self.config.output_dir, True, self.deletion_guard,
         )
         if report.inserted:
-            log.info("  Reconciled: %s", report)
+            log.info("@%s reconciled %d file(s) [%s]", username,
+                     report.inserted, platform.name, extra={"ev": "ingest"})
 
         # 4b. Download
         if platform.name == "tiktok" and tiktok_lock_held():
-            log.info("  [tiktok] lockfile present (recorder active) — "
-                     "skipping download; pending uploads still processed")
+            log.debug("[tiktok] @%s lockfile present (recorder active) — "
+                      "skipping download; pending uploads still processed",
+                      username)
             new_count = 0
         else:
             dl = await self._download_with_recovery(platform, username)
             if dl.get("_error"):
                 return dl["_error"]
             new_count = dl["count"]
+            if new_count:
+                log.info("@%s downloaded %d new [%s]", username, new_count,
+                         platform.name, extra={"ev": "download"})
 
         # 4c. (removed) No enqueue handoff: the download above already
         # inserted pending rows into the shared items table, which the
@@ -573,12 +570,12 @@ class Archiver:
         # next run goes back to fast incremental (date-min) fetching.
         self.db.mark_full_history_done(platform.name, username)
         self.db.reset_circuit(platform.name)
-        log.info("  ✓ Checkpoint → last_run=%s floor=%s",
-                 run_time.strftime("%Y-%m-%d %H:%M UTC"), new_floor or "-")
+        log.debug("✓ checkpoint → last_run=%s floor=%s",
+                  run_time.strftime("%Y-%m-%d %H:%M UTC"), new_floor or "-")
 
         s = self.db.stats(platform.name, username)
-        log.info("  Stats: total=%d sent=%d pending=%d failed=%d (%.1f MB)",
-                 s["total"], s["sent"], s["pending"], s["failed"], s["total_mb"])
+        log.debug("stats: total=%d sent=%d pending=%d failed=%d (%.1f MB)",
+                  s["total"], s["sent"], s["pending"], s["failed"], s["total_mb"])
 
         # 4e. Optional dedup pass — policy opt-in. dedup_user only removes
         # files already status='sent' (confirmed delivered), so in-flight

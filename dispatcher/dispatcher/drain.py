@@ -125,7 +125,9 @@ def _suppress_duplicate(store: QueueStore, guard: DeletionGuard,
     except Exception as e:
         log.exception("drain: id=%d dedup-cleanup raised: %s", it.id, e)
         removed = False
-    log.info("drain: id=%d suppressed as duplicate of id=%d (bytes already "
+    log.info("@%s · %s suppressed as duplicate (bytes already sent)",
+             it.username, Path(it.file_path).name, extra={"ev": "dedup"})
+    log.debug("drain: id=%d suppressed as duplicate of id=%d (bytes already "
              "sent) — redundant copy %s", it.id, twin_id,
              "deleted" if removed else "kept (safebrake)")
 
@@ -142,8 +144,8 @@ async def drain_forever(
     *,
     stop_event:    asyncio.Event | None = None,
 ) -> None:
-    log.info("drain: starting (poll=%.1fs, max_retries=%d)",
-             config.poll_interval_s, config.max_retries)
+    log.info("draining the upload queue (poll %.0fs)", config.poll_interval_s,
+             extra={"ev": "start"})
 
     # Min-batch gate, applied to PLATFORM (archiver) groups only. Recorder
     # (live) and orphaned (chat_id folders) are exempt — they send as soon as
@@ -287,18 +289,20 @@ async def drain_forever(
         if len(present) == 1:
             # single send (gif/other bucket, or a group that filtered to one)
             it = present[0]
-            log.info("drain: id=%d src=%s prio=%d @%s [%s] file=%s attempt=%d",
-                     it.id, it.source, it.priority, it.username,
-                     it.platform, it.file_path, it.attempts)
+            log.info("@%s uploading %s [%s]", it.username,
+                     Path(it.file_path).name, it.platform, extra={"ev": "upload"})
+            log.debug("drain: id=%d src=%s prio=%d attempt=%d file=%s",
+                      it.id, it.source, it.priority, it.attempts, it.file_path)
             result = await send_strategy.send(
                 peer=peer, file_path=it.file_path, caption=caption_for(it),
                 ensure_streamable=it.source not in _PREPPED_AT_INGEST_SOURCES,
             )
         else:
             # album send (homogeneous photo/video batch, all same producer)
-            log.info("drain: album n=%d src=%s prio=%d @%s [%s] ids=%s",
-                     len(present), head.source, head.priority, head.username,
-                     head.platform, [it.id for it in present])
+            log.info("@%s uploading album of %d [%s]", head.username,
+                     len(present), head.platform, extra={"ev": "album"})
+            log.debug("drain: album src=%s prio=%d ids=%s",
+                      head.source, head.priority, [it.id for it in present])
             result = await send_strategy.send_album(
                 peer=peer,
                 file_paths=[it.file_path for it in present],
@@ -314,9 +318,12 @@ async def drain_forever(
             # are NOW confirmed delivered, so suppression is finally legal.
             for it, twin_id in batch_dupes:
                 _suppress_duplicate(store, guard, it, twin_id)
-            log.info("drain: %s sent (%d item(s))",
-                     "album" if len(present) > 1 else f"id={head.id}",
-                     len(present))
+            if len(present) > 1:
+                log.info("@%s album sent (%d items)", head.username,
+                         len(present), extra={"ev": "sent"})
+            else:
+                log.info("@%s sent %s", head.username,
+                         Path(head.file_path).name, extra={"ev": "sent"})
             for it in present:
                 try:
                     maybe_delete(
@@ -333,8 +340,8 @@ async def drain_forever(
                 await asyncio.sleep(config.inter_album_sleep)
 
         elif result.flood_wait_s is not None:
-            log.warning("drain: FloodWait %ds — requeue %d item(s), then sleep",
-                        result.flood_wait_s, len(present))
+            log.warning("FloodWait %ds — requeued %d item(s), pausing",
+                        result.flood_wait_s, len(present), extra={"ev": "flood"})
             for it in present:
                 store.requeue(it.id, reason=f"floodwait {result.flood_wait_s}s")
             # Held-back dupes never went out either; requeue without burning
@@ -359,5 +366,6 @@ async def drain_forever(
             # if the twin eventually delivers, sent_twin suppresses it then.
             for it, _twin_id in batch_dupes:
                 store.requeue(it.id, reason="in-batch twin failed to deliver")
-            log.warning("drain: %d item(s) failed (%s): %s",
-                        len(present), "/".join(sorted(statuses)), result.error)
+            log.warning("@%s upload failed (%d item%s, %s): %s", head.username,
+                        len(present), "" if len(present) == 1 else "s",
+                        "/".join(sorted(statuses)), result.error)

@@ -32,6 +32,7 @@ from core import (
     ItemStore, DeletePolicy, RecorderDeletePolicy, BatchPolicy, DeletionGuard,
 )
 from core import cli as core_cli
+from core import termui
 
 from .config import DispatcherConfig, session_name_or_default
 from .drain import drain_forever
@@ -46,12 +47,7 @@ log = logging.getLogger(__name__)
 # ── Logging ───────────────────────────────────────────────────────────────
 
 def _setup_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    termui.setup_logging(verbose)
 
 
 # ── Subcommand: start ─────────────────────────────────────────────────────
@@ -69,7 +65,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
     stop_event = asyncio.Event()
 
     def _on_signal(signum: int) -> None:
-        log.info("cli: received signal %s, requesting clean shutdown", signum)
+        log.info("signal %s — shutting down cleanly", signum, extra={"ev": "stop"})
         stop_event.set()
 
     loop = asyncio.get_running_loop()
@@ -108,8 +104,14 @@ async def _run_drain(config: DispatcherConfig) -> None:
 def cmd_start(args: argparse.Namespace) -> int:
     config = DispatcherConfig.load(require_telegram=True)
     assert config.telegram is not None
-    log.info("cli: db=%s session=%s",
-             config.db_path, config.telegram.session_name)
+    conns = config.upload_connections
+    termui.banner("dispatcher", [
+        ("upload", f"{conns} connection{'' if conns == 1 else 's'} per file"
+                   f"{' (serial)' if conns <= 1 else ''}"),
+        ("session", config.telegram.session_name),
+        ("chat", str(config.default_chat_id)),
+        ("queue", config.db_path),
+    ], subtitle="telegram uploader")
     try:
         with DispatcherInstanceLock(config.telegram.session_name):
             asyncio.run(_run_drain(config))
@@ -120,7 +122,7 @@ def cmd_start(args: argparse.Namespace) -> int:
         # add_signal_handler should normally swallow SIGINT, but if asyncio
         # is in early startup before the handler is registered, KeyboardInterrupt
         # can still surface. Treat as clean exit.
-        log.info("cli: interrupted")
+        log.info("interrupted", extra={"ev": "stop"})
     return 0
 
 
@@ -133,36 +135,38 @@ def cmd_status(args: argparse.Namespace) -> int:
     # "is a drain daemon actually running?" — answered via the instance
     # lock's holder, not by guessing from queue counts.
     pid = DispatcherInstanceLock(session_name_or_default()).holder_pid()
+    print()
     if pid is not None:
-        print(f"daemon: running (pid {pid})")
+        termui.field("dispatcher", f"running · pid {pid}", accent="green")
         prog = read_progress()
         if prog:
-            print(f"uploading: {describe(prog)}")
+            termui.field("uploading", describe(prog), accent="cyan")
     else:
-        print("daemon: NOT running")
+        termui.field("dispatcher", "not running", accent="yellow")
 
     store = ItemStore.open(config.db_path)
     try:
         counts = store.counts_by_status()
-        total = sum(counts.values())
         last = store.last_sent_at()
-        print(f"last sent: {last or 'never'}")
-        print(f"db: {config.db_path}")
-        print(f"  total: {total}")
-        for st in ("pending", "sending", "sent", "failed"):
-            print(f"  {st:8s}: {counts.get(st, 0)}")
+        queue = (f"{counts.get('pending', 0)} pending · "
+                 f"{counts.get('sending', 0)} sending · "
+                 f"{counts.get('sent', 0)} sent · "
+                 f"{counts.get('failed', 0)} failed")
+        termui.field("queue", queue,
+                     accent="yellow" if counts.get("failed") else None)
+        termui.field("last sent", termui.age(last))
 
-        pending = store.list_items(status="pending", limit=10)
+        pending = store.list_items(status="pending", limit=5)
         if pending:
-            print(f"\ntop 10 pending (priority asc):")
+            print()
+            print(f"  {termui.paint('next up (priority order)', 'dim')}")
             for r in pending:
-                print(
-                    f"  id={r.id:>5} prio={r.priority:>3} "
-                    f"src={r.source:<10} {r.platform}/@{r.username} "
-                    f"{Path(r.file_path).name}"
-                )
+                print(f"    {termui.paint(f'{r.priority:>2}', 'dim')} "
+                      f"@{r.username} · {Path(r.file_path).name} "
+                      f"{termui.paint(f'[{r.platform}]', 'dim')}")
     finally:
         store.close()
+    print()
     return 0
 
 
