@@ -27,7 +27,7 @@ from pathlib import Path
 
 from core import (
     ClaimContentionError, QueueStore, Item, DeletePolicy, RecorderDeletePolicy,
-    BatchPolicy, ORPHANED_SOURCE, subfolder_of, DeletionGuard,
+    BatchPolicy, ORPHANED_SOURCE, subfolder_of, DeletionGuard, is_split_group,
 )
 from core.files import media_bucket
 from .tg_router import TelegramRouter, RouteError
@@ -102,6 +102,11 @@ def album_caption_for(batch: list[Item]) -> str:
     header describing the group, matching the old uploader's behavior:
     '📷 @user · platform' (📷 photos / 🎬 videos)."""
     head = batch[0]
+    if is_split_group(head.group_key):
+        # A split original's parts: list every part name so all are visible
+        # (Telegram shows only the first item's caption). Works for both
+        # producers regardless of how each part is otherwise captioned.
+        return "\n".join(Path(it.file_path).stem for it in batch)
     if head.source == ORPHANED_SOURCE:
         return orphaned_caption(batch)
     if head.caption:
@@ -152,6 +157,10 @@ async def drain_forever(
     # they're ready. The callables receive the anchor row and resolve the
     # policy per (platform, user).
     def _min_batch(anchor) -> int:
+        # A split original's parts are a complete unit — flush immediately,
+        # never hold them behind the archiver min-batch gate waiting for more.
+        if is_split_group(anchor["group_disc"]):
+            return 1
         if anchor["source"] == "archiver":
             return batch_policy.min_batch_size(anchor["platform"], anchor["username"])
         return 1
@@ -272,9 +281,11 @@ async def drain_forever(
         # Resolve the destination once per batch. An explicit chat_id (orphaned
         # folders) wins; an unresolvable one fails the whole batch cleanly
         # rather than throwing mid-send. Routing is by the ANCHOR, so a batch is
-        # always homogeneous in destination.
+        # always homogeneous in destination — and claim_batch keys on chat_id +
+        # topic_id, so every row here shares the anchor's chat AND forum topic.
         try:
-            peer = router.peer_for_item(head)
+            dest = router.destination_for_item(head)
+            peer, topic_id = dest.peer, dest.topic_id
         except RouteError as exc:
             for it in present:
                 store.mark_failed(it.id, error=str(exc),
@@ -294,8 +305,11 @@ async def drain_forever(
             log.debug("drain: id=%d src=%s prio=%d attempt=%d file=%s",
                       it.id, it.source, it.priority, it.attempts, it.file_path)
             result = await send_strategy.send(
-                peer=peer, file_path=it.file_path, caption=caption_for(it),
+                peer=peer, file_path=it.file_path,
+                caption=config.sanitizer.sanitize(caption_for(it)),
                 ensure_streamable=it.source not in _PREPPED_AT_INGEST_SOURCES,
+                filetype_tag=it.source == ORPHANED_SOURCE,
+                topic_id=topic_id,
             )
         else:
             # album send (homogeneous photo/video batch, all same producer)
@@ -306,7 +320,8 @@ async def drain_forever(
             result = await send_strategy.send_album(
                 peer=peer,
                 file_paths=[it.file_path for it in present],
-                caption=album_caption_for(present),
+                caption=config.sanitizer.sanitize(album_caption_for(present)),
+                topic_id=topic_id,
             )
 
         if result.ok:

@@ -43,7 +43,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
-from core import identity, stability, cleanup_sidecars, DeletionGuard, media_prep
+from core import (
+    identity, stability, cleanup_sidecars, DeletionGuard, media_prep,
+    split_group_key,
+)
 from core.hashing import full_hash
 
 # Upload priority for re-registered recordings. MUST match the recorder's live
@@ -239,13 +242,16 @@ def _reconcile_dir(
     # seed the extractor archive with them.
     new_archive_entries: list[str] = []
 
-    def _register(out: Path) -> bool:
+    def _register(out: Path, *, group_key: str | None = None) -> bool:
         """Register one ready-to-send file — a canonical original, or a
         media_prep output for a converted container. Returns True once the file
         is accounted for (a row was inserted, an existing row already covers it,
         or a re-introduced already-sent copy was removed/kept), so a replaced
         original may be retired. False only when the file vanished mid-walk and
-        must be retried next pass."""
+        must be retried next pass.
+
+        `group_key` (set only for split parts) makes all parts of one original
+        share an album identity, so the dispatcher ships them as one batch."""
         out_str = str(out)
 
         ident = identity.resolve(out)
@@ -299,6 +305,7 @@ def _reconcile_dir(
             caption         = caption_for_path(out) if caption_for_path else None,
             priority        = priority,
             content_hash    = digest,
+            group_key       = group_key,
         )
         if inserted:
             report.inserted += 1
@@ -387,7 +394,12 @@ def _reconcile_dir(
             continue
         targets, transformed = prep.outputs, prep.transformed
 
-        accounted = sum(1 for out in targets if _register(out))
+        # Split parts (prep.individual) all share one album key, minted from the
+        # ORIGINAL stem so the dispatcher batches them into a single ordered
+        # album rather than sending each part as its own message.
+        split_gk = (split_group_key(report.platform, username, f.stem)
+                    if prep.individual else None)
+        accounted = sum(1 for out in targets if _register(out, group_key=split_gk))
 
         # Retire the replaced original only once every output is accounted for,
         # so a partial-registration failure keeps the source bytes on disk.

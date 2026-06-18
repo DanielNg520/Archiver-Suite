@@ -64,13 +64,25 @@ from telethon.errors import FloodWaitError, ImageProcessFailedError
 from telethon.tl import types as tg_types
 
 from core.files import media_bucket
-from core import media_prep
+from core import media_prep, Sanitizer
 
 from . import fast_upload, image_fix
 from .media_meta import make_thumbnail, probe_video
 from .progress import ProgressReporter
 
 log = logging.getLogger(__name__)
+
+
+def _append_filetype_tag(caption: str | None, file_path: str) -> str | None:
+    """Append a `#<ext>` hashtag (e.g. `#mkv`) for a file shipped as a document,
+    so the archival original is taggable/filterable in the chat. The extension is
+    lowercased and stripped of its dot; a file with no extension is left as-is.
+    Returns the tag alone when there was no caption."""
+    ext = Path(file_path).suffix.lstrip(".").lower()
+    if not ext:
+        return caption
+    tag = f"#{ext}"
+    return f"{caption}\n{tag}" if caption else tag
 
 
 def _video_attributes(file_path: str):
@@ -131,6 +143,7 @@ class SendStrategy(abc.ABC):
         file_path: str,
         caption: str | None,
         ensure_streamable: bool = True,
+        topic_id: int | None = None,
     ) -> SendResult: ...
 
     @abc.abstractmethod
@@ -140,6 +153,7 @@ class SendStrategy(abc.ABC):
         peer: Any,
         file_paths: list[str],
         caption: str | None,
+        topic_id: int | None = None,
     ) -> SendResult: ...
 
 
@@ -169,6 +183,7 @@ class TelethonSendStrategy(SendStrategy):
         stall_min_rate_kib_s: float = 64.0,
         upload_connections: int = 4,
         progress: ProgressReporter | None = None,
+        sanitizer: Sanitizer | None = None,
     ):
         self._api_id           = api_id
         self._api_hash         = api_hash
@@ -181,7 +196,17 @@ class TelethonSendStrategy(SendStrategy):
         self._stall_min_rate_kib_s = stall_min_rate_kib_s
         self._upload_connections = upload_connections
         self._progress = progress
+        self._sanitizer = sanitizer or Sanitizer([])
         self._client: TelegramClient | None = None
+
+    def _display_name(self, path: str) -> str:
+        """The filename Telegram should show: strip the internal ".tgprep"
+        marker (media_prep.clean_upload_name) AND any banned word
+        (self._sanitizer), protecting the extension. Returns the basename
+        unchanged when neither applies — callers only override the name attribute
+        when it differs, so a no-op sanitizer keeps the status-quo path."""
+        base = media_prep.clean_upload_name(path)
+        return self._sanitizer.sanitize_stem(base)
 
     def _progress_cb(self, file_path: str, *,
                      batch_pos: int | None = None,
@@ -245,6 +270,31 @@ class TelethonSendStrategy(SendStrategy):
             await self._client.disconnect()
             log.info("telethon: disconnected")
 
+    async def check_destination(
+        self, *, peer: Any, topic_id: int | None = None,
+    ) -> "tuple[bool, str]":
+        """Verify a send destination exists on Telegram WITHOUT sending. Returns
+        (ok, human detail). Resolves the chat entity; when topic_id is set, also
+        confirms the forum topic by fetching its root message — a forum topic's
+        thread id IS the id of that creation message, so a None result means the
+        topic doesn't exist (or the chat isn't a forum). Powers `check-routes`."""
+        assert self._client is not None, "use as async context manager"
+        try:
+            ent = await self._client.get_entity(peer)
+        except Exception as e:
+            return False, f"chat NOT found ({type(e).__name__})"
+        name = (getattr(ent, "title", None) or getattr(ent, "username", None)
+                or getattr(ent, "id", "?"))
+        if topic_id is None:
+            return True, str(name)
+        try:
+            msg = await self._client.get_messages(ent, ids=topic_id)
+        except Exception as e:
+            return False, f"chat OK ({name}) — topic {topic_id} check errored ({type(e).__name__})"
+        if msg is None:
+            return False, f"chat OK ({name}) — topic {topic_id} NOT found"
+        return True, f"{name} · topic {topic_id}"
+
     async def send(
         self,
         *,
@@ -252,9 +302,19 @@ class TelethonSendStrategy(SendStrategy):
         file_path: str,
         caption: str | None,
         ensure_streamable: bool = True,
+        filetype_tag: bool = False,
+        topic_id: int | None = None,
     ) -> SendResult:
         """
         Single-file send with FloodWait + exponential-backoff retry.
+
+        topic_id (a forum message_thread_id) is passed to Telethon as `reply_to`,
+        which posts the message INTO that forum topic. None → the chat's General
+        topic (no thread). Telethon's reply_to is how forum topics are targeted.
+
+        filetype_tag appends a `#<ext>` hashtag (e.g. `#mkv`) to the caption when
+        the file ships as a document. It is opt-in per source — only chat_id-folder
+        (orphaned) items set it — so a recorder/archiver document send is untagged.
 
         ensure_streamable gates the send-time conversion net. It is the safety
         net for producers that DON'T prep at ingest (the recorder, whose remux
@@ -307,13 +367,24 @@ class TelethonSendStrategy(SendStrategy):
             # A pure document send: no video attributes, no poster thumb, no
             # streaming flag. Telegram stores the bytes verbatim for download.
             # The parallel upload happens INSIDE _do_doc so a retry re-uploads.
+            # Tag the caption with the container type (#mkv, #avi, …) so the
+            # archival full-quality download is visibly distinguished from its
+            # streamable .mp4 preview in the chat. Chat_id-folder items only.
+            doc_caption = (_append_filetype_tag(caption, file_path)
+                           if filetype_tag else caption)
+            # Override the shown filename when ".tgprep"/a banned word changed it
+            # — a document's name is the most visible text after the caption.
+            doc_display = self._display_name(send_path)
+            doc_attrs = ([tg_types.DocumentAttributeFilename(doc_display)]
+                         if doc_display != Path(send_path).name else None)
             try:
                 async def _do_doc():
                     media = await self._upload_document(
-                        send_path, attributes=None, thumb_path=None,
+                        send_path, attributes=doc_attrs, thumb_path=None,
                         supports_streaming=False, force_document=True,
                         progress_cb=self._progress_cb(file_path))
-                    await self._client.send_file(peer, media, caption=caption)
+                    await self._client.send_file(peer, media, caption=doc_caption,
+                                                 reply_to=topic_id)
                 return await self._send_with_retries(
                     _do_doc, what=f"{Path(file_path).name} (document)",
                     payload_bytes=self._payload_bytes([send_path]),
@@ -330,7 +401,7 @@ class TelethonSendStrategy(SendStrategy):
         # stored as "<stem>.tgprep.mp4") — override it with the clean name so the
         # tag never reaches Telegram. A user-supplied filename still wins in
         # get_attributes().
-        display = media_prep.clean_upload_name(send_path)
+        display = self._display_name(send_path)
         if display != Path(send_path).name:
             attributes = (attributes or []) + [
                 tg_types.DocumentAttributeFilename(display)]
@@ -352,12 +423,13 @@ class TelethonSendStrategy(SendStrategy):
                         send_path, attributes=attributes, thumb_path=thumb,
                         supports_streaming=True, force_document=False,
                         progress_cb=self._progress_cb(file_path))
-                    await self._client.send_file(peer, media, caption=caption)
+                    await self._client.send_file(peer, media, caption=caption,
+                                                 reply_to=topic_id)
             else:
                 async def _do():
                     await self._client.send_file(
                         peer, send_path, caption=caption, supports_streaming=True,
-                        attributes=attributes, thumb=thumb,
+                        attributes=attributes, thumb=thumb, reply_to=topic_id,
                         progress_callback=self._progress_cb(file_path),
                     )
             result = await self._send_with_retries(
@@ -389,6 +461,7 @@ class TelethonSendStrategy(SendStrategy):
             async def _do_retry():
                 await self._client.send_file(
                     peer, safe, caption=caption, supports_streaming=True,
+                    reply_to=topic_id,
                     progress_callback=self._progress_cb(file_path),
                 )
             return await self._send_with_retries(
@@ -408,8 +481,12 @@ class TelethonSendStrategy(SendStrategy):
         peer: Any,
         file_paths: list[str],
         caption: str | None,
+        topic_id: int | None = None,
     ) -> SendResult:
         """Send up to 10 files as ONE Telegram album (SendMultiMedia).
+
+        topic_id (forum message_thread_id) → Telethon `reply_to`, posting the
+        whole album into that topic; None → General.
 
         Atomic at the API level: the single send_file([..]) call either
         returns (all items posted) or raises (none posted) — there is no
@@ -435,7 +512,8 @@ class TelethonSendStrategy(SendStrategy):
         # (drain groups by media bucket), so the anchor's bucket decides.
         is_video_album = media_bucket(file_paths[0]) == "video"
         if not is_video_album:
-            return await self._send_photo_album(peer, file_paths, captions)
+            return await self._send_photo_album(
+                peer, file_paths, captions, topic_id=topic_id)
 
         # Poster frames for each clip, built once so they survive retries; same
         # black/white-fade-in fix as the single-send path. fp → thumb-path|None.
@@ -458,6 +536,7 @@ class TelethonSendStrategy(SendStrategy):
                 ]
                 await self._client.send_file(
                     peer, payload, caption=captions, supports_streaming=True,
+                    reply_to=topic_id,
                 )
             return await self._send_with_retries(
                 _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
@@ -477,6 +556,8 @@ class TelethonSendStrategy(SendStrategy):
         peer: Any,
         file_paths: list[str],
         captions: list[str | None],
+        *,
+        topic_id: int | None = None,
     ) -> SendResult:
         """Send a photo album, normalizing any image Telegram would reject.
 
@@ -518,6 +599,7 @@ class TelethonSendStrategy(SendStrategy):
             async def _do():
                 await self._client.send_file(
                     peer, prepared, caption=captions, supports_streaming=True,
+                    reply_to=topic_id,
                     progress_callback=self._progress_cb(
                         file_paths[0], batch_total=len(prepared)),
                 )
@@ -548,6 +630,7 @@ class TelethonSendStrategy(SendStrategy):
             async def _do_retry():
                 await self._client.send_file(
                     peer, retry_paths, caption=captions, supports_streaming=True,
+                    reply_to=topic_id,
                     progress_callback=self._progress_cb(
                         file_paths[0], batch_total=len(retry_paths)),
                 )
@@ -614,7 +697,7 @@ class TelethonSendStrategy(SendStrategy):
         # Strip any ".tgprep" marker from the album item's filename too (same
         # reason as the single path) — an explicit DocumentAttributeFilename
         # overrides the basename get_attributes would otherwise derive.
-        display = media_prep.clean_upload_name(file_path)
+        display = self._display_name(file_path)
         name_attr = ([tg_types.DocumentAttributeFilename(display)]
                      if display != Path(file_path).name else [])
         return await self._upload_document(

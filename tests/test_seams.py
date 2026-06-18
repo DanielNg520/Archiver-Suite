@@ -614,13 +614,14 @@ class _FakeSend:
         self.sent_albums: list[list[str]] = []
         self.sent_ensure_streamable: list[bool] = []
 
-    async def send(self, *, peer, file_path, caption, ensure_streamable=True):
+    async def send(self, *, peer, file_path, caption, ensure_streamable=True,
+                   filetype_tag=False, topic_id=None):
         from dispatcher.send import SendResult
         self.sent_singles.append(file_path)
         self.sent_ensure_streamable.append(ensure_streamable)
         return SendResult(ok=True)
 
-    async def send_album(self, *, peer, file_paths, caption):
+    async def send_album(self, *, peer, file_paths, caption, topic_id=None):
         from dispatcher.send import SendResult
         self.sent_albums.append(list(file_paths))
         return SendResult(ok=True)
@@ -832,14 +833,16 @@ class _FlakySend(_FakeSend):
             return SendResult(ok=False, error="simulated network failure")
         return None
 
-    async def send(self, *, peer, file_path, caption, ensure_streamable=True):
+    async def send(self, *, peer, file_path, caption, ensure_streamable=True,
+                   filetype_tag=False, topic_id=None):
         return self._maybe_fail() or await super().send(
             peer=peer, file_path=file_path, caption=caption,
-            ensure_streamable=ensure_streamable)
+            ensure_streamable=ensure_streamable, filetype_tag=filetype_tag,
+            topic_id=topic_id)
 
-    async def send_album(self, *, peer, file_paths, caption):
+    async def send_album(self, *, peer, file_paths, caption, topic_id=None):
         return self._maybe_fail() or await super().send_album(
-            peer=peer, file_paths=file_paths, caption=caption)
+            peer=peer, file_paths=file_paths, caption=caption, topic_id=topic_id)
 
 
 def test_in_batch_dedup_integrity_seam(tmp: Path) -> None:

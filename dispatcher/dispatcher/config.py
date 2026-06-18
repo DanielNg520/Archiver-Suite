@@ -13,12 +13,12 @@ instance is fixed but its contents can be mutated through .set/.unset.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from core import PolicyStore, DEFAULT_DB_PATH
+from core import PolicyStore, DEFAULT_DB_PATH, Sanitizer, load_words
 
 # Load dispatcher's own .env BEFORE any os.environ reads. This is a side
 # effect on import; matches archiver's pattern. Test code that needs a
@@ -39,6 +39,16 @@ def _req(key: str) -> str:
 
 def _opt(key: str, default: str = "") -> str:
     return os.environ.get(key, default).strip()
+
+
+def banned_words_file_path() -> Path:
+    """Path to the banned-word list the sanitizer reads (BANNED_WORDS_FILE, else
+    ~/.config/dispatcher/banned_words.txt). One word per line, '#' comments. The
+    single source of truth shared by config-load and the `banned-words` CLI."""
+    return Path(_opt(
+        "BANNED_WORDS_FILE",
+        str(Path.home() / ".config" / "dispatcher" / "banned_words.txt")
+    )).expanduser()
 
 
 def session_name_or_default() -> str:
@@ -79,6 +89,11 @@ class DispatcherConfig:
     default_chat_id:    str | None
     db_path:            str
     policy_store:       PolicyStore
+    # Banned-word sanitizer, applied to upload filenames + captions at send time.
+    # Empty (no words / no file) → a no-op. Word list path via BANNED_WORDS_FILE
+    # (default ~/.config/dispatcher/banned_words.txt): one word per line, '#'
+    # comments allowed.
+    sanitizer:          Sanitizer = field(default_factory=lambda: Sanitizer([]))
     poll_interval_s:    float = 2.0
     max_retries:        int   = 4
     retry_base_delay:   float = 2.0
@@ -116,11 +131,13 @@ class DispatcherConfig:
         default_db = os.path.expanduser(DEFAULT_DB_PATH)
         telegram = TelegramCreds.from_env() if require_telegram else None
         default_chat_id = _req("TELEGRAM_CHAT_ID") if require_telegram else None
+        banned_words_file = banned_words_file_path()
         return cls(
             telegram          = telegram,
             default_chat_id   = default_chat_id,
             db_path           = _opt("ARCHIVER_DB", _opt("DISPATCHER_DB", default_db)),
             policy_store      = store,
+            sanitizer         = Sanitizer(load_words(banned_words_file)),
             poll_interval_s   = float(_opt("POLL_INTERVAL_S", "2.0")),
             max_retries       = int(_opt("MAX_RETRIES", "4")),
             retry_base_delay  = float(_opt("RETRY_BASE_DELAY", "2.0")),

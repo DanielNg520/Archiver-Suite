@@ -121,7 +121,7 @@ CREATE TABLE IF NOT EXISTS metadata (
 # (not executescript) so the whole upgrade is ONE transaction that rolls back
 # cleanly on failure — including the user_version bump, which lives in the DB
 # header and participates in the transaction.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class SchemaVersionError(RuntimeError):
@@ -168,6 +168,16 @@ _MIGRATIONS: list[tuple[int, list[str]]] = [
         # new users (no checkpoint row yet) default to "needs full history".
         "ALTER TABLE checkpoints ADD COLUMN full_history_done INTEGER NOT NULL DEFAULT 0",
         "UPDATE checkpoints SET full_history_done = 1",
+    ]),
+    (4, [
+        # Forum-topic destination. The twin of chat_id (schema v1): explicit on
+        # orphaned rows whose folder name carries a `.t<topic_id>` suffix, NULL
+        # for platform/recorder rows (which resolve their destination — chat AND
+        # topic — from the env chain at send time). A forum's message_thread_id;
+        # NULL → the chat's General topic (no reply_to). INTEGER, not TEXT,
+        # because a thread id is always a positive int and Telethon's reply_to
+        # wants one — keeps the send-time call total.
+        "ALTER TABLE items ADD COLUMN topic_id INTEGER",
     ]),
 ]
 

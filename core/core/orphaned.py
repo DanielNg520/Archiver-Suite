@@ -38,7 +38,8 @@ from .dedup import MEDIA_EXTENSIONS
 from .deletion import DeletionGuard
 from .files import cleanup_sidecars
 from .ingest import register_file, IngestOutcome
-from .routing import is_chat_id
+from .routing import parse_route
+from .grouping import split_group_key
 from .store import ItemStore
 
 log = logging.getLogger(__name__)
@@ -142,16 +143,18 @@ def ingest_chat_id_dirs(
             continue
         if name.lower() in known:
             continue   # a platform dir — the archiver's reconcile pass owns it
-        if not is_chat_id(name):
+        route = parse_route(name)
+        if route is None:
             log.warning(
                 "orphaned: top-level dir %r is neither a known platform nor a "
-                "valid chat_id — skipping (rename it to the destination chat_id "
-                "to route it)", name,
+                "valid chat_id — skipping (rename it to the destination chat_id, "
+                "optionally with a `.t<topic_id>` suffix, to route it)", name,
             )
             reports.append(OrphanedReport(chat_id=name, skipped_dir=True))
             continue
         reports.append(ingest_folder(
-            store, entry, chat_id=name, priority=priority, guard=guard))
+            store, entry, chat_id=route.chat_id, topic_id=route.topic_id,
+            priority=priority, guard=guard))
     return reports
 
 
@@ -168,6 +171,7 @@ _OUTCOME_TALLY = {
 
 def ingest_folder(
     store: ItemStore, folder: Path, *, chat_id: str,
+    topic_id: int | None = None,
     priority: int = CHAT_ID_PRIORITY,
     guard: DeletionGuard | None = None,
 ) -> OrphanedReport:
@@ -280,6 +284,7 @@ def ingest_folder(
                     platform  = ORPHANED_PLATFORM,
                     username  = chat_id,
                     chat_id   = chat_id,
+                    topic_id  = topic_id,
                     group_key = None,
                     caption   = f.name,
                     priority  = priority,
@@ -290,12 +295,19 @@ def ingest_folder(
                 rep.errors.append(f"{f.name}: keep-original {e}")
                 log.exception("orphaned: register_file (keep-original) on %s", f)
 
-        # Register every output. For split parts each is its own message; for a
-        # passthrough or single conversion the file's location decides grouping.
+        # Register every output. Split parts of one original share a synthetic
+        # group_key so the dispatcher albums them (ordered) as a single batch;
+        # for a passthrough or single conversion the file's location decides
+        # grouping. The key is minted from the ORIGINAL stem (f), so all parts —
+        # whatever their per-part names — land in the same album.
+        split_gk = (split_group_key(ORPHANED_PLATFORM, chat_id, f.stem)
+                    if prep.individual else None)
         outcomes: list[IngestOutcome] = []
         for out in prep.outputs:
-            group_key, caption = _route_for(
-                folder, chat_id, out, individual=prep.individual)
+            if split_gk is not None:
+                group_key, caption = split_gk, out.name
+            else:
+                group_key, caption = _route_for(folder, chat_id, out)
             try:
                 res = register_file(
                     store, out,
@@ -303,6 +315,7 @@ def ingest_folder(
                     platform  = ORPHANED_PLATFORM,
                     username  = chat_id,
                     chat_id   = chat_id,
+                    topic_id  = topic_id,
                     group_key = group_key,
                     caption   = caption,
                     priority  = priority,
@@ -355,14 +368,11 @@ def ingest_folder(
 
 
 def _route_for(
-    folder: Path, chat_id: str, out: Path, *, individual: bool,
+    folder: Path, chat_id: str, out: Path,
 ) -> tuple[str | None, str | None]:
-    """(group_key, caption) for an output file. Split parts (individual=True)
-    each get a unique batch key so they send as separate ordered messages; a
-    file in a subfolder albums by subfolder; a top-level file sends alone."""
-    if individual:
-        # Unique group via caption; display caption is the stem (drain).
-        return None, out.name
+    """(group_key, caption) for a non-split output file. A file in a subfolder
+    albums by subfolder; a top-level file sends alone. (Split parts are keyed by
+    the caller via split_group_key — they never reach here.)"""
     try:
         rel = out.relative_to(folder)
         subpath = rel.parent.as_posix()

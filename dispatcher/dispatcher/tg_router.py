@@ -11,6 +11,13 @@ Resolution chain (most specific wins):
   4. TELEGRAM_CHAT_ID_<PLATFORM>          (per-platform override)
   5. TELEGRAM_CHAT_ID                     (global default; required)
 
+FORUM TOPICS — each layer has an optional sibling TELEGRAM_TOPIC_<…> var naming
+a forum topic (message_thread_id) within that chat. The chat AND its topic are
+ALWAYS resolved from the SAME layer (see _destination_from_env): you can never
+end up posting to a chat from layer 3 inside a topic from layer 4. Orphaned rows
+carry an explicit chat_id+topic_id pair (parsed together from the `.t<id>`
+folder name), which overrides the env chain entirely — same atomicity.
+
 These env vars are read from dispatcher's own .env at
 ~/.config/dispatcher/.env. The dispatcher process loads its own
 environment — no collision with archiver's .env even though the
@@ -61,6 +68,27 @@ def _platform_key(platform: str) -> str:
     return f"TELEGRAM_CHAT_ID_{platform.upper()}"
 
 
+def _topic_for_chat_key(chat_key: str) -> str:
+    """The sibling TELEGRAM_TOPIC_<…> var for a TELEGRAM_CHAT_ID_<…> var, so a
+    layer's chat and topic are always named in lockstep."""
+    return chat_key.replace("TELEGRAM_CHAT_ID", "TELEGRAM_TOPIC", 1)
+
+
+def _topic_env(chat_key: str) -> int | None:
+    """Read+parse the forum topic id siblng to `chat_key`. A non-integer value
+    is a config typo: warn loudly and fall back to General (None) rather than
+    crash the daemon or silently misroute to a numeric-looking thread."""
+    raw = os.environ.get(_topic_for_chat_key(chat_key), "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("router: %s=%r is not an integer topic id — ignoring "
+                    "(posting to General)", _topic_for_chat_key(chat_key), raw)
+        return None
+
+
 def _is_tiktok_live(platform: str, source: str | None) -> bool:
     return platform.lower() == "tiktok" and (source or "").lower() == "recorder"
 
@@ -72,16 +100,30 @@ class RouteError(ValueError):
 
 
 @dataclass(frozen=True)
+class Destination:
+    """A resolved send target: a chat and (optionally) a forum topic within it.
+    Resolved as ONE unit so chat and topic can never come from different env
+    layers. topic_id is None for the chat's General topic."""
+    chat_id:  str
+    topic_id: int | None = None
+
+    @property
+    def peer(self) -> Any:
+        return _resolve_peer(self.chat_id)
+
+
+@dataclass(frozen=True)
 class TelegramRouter:
     """Immutable resolver. Built once at dispatcher startup."""
     default_chat_id: str
 
     # ── Item-aware entry point (explicit chat_id wins) ────────────────────
-    def chat_id_for_item(self, item) -> str:
-        """Resolve the destination for one item. An explicit chat_id on the
-        row (orphaned files, whose folder name IS the destination) overrides
-        the platform/user env resolution entirely. Validated here so a
-        fat-fingered folder name fails fast and loud, not mid-send."""
+    def destination_for_item(self, item) -> Destination:
+        """Resolve the full destination (chat + topic) for one item. An explicit
+        chat_id on the row (orphaned files, whose folder name IS the destination)
+        overrides the env resolution entirely; its topic_id travels with it as a
+        pair. Validated here so a fat-fingered folder name fails fast and loud,
+        not mid-send."""
         if item.chat_id:
             cid = item.chat_id.strip()
             if not is_chat_id(cid):
@@ -89,11 +131,38 @@ class TelegramRouter:
                     f"item id={item.id}: chat_id {item.chat_id!r} is not a "
                     f"valid Telegram destination"
                 )
-            return cid
-        return self.chat_id_for(item.platform, item.username, source=item.source)
+            return Destination(cid, item.topic_id)
+        return self._destination_from_env(
+            item.platform, item.username, source=item.source)
+
+    def chat_id_for_item(self, item) -> str:
+        """Bare chat_id for one item (back-compat / explain). See
+        destination_for_item for the chat+topic pair the sender uses."""
+        return self.destination_for_item(item).chat_id
 
     def peer_for_item(self, item):
-        return _resolve_peer(self.chat_id_for_item(item))
+        return self.destination_for_item(item).peer
+
+    def _destination_from_env(
+        self,
+        platform: str,
+        username: str,
+        *,
+        source: str | None = None,
+    ) -> Destination:
+        """Walk the precedence chain; the FIRST chat var that is set decides the
+        destination, and the topic is read from that SAME layer's sibling var."""
+        keys: list[str] = []
+        if _is_tiktok_live(platform, source):
+            keys += [_user_key("tiktok_live", username),
+                     _platform_key("tiktok_live")]
+        keys += [_user_key(platform, username), _platform_key(platform)]
+        for k in keys:
+            v = os.environ.get(k, "").strip()
+            if v:
+                return Destination(v, _topic_env(k))
+        # Global default layer: TELEGRAM_CHAT_ID / TELEGRAM_TOPIC.
+        return Destination(self.default_chat_id, _topic_env("TELEGRAM_CHAT_ID"))
 
     def chat_id_for(
         self,
@@ -102,25 +171,12 @@ class TelegramRouter:
         *,
         source: str | None = None,
     ) -> str:
-        if _is_tiktok_live(platform, source):
-            v = os.environ.get(_user_key("tiktok_live", username), "").strip()
-            if v:
-                return v
-            v = os.environ.get(_platform_key("tiktok_live"), "").strip()
-            if v:
-                return v
-        v = os.environ.get(_user_key(platform, username), "").strip()
-        if v:
-            return v
-        v = os.environ.get(_platform_key(platform), "").strip()
-        if v:
-            return v
-        return self.default_chat_id
+        return self._destination_from_env(
+            platform, username, source=source).chat_id
 
     def peer_for(self, platform: str, username: str, *, source: str | None = None):
-        return _resolve_peer(
-            self.chat_id_for(platform, username, source=source)
-        )
+        return self._destination_from_env(
+            platform, username, source=source).peer
 
     def explain(
         self,

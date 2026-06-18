@@ -126,7 +126,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     machine = StateMachine(config, platform, capture, _enqueue, lock)
 
     def _on_signal(signum, _frame):
-        log.info("signal %s — requesting stop", signum, extra={"ev": "stop"})
+        # First signal → graceful stop. A second one (the user mashing Ctrl-C
+        # because an in-flight network probe / browser fallback hasn't yielded
+        # yet) → hard exit, so the terminal is always recoverable.
+        if machine._stop.is_set():
+            log.warning("second signal — forcing exit", extra={"ev": "stop"})
+            os._exit(130)
+        log.info("signal %s — requesting stop (Ctrl-C again to force)", signum,
+                 extra={"ev": "stop"})
         machine.request_stop()
 
     signal.signal(signal.SIGINT, _on_signal)
@@ -200,7 +207,12 @@ def cmd_record(args: argparse.Namespace) -> int:
     machine = StateMachine(config, platform, capture, _enqueue, lock)
 
     def _on_signal(signum, _frame):
-        log.info("signal %s — requesting stop", signum, extra={"ev": "stop"})
+        # First signal → graceful stop; second → hard exit (see cmd_start).
+        if machine._stop.is_set():
+            log.warning("second signal — forcing exit", extra={"ev": "stop"})
+            os._exit(130)
+        log.info("signal %s — requesting stop (Ctrl-C again to force)", signum,
+                 extra={"ev": "stop"})
         machine.request_stop()
 
     signal.signal(signal.SIGINT, _on_signal)

@@ -79,6 +79,9 @@ class Item:
     content_hash:    str | None = None   # full SHA-256; global dedup key
     chat_id:         str | None = None   # explicit Telegram dest (chat_id folders)
     group_key:       str | None = None   # explicit album batch identity
+    # Forum-topic destination (schema v4). Twin of chat_id: set only when the
+    # destination is explicit (orphaned `.t<id>` folders); NULL → General topic.
+    topic_id:        int | None = None
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> "Item":

@@ -20,7 +20,9 @@ from .files import cleanup_sidecars
 from .deletion import DeletionGuard
 from .dedup import dedup_user, DedupReport, DupGroup
 from .ingest import register_file, IngestResult, IngestOutcome
-from .routing import is_chat_id, CHAT_ID_RE
+from .routing import is_chat_id, CHAT_ID_RE, Route, parse_route
+from .grouping import split_group_key, is_split_group, SPLIT_GROUP_PREFIX
+from .sanitize import Sanitizer, load_words
 from .orphaned import (
     ingest_chat_id_dirs, ingest_folder, OrphanedReport, subfolder_of,
     ORPHANED_SOURCE, ORPHANED_PLATFORM, CHAT_ID_PRIORITY,
@@ -39,7 +41,9 @@ __all__ = [
     "DeletionGuard",
     "dedup_user", "DedupReport", "DupGroup",
     "register_file", "IngestResult", "IngestOutcome",
-    "is_chat_id", "CHAT_ID_RE",
+    "is_chat_id", "CHAT_ID_RE", "Route", "parse_route",
+    "split_group_key", "is_split_group", "SPLIT_GROUP_PREFIX",
+    "Sanitizer", "load_words",
     "ingest_chat_id_dirs", "ingest_folder", "OrphanedReport", "subfolder_of",
     "ORPHANED_SOURCE", "ORPHANED_PLATFORM", "CHAT_ID_PRIORITY",
     "backfill_content_hashes", "BackfillReport",

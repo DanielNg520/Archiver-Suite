@@ -86,6 +86,7 @@ def register_file(
     caption:    str | None = None,
     priority:   int = 100,
     identifier: str | None = None,
+    topic_id:   int | None = None,
 ) -> IngestResult:
     """Register one finished media file as a pending upload. Never raises for
     an expected condition (unstable / unreadable / duplicate) — it reports the
@@ -134,6 +135,7 @@ def register_file(
         content_hash    = digest,
         chat_id         = chat_id,
         group_key       = group_key,
+        topic_id        = topic_id,
     )
     if not inserted:
         # Lost a race on UNIQUE(platform, identifier) — another row claimed

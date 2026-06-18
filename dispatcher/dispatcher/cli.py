@@ -5,6 +5,9 @@ Argparse-based CLI. Subcommands:
 
   dispatcher start                      Run the drain loop in foreground.
   dispatcher status                     Queue counts + top pending rows.
+  dispatcher check-routes [token …]     Verify chat_id/.t<topic> dests exist.
+  dispatcher banned-words add <word…>   Add words stripped from names/captions.
+  dispatcher banned-words remove <w…>   Remove banned words.  list  Show them.
   dispatcher queue list [--status S]    List rows; default newest 50.
   dispatcher queue retry <id>           Reset failed/sent row to pending.
   dispatcher queue cancel <id>          Force pending/sending row to failed.
@@ -30,16 +33,19 @@ from pathlib import Path
 
 from core import (
     ItemStore, DeletePolicy, RecorderDeletePolicy, BatchPolicy, DeletionGuard,
+    parse_route, load_words,
 )
 from core import cli as core_cli
 from core import termui
 
-from .config import DispatcherConfig, session_name_or_default
+from .config import (
+    DispatcherConfig, session_name_or_default, banned_words_file_path,
+)
 from .drain import drain_forever
 from .instance_lock import DispatcherAlreadyRunning, DispatcherInstanceLock
 from .progress import ProgressReporter, describe, read_progress
 from .send import TelethonSendStrategy
-from .tg_router import TelegramRouter
+from .tg_router import TelegramRouter, Destination
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +90,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
         stall_min_rate_kib_s = config.stall_min_rate_kib_s,
         upload_connections   = config.upload_connections,
         progress         = ProgressReporter(),
+        sanitizer        = config.sanitizer,
     ) as send_strategy:
         try:
             await drain_forever(
@@ -124,6 +131,129 @@ def cmd_start(args: argparse.Namespace) -> int:
         # can still surface. Treat as clean exit.
         log.info("interrupted", extra={"ev": "stop"})
     return 0
+
+
+# ── Subcommand: check-routes ──────────────────────────────────────────────
+
+async def _run_check_routes(
+    config: DispatcherConfig, dests: "list[tuple[str, int | None]]",
+) -> int:
+    assert config.telegram is not None
+    bad = 0
+    async with TelethonSendStrategy(
+        api_id       = config.telegram.api_id,
+        api_hash     = config.telegram.api_hash,
+        phone        = config.telegram.phone,
+        session_name = config.telegram.session_name,
+    ) as strat:
+        for chat_id, topic_id in dests:
+            # Same peer construction the sender uses, so a green check means the
+            # exact value we'd send to resolves.
+            dest = Destination(chat_id, topic_id)
+            label = chat_id + (f".t{topic_id}" if topic_id is not None else "")
+            try:
+                ok, detail = await strat.check_destination(
+                    peer=dest.peer, topic_id=topic_id)
+            except Exception as e:                       # pragma: no cover
+                ok, detail = False, f"check errored ({type(e).__name__}: {e})"
+            termui.field(label, detail, accent="green" if ok else "red")
+            bad += 0 if ok else 1
+    return 1 if bad else 0
+
+
+def cmd_check_routes(args: argparse.Namespace) -> int:
+    """Verify chat_id / chat_id.t<topic> destinations actually exist on Telegram.
+    With no args, checks every explicit destination in the queue plus the default
+    chat; otherwise checks the given tokens (dash-free + `.t<topic>` accepted)."""
+    config = DispatcherConfig.load(require_telegram=True)
+    assert config.telegram is not None
+
+    dests: list[tuple[str, int | None]] = []
+    if args.targets:
+        for t in args.targets:
+            r = parse_route(t)
+            if r is None:
+                termui.field(t, "invalid chat_id / route token", accent="red")
+                continue
+            dests.append((r.chat_id, r.topic_id))
+    else:
+        store = ItemStore.open(config.db_path)
+        try:
+            dests = store.distinct_destinations()
+        finally:
+            store.close()
+        if config.default_chat_id and \
+                (config.default_chat_id, None) not in dests:
+            dests.insert(0, (config.default_chat_id, None))
+
+    if not dests:
+        termui.field("check-routes",
+                     "nothing to check (no explicit queue destinations)",
+                     accent="yellow")
+        return 0
+    print()
+    return asyncio.run(_run_check_routes(config, dests))
+
+
+# ── Subcommand: banned-words ──────────────────────────────────────────────
+
+def cmd_banned_words(args: argparse.Namespace) -> int:
+    """Manage the banned-word list the sanitizer strips from upload filenames +
+    captions. Edits BANNED_WORDS_FILE in place, preserving comments/blank lines.
+    `add` is idempotent (case-insensitive); `remove` drops matching lines."""
+    path = banned_words_file_path()
+    action = args.banned_command
+
+    if action == "list":
+        words = load_words(path)
+        if not words:
+            termui.field("banned-words", f"none set ({path})", accent="yellow")
+        else:
+            print()
+            for w in words:
+                termui.field("•", w, accent="red")
+            termui.field("file", str(path), accent="dim")
+        return 0
+
+    # add / remove both mutate the file.
+    existing_raw = path.read_text(encoding="utf-8").splitlines() \
+        if path.exists() else []
+    active = {ln.strip().lower() for ln in existing_raw
+              if ln.strip() and not ln.strip().startswith("#")}
+    targets = [w.strip() for w in args.words if w.strip()]
+
+    if action == "add":
+        added = []
+        out = list(existing_raw)
+        for w in targets:
+            if w.lower() in active:
+                continue
+            out.append(w)
+            active.add(w.lower())
+            added.append(w)
+        if added:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("\n".join(out) + "\n", encoding="utf-8")
+        termui.field("added", ", ".join(added) if added else "(all already present)",
+                     accent="green" if added else "yellow")
+        return 0
+
+    if action == "remove":
+        drop = {w.lower() for w in targets}
+        kept, removed = [], []
+        for ln in existing_raw:
+            s = ln.strip()
+            if s and not s.startswith("#") and s.lower() in drop:
+                removed.append(s)
+            else:
+                kept.append(ln)
+        if removed:
+            path.write_text(("\n".join(kept) + "\n") if kept else "",
+                            encoding="utf-8")
+        termui.field("removed", ", ".join(removed) if removed else "(none matched)",
+                     accent="green" if removed else "yellow")
+        return 0
+    return 2
 
 
 # ── Subcommand: status ────────────────────────────────────────────────────
@@ -276,6 +406,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="show queue counts + top pending")
     core_cli.add_stats_parser(sub)   # shared `stats` noun (DB counts)
 
+    p_check = sub.add_parser(
+        "check-routes",
+        help="verify chat_id / chat_id.t<topic> destinations exist on Telegram")
+    p_check.add_argument(
+        "targets", nargs="*",
+        help="chat_id or chat_id.t<topic> to check (dash-free numeric ok); "
+             "default = all explicit queue destinations + the default chat")
+
+    p_banned = sub.add_parser(
+        "banned-words", help="manage words stripped from filenames/captions")
+    banned_sub = p_banned.add_subparsers(dest="banned_command", required=True)
+    b_add = banned_sub.add_parser("add", help="add one or more banned words")
+    b_add.add_argument("words", nargs="+")
+    b_rm = banned_sub.add_parser("remove", help="remove one or more banned words")
+    b_rm.add_argument("words", nargs="+")
+    banned_sub.add_parser("list", help="list the current banned words")
+
     p_queue = sub.add_parser("queue", help="queue operations")
     queue_sub = p_queue.add_subparsers(dest="queue_command", required=True)
 
@@ -318,6 +465,10 @@ def _build_parser() -> argparse.ArgumentParser:
 _DISPATCHERS = {
     ("start", None):                cmd_start,
     ("status", None):               cmd_status,
+    ("check-routes", None):         cmd_check_routes,
+    ("banned-words", "add"):        cmd_banned_words,
+    ("banned-words", "remove"):     cmd_banned_words,
+    ("banned-words", "list"):       cmd_banned_words,
     ("stats", None):                cmd_stats,
     ("queue", "list"):              cmd_queue_list,
     ("queue", "retry"):             cmd_queue_retry,
@@ -335,7 +486,8 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.verbose)
 
     sub = getattr(args, "queue_command", None) \
-          or getattr(args, "config_command", None)
+          or getattr(args, "config_command", None) \
+          or getattr(args, "banned_command", None)
     handler = _DISPATCHERS.get((args.command, sub))
     if handler is None:
         log.error("cli: no handler for %s/%s", args.command, sub)

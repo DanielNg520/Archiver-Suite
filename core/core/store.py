@@ -269,6 +269,7 @@ class ItemStore:
         content_hash:    str | None = None,
         chat_id:         str | None = None,
         group_key:       str | None = None,
+        topic_id:        int | None = None,
     ) -> bool:
         """
         Register a downloaded/recorded file as a pending upload. This IS
@@ -284,17 +285,19 @@ class ItemStore:
           - chat_id      → explicit Telegram destination (orphaned folders)
           - group_key    → explicit album batch identity (else NULL → the
                            dispatcher falls back to caption-based grouping)
+          - topic_id     → explicit forum-topic thread (twin of chat_id; NULL →
+                           the chat's General topic)
         """
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO items
                  (source, platform, username, identifier, file_path,
                   upload_date, file_size_bytes, title, discovered_at,
                   status, priority, caption, attempts,
-                  content_hash, chat_id, group_key)
-               VALUES (?,?,?,?,?,?,?,?,?, 'pending', ?, ?, 0, ?, ?, ?)""",
+                  content_hash, chat_id, group_key, topic_id)
+               VALUES (?,?,?,?,?,?,?,?,?, 'pending', ?, ?, 0, ?, ?, ?, ?)""",
             (source, platform, username, identifier, file_path,
              upload_date, file_size_bytes, title, now_iso(),
-             priority, caption, content_hash, chat_id, group_key),
+             priority, caption, content_hash, chat_id, group_key, topic_id),
         )
         self._commit()
         return cur.rowcount > 0
@@ -318,6 +321,18 @@ class ItemStore:
             "SELECT id FROM items WHERE file_path=?", (file_path,),
         ).fetchone()
         return r["id"] if r else None
+
+    def distinct_destinations(self) -> "list[tuple[str, int | None]]":
+        """Every distinct explicit (chat_id, topic_id) currently in the queue —
+        the rows whose chat_id is set (orphaned / topic-routed items). Powers
+        `dispatcher check-routes`: the set of explicit destinations whose
+        existence on Telegram is worth pre-verifying. Platform/recorder rows
+        (chat_id NULL, resolved from env at send) are not enumerable here."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT chat_id, topic_id FROM items "
+            "WHERE chat_id IS NOT NULL ORDER BY chat_id, topic_id"
+        ).fetchall()
+        return [(r["chat_id"], r["topic_id"]) for r in rows]
 
     def find_by_content_hash(self, content_hash: str) -> Item | None:
         """Existing row sharing these exact bytes, or None. Drives ingest-time
@@ -439,6 +454,12 @@ class ItemStore:
             return []
 
         GROUP_DISC = "COALESCE(group_key, caption, '')"
+        # DESTINATION is part of the batch identity: an album must never mix two
+        # chats OR two forum topics. chat_id/topic_id are NULL for platform rows
+        # (so NULLs must group together) → IFNULL sentinels. Without this, two
+        # `.t1`/`.t2` topic folders that share a chat AND a subfolder name would
+        # collide on group_disc and one topic's files would land in the other.
+        DEST_DISC = "IFNULL(chat_id,''), IFNULL(topic_id,-1)"
         gated = min_batch is not None or flush_age_s is not None
 
         for _ in range(_CLAIM_RETRIES):
@@ -446,7 +467,9 @@ class ItemStore:
                 if not gated:
                     anchor = cur.execute(
                         f"""SELECT id, platform, username, source, file_path,
-                                  {GROUP_DISC} AS group_disc
+                                  {GROUP_DISC} AS group_disc,
+                                  IFNULL(chat_id,'') AS chat_disc,
+                                  IFNULL(topic_id,-1) AS topic_disc
                              FROM items WHERE status='pending'
                             ORDER BY priority ASC, discovered_at ASC LIMIT 1"""
                     ).fetchone()
@@ -456,7 +479,9 @@ class ItemStore:
                 else:
                     pending = cur.execute(
                         f"""SELECT id, platform, username, source, file_path,
-                                  discovered_at, {GROUP_DISC} AS group_disc
+                                  discovered_at, {GROUP_DISC} AS group_disc,
+                                  IFNULL(chat_id,'') AS chat_disc,
+                                  IFNULL(topic_id,-1) AS topic_disc
                              FROM items WHERE status='pending'
                             ORDER BY priority ASC, discovered_at ASC"""
                     ).fetchall()
@@ -488,8 +513,10 @@ class ItemStore:
     def _gather_group(self, cur, anchor, group_disc_sql: str,
                       max_items: int) -> list:
         """The anchor's album: all same-bucket pending rows sharing its
-        (platform, username, source, group_disc), capped at max_items. A
-        'single'-bucket anchor yields just itself (gifs/other never album)."""
+        (platform, username, source, group_disc, chat_id, topic_id), capped at
+        max_items. A 'single'-bucket anchor yields just itself (gifs/other never
+        album). chat_id/topic_id are in the key so an album is homogeneous in
+        DESTINATION — never two chats, never two forum topics."""
         bucket = media_bucket(anchor["file_path"])
         if bucket == "single":
             return [anchor]
@@ -498,9 +525,10 @@ class ItemStore:
                  WHERE status='pending'
                    AND platform=? AND username=? AND source=?
                    AND {group_disc_sql}=?
+                   AND IFNULL(chat_id,'')=? AND IFNULL(topic_id,-1)=?
                  ORDER BY priority ASC, discovered_at ASC""",
             (anchor["platform"], anchor["username"], anchor["source"],
-             anchor["group_disc"]),
+             anchor["group_disc"], anchor["chat_disc"], anchor["topic_disc"]),
         ).fetchall()
         chosen = []
         for row in candidates:
@@ -525,7 +553,8 @@ class ItemStore:
         for anchor in pending:
             bucket = media_bucket(anchor["file_path"])
             gkey = (anchor["platform"], anchor["username"], anchor["source"],
-                    anchor["group_disc"], bucket)
+                    anchor["group_disc"], anchor["chat_disc"],
+                    anchor["topic_disc"], bucket)
             if gkey in deferred:
                 continue
             if bucket == "single":

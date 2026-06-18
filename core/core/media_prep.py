@@ -33,8 +33,9 @@ shipping something broken or oversized. A file we don't need to touch
 
 OUTPUT PLACEMENT: derived files are written NEXT TO the source so the orphaned
 ingester's subfolder→album routing keeps working unchanged. Split parts are
-the exception — each chunk of one video is a standalone clip, so they are
-registered as individual messages (the caller decides this via .individual).
+the exception — the .individual flag marks them as the chunks of ONE oversize
+video; the caller (orphaned/reconcile) stamps every part with a shared
+split_group_key so the dispatcher ships them as a single ordered album.
 """
 
 from __future__ import annotations
