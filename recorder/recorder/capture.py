@@ -44,6 +44,8 @@ OUTPUT DISCOVERY:
 from __future__ import annotations
 
 import logging
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -103,8 +105,15 @@ class StreamCapture:
         # merged into stdout so one file holds the full diagnostic stream.
         self._log_path = self._run_dir / f"{username}_{int(self._started_at)}_ytdlp.log"
         self._log_fh = open(self._log_path, "ab", buffering=0)
+        # start_new_session puts yt-dlp in its OWN process group so we can later
+        # signal the whole group. yt-dlp does the actual download via a child
+        # ffmpeg (--downloader ffmpeg); without the group, terminating only the
+        # yt-dlp pid orphans that ffmpeg — it keeps the recording file open and
+        # writing, and a remux that then unlinks the source drains live footage
+        # into a deleted inode (silent data loss, observed in prod).
         self._proc = subprocess.Popen(
             cmd, stdout=self._log_fh, stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     def is_running(self) -> bool:
@@ -150,15 +159,39 @@ class StreamCapture:
         return rc
 
     def _terminate(self) -> None:
-        """SIGTERM yt-dlp, escalating to SIGKILL if it ignores us."""
+        """Stop the capture AND every subprocess it spawned.
+
+        SIGTERM the whole process group (yt-dlp + its child ffmpeg), escalating
+        to SIGKILL if the group ignores us. Group-signalling is what guarantees
+        the ffmpeg downloader dies with yt-dlp instead of being orphaned and
+        left writing the recording file (see start()). Falls back to signalling
+        the lone pid if the group can't be reached (already gone / no killpg)."""
         if self._proc is None:
             return
-        self._proc.terminate()
+        if not self._signal_group(signal.SIGTERM):
+            self._proc.terminate()
         try:
             self._proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            log.warning("capture: yt-dlp ignored SIGTERM — killing")
-            self._proc.kill()
+            log.warning("capture: yt-dlp group ignored SIGTERM — killing")
+            if not self._signal_group(signal.SIGKILL):
+                self._proc.kill()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                log.error("capture: yt-dlp survived SIGKILL — possible orphan")
+
+    def _signal_group(self, sig: int) -> bool:
+        """Send `sig` to the capture's entire process group. Returns False if
+        the group can't be signalled — already exited, not permitted, or the
+        platform has no killpg — so the caller can fall back to the bare pid."""
+        if self._proc is None or not hasattr(os, "killpg"):
+            return False
+        try:
+            os.killpg(os.getpgid(self._proc.pid), sig)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
 
     def _recorded_bytes(self) -> int:
         """Total bytes written so far for this run. output_files() already

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from core import PolicyStore, DEFAULT_DB_PATH, Sanitizer, load_words
+from core import PolicyStore, DEFAULT_DB_PATH, Sanitizer, ReloadingSanitizer
 
 # Load dispatcher's own .env BEFORE any os.environ reads. This is a side
 # effect on import; matches archiver's pattern. Test code that needs a
@@ -137,7 +137,7 @@ class DispatcherConfig:
             default_chat_id   = default_chat_id,
             db_path           = _opt("ARCHIVER_DB", _opt("DISPATCHER_DB", default_db)),
             policy_store      = store,
-            sanitizer         = Sanitizer(load_words(banned_words_file)),
+            sanitizer         = ReloadingSanitizer(banned_words_file),
             poll_interval_s   = float(_opt("POLL_INTERVAL_S", "2.0")),
             max_retries       = int(_opt("MAX_RETRIES", "4")),
             retry_base_delay  = float(_opt("RETRY_BASE_DELAY", "2.0")),

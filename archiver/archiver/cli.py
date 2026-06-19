@@ -503,7 +503,7 @@ def cmd_ingest(args, config: Config, db: ItemStore) -> int:
     """Ingest loose files and enqueue them as source='orphaned' rows (deduped).
     Default: scan output_dir's chat_id folders. --path DIR --chat CHAT_ID:
     ingest an arbitrary folder to an explicit chat (same dedup guarantee)."""
-    from core import ingest_chat_id_dirs, ingest_folder, is_chat_id
+    from core import ingest_chat_id_dirs, ingest_folder, parse_route
 
     guard = DeletionGuard(config.policy_store)
 
@@ -511,7 +511,12 @@ def cmd_ingest(args, config: Config, db: ItemStore) -> int:
         if not args.chat:
             log.error("ingest --path requires --chat <chat_id>")
             return 2
-        if not is_chat_id(args.chat):
+        # parse_route (not bare is_chat_id) so a dash-free numeric id is re-signed
+        # to its canonical -100… form before it lands on the row — otherwise the
+        # dispatcher would resolve it as a PeerUser. Also accepts a .t<topic>
+        # suffix, routing the ingest to a specific forum topic.
+        route = parse_route(args.chat)
+        if route is None:
             log.error("ingest --chat %r is not a valid chat_id", args.chat)
             return 2
         folder = Path(args.path).expanduser()
@@ -519,7 +524,8 @@ def cmd_ingest(args, config: Config, db: ItemStore) -> int:
             log.error("ingest --path %s is not a directory", folder)
             return 2
         rep = ingest_folder(
-            db, folder, chat_id=args.chat, priority=args.priority, guard=guard)
+            db, folder, chat_id=route.chat_id, topic_id=route.topic_id,
+            priority=args.priority, guard=guard)
         print(rep)
         return 0
 

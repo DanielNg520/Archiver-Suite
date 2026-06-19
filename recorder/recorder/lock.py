@@ -42,6 +42,11 @@ class TikTokLock:
                  recorder_pid: int | None = None):
         self.path = Path(lock_path).expanduser()
         self.pid = recorder_pid if recorder_pid is not None else os.getpid()
+        # Who is being recorded right now. Set by the recorder just before it
+        # acquires the lock for a capture; surfaced in the lockfile so ops (and
+        # any human) can see the in-progress user — the recording isn't in the
+        # items table until it finishes, so the lockfile is the only live source.
+        self.username: str | None = None
 
     def __enter__(self) -> "TikTokLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +54,7 @@ class TikTokLock:
             "pid":        self.pid,
             "started_at": _now_iso(),
             "block":      "download",
+            "username":   self.username,
         }
         # Write atomically so the archiver never reads a half-written file.
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")

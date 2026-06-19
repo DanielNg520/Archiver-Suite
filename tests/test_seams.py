@@ -496,6 +496,20 @@ def test_routing_seam() -> None:
     orphan = _item(source="orphaned", chat_id="-1009999")
     ok(router.chat_id_for_item(orphan) == "-1009999",
        "explicit row chat_id (orphaned) overrides env resolution")
+
+    # Regression: a DASH-FREE numeric channel id on the row (a legacy row, or one
+    # from `archiver ingest --chat 100…`) must re-sign to -100… and resolve as a
+    # PeerChannel — NOT a PeerUser, which Telegram can't find an input entity for.
+    from telethon.tl.types import PeerChannel, PeerUser
+    bare = _item(source="orphaned", chat_id="1001733273713")
+    ok(router.chat_id_for_item(bare) == "-1001733273713",
+       "dash-free channel id re-signed to its canonical -100… form")
+    peer = router.peer_for_item(bare)
+    ok(isinstance(peer, PeerChannel) and peer.channel_id == 1733273713,
+       "dash-free channel id resolves to PeerChannel (not PeerUser → entity error)")
+    ok(not isinstance(router.peer_for_item(orphan), PeerUser),
+       "a -100… channel id never resolves to PeerUser")
+
     bad = _item(source="orphaned", chat_id="not-a-chat-id")
     try:
         router.chat_id_for_item(bad)
@@ -608,22 +622,32 @@ def test_identity_ig_pk_dedup_seam(tmp: Path) -> None:
 
 class _FakeSend:
     """A SendStrategy stand-in: records calls, always succeeds. Lets us drive
-    dispatcher.drain.drain_forever end-to-end with zero network."""
+    dispatcher.drain.drain_forever end-to-end with zero network. Captures the
+    caption and topic_id of every send so seams that assert on the destination
+    forum-topic (Seam 22) or the sanitized caption (Seam 24) can read them back."""
     def __init__(self):
         self.sent_singles: list[str] = []
         self.sent_albums: list[list[str]] = []
         self.sent_ensure_streamable: list[bool] = []
+        self.single_captions: list[str] = []
+        self.album_captions: list[str] = []
+        self.single_topics: list[int | None] = []
+        self.album_topics: list[int | None] = []
 
     async def send(self, *, peer, file_path, caption, ensure_streamable=True,
                    filetype_tag=False, topic_id=None):
         from dispatcher.send import SendResult
         self.sent_singles.append(file_path)
         self.sent_ensure_streamable.append(ensure_streamable)
+        self.single_captions.append(caption)
+        self.single_topics.append(topic_id)
         return SendResult(ok=True)
 
     async def send_album(self, *, peer, file_paths, caption, topic_id=None):
         from dispatcher.send import SendResult
         self.sent_albums.append(list(file_paths))
+        self.album_captions.append(caption)
+        self.album_topics.append(topic_id)
         return SendResult(ok=True)
 
 
@@ -1354,6 +1378,195 @@ def test_keep_original_document_seam(tmp: Path) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Shared drain runner for the destination/grouping seams below (22–24). Drives
+# the real drain_forever to quiescence against a _FakeSend, same pattern as
+# Seam 10/21 but factored out so each new seam reads as just its setup+asserts.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _drain_once(db_file: str, ps, fake: "_FakeSend", *,
+                default_chat_id: str, sanitizer=None) -> None:
+    from core import (ItemStore, DeletePolicy, RecorderDeletePolicy,
+                      BatchPolicy, DeletionGuard)
+    from dispatcher.drain import drain_forever
+    from dispatcher.config import DispatcherConfig
+    from dispatcher.tg_router import TelegramRouter
+
+    cfg_kwargs = dict(
+        telegram=None, default_chat_id=default_chat_id, db_path=db_file,
+        policy_store=ps, poll_interval_s=0.01, max_retries=3,
+        inter_album_sleep=0.0, stuck_claim_min=10, failed_retention_days=0,
+    )
+    if sanitizer is not None:
+        cfg_kwargs["sanitizer"] = sanitizer
+    cfg = DispatcherConfig(**cfg_kwargs)
+    store = ItemStore.open(db_file)
+    router = TelegramRouter(default_chat_id=default_chat_id)
+    stop = asyncio.Event()
+
+    async def _run():
+        task = asyncio.create_task(drain_forever(
+            cfg, store, fake, router,
+            DeletePolicy(ps), RecorderDeletePolicy(ps), BatchPolicy(ps),
+            DeletionGuard(ps), stop_event=stop,
+        ))
+        for _ in range(400):
+            await asyncio.sleep(0.01)
+            c = store.counts_by_status()
+            if c.get("pending", 0) == 0 and c.get("sending", 0) == 0:
+                break
+        stop.set()
+        await task
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 22 — forum-topic routing end-to-end: a `<chat>.t<topic>` folder name →
+# core.parse_route → add_item(topic_id) → claim_batch's destination discriminator
+# (chat_id + topic_id) → drain dest resolution → fake send's reply_to. The trap
+# this guards: two folders for the SAME chat but DIFFERENT topics whose subfolders
+# share a name produce the SAME group_key ('<chat>/<sub>'), so ONLY the topic_id
+# discriminator keeps them from wrongly albuming into one cross-topic message.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_topic_routing_seam(tmp: Path) -> None:
+    section("Seam 22: forum-topic routing (.t<topic> folder → reply_to)")
+    from core import ItemStore, PolicyStore, BatchPolicy
+    from core.orphaned import ingest_chat_id_dirs
+
+    # Same chat, two topics, identically-named subfolders ('g') → colliding
+    # group_key '<chat>/g'. Topic is the only thing that separates them.
+    _write_media(tmp / "-100222.t77" / "g" / "a.jpg", b"AA")
+    _write_media(tmp / "-100222.t77" / "g" / "b.jpg", b"BB")
+    _write_media(tmp / "-100222.t88" / "g" / "c.jpg", b"CC")
+    _write_media(tmp / "-100222.t88" / "g" / "d.jpg", b"DD")
+
+    db_file = str(tmp / "seam22.db")
+    store = ItemStore.open(db_file)
+    reports = ingest_chat_id_dirs(store, tmp, known_platforms=set())
+    inserted = sum(r.inserted for r in reports)
+    ok(inserted == 4, "4 loose files ingested from two .t<topic> folders")
+    paths = [tmp / "-100222.t77" / "g" / "a.jpg",
+             tmp / "-100222.t77" / "g" / "b.jpg",
+             tmp / "-100222.t88" / "g" / "c.jpg",
+             tmp / "-100222.t88" / "g" / "d.jpg"]
+    rows = [store.get(store.id_of(str(p))) for p in paths]
+    topics = sorted(r.topic_id for r in rows)
+    ok(topics == [77, 77, 88, 88],
+       "parse_route carried each file's topic_id onto its row (77/77, 88/88)")
+    ok(all(r.chat_id == "-100222" for r in rows),
+       "the .t<topic> suffix is stripped from chat_id (dest is the bare chat)")
+    store.close()
+
+    ps = PolicyStore()
+    ps.set(BatchPolicy.SIZE_KEY, 1)
+    fake = _FakeSend()
+    _drain_once(db_file, ps, fake, default_chat_id="-100999")
+
+    ok(len(fake.sent_albums) == 2,
+       "two albums sent — the shared group_key did NOT merge across topics")
+    by_topic = {t: sorted(Path(p).name for p in a)
+                for t, a in zip(fake.album_topics, fake.sent_albums)}
+    ok(by_topic.get(77) == ["a.jpg", "b.jpg"],
+       "topic 77 album = a.jpg+b.jpg, sent with reply_to=77")
+    ok(by_topic.get(88) == ["c.jpg", "d.jpg"],
+       "topic 88 album = c.jpg+d.jpg, sent with reply_to=88")
+    ok(None not in fake.album_topics,
+       "every topic-routed album carried a non-None reply_to (no General leak)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 23 — split-part albums: an oversize original split into parts shares ONE
+# core.split_group_key, so claim_batch albums the parts together (despite each
+# part carrying a different per-part caption), and the drain's min-batch gate is
+# EXEMPT for a split group (flush the complete unit immediately, never hold it
+# waiting for the archiver batch size). Guards the contract between core.grouping,
+# core.store.claim_batch, and dispatcher.drain.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_split_album_seam(tmp: Path) -> None:
+    section("Seam 23: split-part albums (shared group_key, gate-exempt flush)")
+    from core import ItemStore, PolicyStore, BatchPolicy, split_group_key
+    from core.hashing import full_hash
+
+    gk = split_group_key("x", "alice", "bigvideo")
+    db_file = str(tmp / "seam23.db")
+    store = ItemStore.open(db_file)
+    parts = []
+    for n in range(3):
+        f = _write_media(tmp / "x" / "alice" / f"bigvideo_part{n:03d}.mp4",
+                         bytes([n]) * 300)
+        parts.append(f)
+        # Distinct per-part captions on purpose: only the shared group_key may
+        # bind them, never a coincidentally-equal caption.
+        store.add_item(source="archiver", platform="x", username="alice",
+                       identifier=f"bigvideo_p{n}", file_path=str(f),
+                       priority=10, group_key=gk, caption=f"part {n}",
+                       content_hash=full_hash(f))
+    store.close()
+
+    ps = PolicyStore()
+    # Archiver min-batch gate set HIGH: a non-split group of 3 would be deferred.
+    # The split exemption is the only reason these flush.
+    ps.set(BatchPolicy.SIZE_KEY, 10)
+    fake = _FakeSend()
+    _drain_once(db_file, ps, fake, default_chat_id="-100123")
+
+    ok(len(fake.sent_albums) == 1 and len(fake.sent_albums[0]) == 3,
+       "all 3 split parts shipped as ONE album despite min_batch=10 (gate-exempt)")
+    ok(sorted(Path(p).name for p in fake.sent_albums[0]) ==
+       ["bigvideo_part000.mp4", "bigvideo_part001.mp4", "bigvideo_part002.mp4"],
+       "the album holds exactly the three parts of the one split original")
+    cap = fake.album_captions[0]
+    ok(cap == "bigvideo_part000\nbigvideo_part001\nbigvideo_part002",
+       "split album caption lists each part stem (one per line), no icon header")
+    store = ItemStore.open(db_file)
+    ok(store.counts_by_status().get("sent", 0) == 3,
+       "all three part rows are terminal 'sent'")
+    store.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 24 — banned-word sanitizer at send: a configured Sanitizer on the
+# dispatcher config strips banned words from the caption the drain builds, before
+# the send sees it — while the on-disk file is left untouched. Guards the contract
+# between core.sanitize and dispatcher.drain's caption path.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_banned_word_sanitizer_seam(tmp: Path) -> None:
+    section("Seam 24: banned-word sanitizer strips caption at send")
+    from core import ItemStore, PolicyStore, Sanitizer
+    from core.hashing import full_hash
+
+    db_file = str(tmp / "seam24.db")
+    store = ItemStore.open(db_file)
+    # An orphaned single → caption is its own stem (drain's orphaned_caption).
+    photo = _write_media(tmp / "-100777" / "meetup badword tonight.jpg", b"PH")
+    store.add_item(source="orphaned", platform="orphaned", username="-100777",
+                   identifier="orph_1", file_path=str(photo), priority=6,
+                   caption="meetup badword tonight", chat_id="-100777",
+                   content_hash=full_hash(photo))
+    store.close()
+
+    ps = PolicyStore()
+    fake = _FakeSend()
+    _drain_once(db_file, ps, fake, default_chat_id="-100777",
+                sanitizer=Sanitizer(["badword"]))
+
+    ok(len(fake.single_captions) == 1, "the orphaned photo sent as one single")
+    cap = fake.single_captions[0]
+    ok("badword" not in cap,
+       "the banned word was stripped from the caption before the send")
+    ok("meetup" in cap and "tonight" in cap,
+       "only the banned token was removed; the rest of the caption survives")
+    ok(photo.exists(),
+       "the on-disk file is untouched (sanitizer rewrites the message, not disk)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
     print("cross-worker seam integration tests")
@@ -1392,6 +1605,9 @@ def main() -> int:
         test_upload_progress_seam(tmp / "s19")
         test_send_streamable_net_seam(tmp / "s20")
         test_keep_original_document_seam(tmp / "s21")
+        test_topic_routing_seam(tmp / "s22")
+        test_split_album_seam(tmp / "s23")
+        test_banned_word_sanitizer_seam(tmp / "s24")
 
     print(f"\nALL PASS ({_checks} checks)")
     return 0

@@ -74,6 +74,7 @@ EVENTS: dict[str, tuple[str, str]] = {
     "ok":      ("✓", "green"),
     # recorder
     "live":    ("●", "green"),
+    "reconnect": ("⟲", "yellow"),
     "rec_end": ("■", "cyan"),
     "remux":   ("⤳", "dim"),
     "queued":  ("↑", "blue"),

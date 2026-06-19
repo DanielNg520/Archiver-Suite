@@ -33,7 +33,7 @@ from typing import Any
 
 from telethon.tl.types import PeerChannel, PeerChat, PeerUser
 
-from core import is_chat_id
+from core import parse_route
 
 log = logging.getLogger(__name__)
 
@@ -122,16 +122,19 @@ class TelegramRouter:
         """Resolve the full destination (chat + topic) for one item. An explicit
         chat_id on the row (orphaned files, whose folder name IS the destination)
         overrides the env resolution entirely; its topic_id travels with it as a
-        pair. Validated here so a fat-fingered folder name fails fast and loud,
-        not mid-send."""
+        pair. Normalized through parse_route — the SAME canonical normalizer the
+        ingester uses — so a dash-free numeric id stored on the row (a legacy row,
+        or one enqueued via `archiver ingest --chat 100…`) is re-signed to its
+        `-100…` form here and resolves as the channel it is, never a PeerUser.
+        A fat-fingered id fails fast and loud here, not mid-send."""
         if item.chat_id:
-            cid = item.chat_id.strip()
-            if not is_chat_id(cid):
+            route = parse_route(item.chat_id.strip())
+            if route is None:
                 raise RouteError(
                     f"item id={item.id}: chat_id {item.chat_id!r} is not a "
                     f"valid Telegram destination"
                 )
-            return Destination(cid, item.topic_id)
+            return Destination(route.chat_id, item.topic_id)
         return self._destination_from_env(
             item.platform, item.username, source=item.source)
 

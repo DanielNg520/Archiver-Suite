@@ -55,15 +55,36 @@ def cmd_health(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _watch_frame() -> str:
+    """One repaint of the watch screen, as a SINGLE string written atomically.
+
+    Flicker-free redraw: never blank the screen (the old `\\033[2J` left a blank
+    frame between clear and repaint — the visible blink). Instead home the cursor
+    and overwrite in place. Each line ends with `\\033[K` (erase-to-end-of-line)
+    so a shorter new line leaves no stale tail; a trailing `\\033[J`
+    (erase-to-end-of-screen) drops orphaned rows when a frame is shorter than the
+    last. Written in one shot so the terminal repaints in a single pass."""
+    body = render()   # render() draws its own header + live clock
+    return "\033[H" + "\033[K\n".join(body.split("\n")) + "\033[K\033[J"
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
+    out = sys.stdout
+    # Alternate screen buffer (like htop/less): watch gets its own screen, so an
+    # oversized report can't smear and the user's scrollback is restored on exit.
+    # Cursor hidden during the loop to kill its blink too.
+    out.write("\033[?1049h\033[?25l")
+    out.flush()
     try:
         while True:
-            print("\033[2J\033[H", end="")  # clear screen
-            print(f"system health  ({time.strftime('%H:%M:%S')})\n")
-            print(render())
+            out.write(_watch_frame())
+            out.flush()
             time.sleep(args.interval)
     except KeyboardInterrupt:
         return 0
+    finally:
+        out.write("\033[?25h\033[?1049l")  # restore cursor + leave alt screen
+        out.flush()
 
 
 def _plist_path(label: str) -> Path:

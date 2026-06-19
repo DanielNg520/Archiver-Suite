@@ -92,6 +92,49 @@ class Sanitizer:
         return stem + p.suffix
 
 
+class ReloadingSanitizer(Sanitizer):
+    """A Sanitizer backed by a word-list FILE that hot-reloads when the file's
+    mtime changes.
+
+    The plain Sanitizer freezes its word list at construction. A long-running
+    process (the dispatcher drain loop) builds it ONCE at startup, so a word
+    added later via `banned-words add` — or a hand-edit of the file — never took
+    effect until the process was restarted, and the token kept leaking into
+    uploads in the meantime. This variant re-reads the file the moment its mtime
+    moves: a stat() per call is negligible next to the network send it guards,
+    and the drain loop is single-threaded so there's no reload race.
+
+    Same interface as Sanitizer (sanitize / sanitize_stem / truthiness); a
+    missing file reloads to the empty (no-op) list."""
+
+    def __init__(self, path: "str | Path") -> None:
+        self._path = Path(path).expanduser()
+        self._mtime: float | None = None
+        super().__init__([])
+        self._reload()
+
+    def _reload(self) -> None:
+        try:
+            m: float | None = self._path.stat().st_mtime
+        except OSError:
+            m = None
+        if m != self._mtime:
+            self._mtime = m
+            super().__init__(load_words(self._path) if m is not None else [])
+
+    def sanitize(self, text: str | None) -> str | None:
+        self._reload()
+        return super().sanitize(text)
+
+    def sanitize_stem(self, filename: str, *, fallback: str = "file") -> str:
+        self._reload()
+        return super().sanitize_stem(filename, fallback=fallback)
+
+    def __bool__(self) -> bool:
+        self._reload()
+        return super().__bool__()
+
+
 def load_words(path: "str | Path") -> list[str]:
     """Read a banned-word list file: one entry per line, blank lines and
     `#` comments ignored. A missing file → [] (feature simply off)."""

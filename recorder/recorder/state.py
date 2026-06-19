@@ -35,6 +35,7 @@ import logging
 import queue
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -49,6 +50,15 @@ from .platforms.base import LivePlatform
 log = logging.getLogger(__name__)
 
 _VIDEO_SUFFIXES = frozenset({".mp4", ".ts", ".mkv", ".webm", ".flv", ".m4v"})
+
+
+def _safe_size(p: Path) -> int:
+    """Byte size of `p`, or 0 if it vanished/can't be stat'd. Used to total a
+    recording session without letting a transient FS error abort the tally."""
+    try:
+        return p.stat().st_size
+    except OSError:
+        return 0
 
 
 def _remux_for_telegram(src: Path) -> Path:
@@ -66,10 +76,21 @@ def _remux_for_telegram(src: Path) -> Path:
     if src.suffix.lower() not in _VIDEO_SUFFIXES:
         return src
 
+    # Integrity guard: only remux a source that's actually present and non-empty.
+    # A vanished/zero-byte source here means the capture was already lost (e.g. a
+    # subprocess orphaned past termination and its file unlinked); remuxing it
+    # would just produce an ffmpeg "No such file" and a misleading fallback.
+    if not src.exists() or _safe_size(src) == 0:
+        log.warning("remux: %s missing or empty — nothing to convert", src.name)
+        return src
+
     # If src is already .mp4 we can't overwrite it while ffmpeg reads it,
-    # so write to a temp name and rename over it after.
+    # so write to a temp name and rename over it after. The temp is a DOTFILE
+    # ('.<stem>._tmp.mp4'): if a kill interrupts the remux mid-write, the leftover
+    # must NOT look like a recording — both output_files() and the startup sweep
+    # skip dotfiles, so a hidden temp can't be re-enqueued as a phantom row.
     if src.suffix.lower() == ".mp4":
-        tmp = src.with_name(src.stem + "._tmp.mp4")
+        tmp = src.with_name("." + src.stem + "._tmp.mp4")
         final = src
     else:
         tmp = src.with_suffix(".mp4")
@@ -88,6 +109,15 @@ def _remux_for_telegram(src: Path) -> Path:
             raise RuntimeError(f"ffmpeg rc={result.returncode}: {stderr}")
     except (subprocess.TimeoutExpired, OSError, RuntimeError) as e:
         log.warning("remux: %s: failed (%s) — uploading original", src.name, e)
+        tmp.unlink(missing_ok=True)
+        return src
+
+    # Never destroy the source until the remux output is proven real. An ffmpeg
+    # rc=0 that nonetheless left no/empty output (rare, but it would otherwise
+    # trade a good .flv for a 0-byte .mp4) must keep the original instead.
+    if not tmp.exists() or _safe_size(tmp) == 0:
+        log.warning("remux: %s produced no output despite rc=0 — keeping original",
+                    src.name)
         tmp.unlink(missing_ok=True)
         return src
 
@@ -258,50 +288,151 @@ class StateMachine:
         self._stop.wait(self.config.poll_interval_s)
 
     def _start_recording(self, username: str) -> None:
-        try:
-            url = self.platform.stream_url(username)
-        except Exception as e:
-            log.error("recorder: stream_url(%s) failed: %s — back to listening",
-                      username, e)
-            self.state = RecorderState.LISTENING
-            return
-        self._acquire_lock()
-        try:
-            self.capture.start(url, username)
-        except Exception as e:
+        # Commit to recording this user: take the download-lock, then open a
+        # capture. _open_capture resolves a fresh URL and launches yt-dlp; on
+        # any failure we release the lock and fall back to listening.
+        self._acquire_lock(username)
+        if not self._open_capture(username):
             self._release_lock_if_held()
-            log.error("recorder: capture start for @%s failed: %s — back to listening",
-                      username, e)
             self.state = RecorderState.LISTENING
             return
         self.current_user = username
         self.state = RecorderState.RECORDING
 
-    def _wait_for_recording_done(self) -> None:
-        rc = self.capture.wait(self._stop)
-        # Release the download-lock as soon as the capture ends — archiver
-        # may resume TikTok downloads during our handoff scan + upload.
-        self._release_lock_if_held()
+    def _open_capture(self, username: str) -> bool:
+        """Resolve a FRESH stream URL and launch a capture for `username`.
+        Returns True on success. Touches neither the lock nor self.state — the
+        caller owns those (initial start acquires the lock; a reconnect keeps
+        the one it already holds). Re-resolving the URL each time is essential
+        for reconnects: a rotated/expired m3u8 URL is the usual reason a live
+        capture exits early, so reusing the old one would just re-fail."""
+        try:
+            url = self.platform.stream_url(username)
+        except Exception as e:
+            log.error("recorder: stream_url(%s) failed: %s", username, e)
+            return False
+        try:
+            self.capture.start(url, username)
+        except Exception as e:
+            log.error("recorder: capture start for @%s failed: %s", username, e)
+            return False
+        return True
 
-        elapsed = self.capture.elapsed_s()
-        files = self.capture.output_files()
-        # Pair the yt-dlp log with the recording (or drop it if the stream was
-        # dead) so it's cleaned up with the media instead of piling up forever.
-        self.capture.finalize()
+    def _confirm_still_live(self, username: str | None) -> bool:
+        """Re-check whether `username` is still broadcasting after a capture
+        exit. Biased toward CONTINUING: returns True as soon as ANY of
+        live_confirm_samples polls (spaced live_confirm_interval_s) reports
+        live, and False only when EVERY sample says offline.
+
+        Rationale — the fault we are fixing is a premature STOP, so when
+        uncertain we keep recording. A false 'still live' (is_live() lagging
+        after a real end) costs only one bounded relaunch that the capture's
+        dead-stream guard (rc=-2) terminates — never lost data. A stop request
+        short-circuits to False; is_live() is contracted not to raise, but a
+        raise is treated defensively as 'not live for this sample'."""
+        if not username:
+            return False
+        samples = max(1, self.config.live_confirm_samples)
+        for i in range(samples):
+            if self._stop.is_set():
+                return False
+            try:
+                if self.platform.is_live(username):
+                    return True
+            except Exception as e:
+                log.debug("recorder: is_live(%s) raised during confirm: %s",
+                          username, e)
+            if i < samples - 1 and self._stop.wait(self.config.live_confirm_interval_s):
+                return False
+        return False
+
+    def _wait_for_recording_done(self) -> None:
+        """Record current_user until the broadcast GENUINELY ends.
+
+        yt-dlp can exit while the user is STILL live — TikTok rotates the m3u8
+        URL, a token expires, or ffmpeg (our live-HLS downloader) hits a
+        transient input error that --fragment-retries doesn't cover. Finalizing
+        on that exit truncates the recording. So after each capture exit we
+        re-confirm liveness and, if still live, relaunch on a FRESH URL and keep
+        recording — accumulating segment files — until the stream is confirmed
+        offline (or a stop is requested, or a reconnect budget trips). The
+        download-lock is held across the WHOLE session; the segment files are
+        handed to the uploader exactly once, at the end."""
+        session_files: "dict[Path, None]" = {}     # insertion-ordered de-dup
+        session_start = time.monotonic()
+        zero_byte_streak = 0
+        reconnects = 0
+
+        while True:
+            rc = self.capture.wait(self._stop)
+
+            # Snapshot THIS segment BEFORE any relaunch: output_files() is keyed
+            # to the latest capture.start()'s mtime, so a reconnect hides it.
+            segment = self.capture.output_files()
+            seg_bytes = sum(_safe_size(f) for f in segment)
+            for f in segment:
+                session_files[f] = None
+            # Pair this segment's yt-dlp log with its media (or drop it if dead)
+            # before the next start() opens a new log.
+            self.capture.finalize()
+
+            # ── Terminal conditions: never reconnect ──
+            if self._stop.is_set() or rc == -1:        # clean shutdown
+                break
+            if rc == -2:                               # dead stream (zero bytes)
+                break
+            if not self.config.reconnect_enabled:
+                break
+            if not self._confirm_still_live(self.current_user):
+                break                                  # genuine end
+
+            # Still live but the capture dropped → premature. Bound pathological
+            # loops: count reconnects yielding NO new bytes, and an optional
+            # whole-session cap. (A dead relaunch is also caught by the capture's
+            # own rc=-2 guard above; this is belt-and-braces for a flapping one.)
+            zero_byte_streak = zero_byte_streak + 1 if seg_bytes == 0 else 0
+            if zero_byte_streak > self.config.max_zero_byte_reconnects:
+                log.warning("@%s still flagged live but %d reconnect(s) produced "
+                            "no data — finalizing", self.current_user,
+                            zero_byte_streak)
+                break
+            if (self.config.max_session_minutes > 0 and
+                    time.monotonic() - session_start
+                    >= self.config.max_session_minutes * 60.0):
+                log.warning("@%s session passed the %.0f-min cap — finalizing",
+                            self.current_user, self.config.max_session_minutes)
+                break
+
+            reconnects += 1
+            backoff = min(
+                self.config.reconnect_backoff_base_s * (2 ** zero_byte_streak),
+                30.0)
+            log.warning("@%s capture exited (rc=%d) but still LIVE — "
+                        "reconnecting in %.0fs (#%d)", self.current_user, rc,
+                        backoff, reconnects, extra={"ev": "reconnect"})
+            if self._stop.wait(backoff):               # stop during backoff
+                break
+            if not self._open_capture(self.current_user):
+                log.warning("@%s reconnect failed to start — finalizing",
+                            self.current_user)
+                break
+            # loop: lock still held, recording resumed on the fresh URL
+
+        # ── Session over: release the lock so the archiver can resume TikTok
+        #    downloads during handoff + upload, then hand off the files once. ──
+        self._release_lock_if_held()
+        elapsed = time.monotonic() - session_start
+        files = list(session_files)
         user = self.current_user or "?"
         if files:
-            total = 0
-            for f in files:
-                try:
-                    total += f.stat().st_size
-                except OSError:
-                    pass
-            log.info("@%s ended — %s · %d file%s · %s",
+            total = sum(_safe_size(f) for f in files)
+            extra_seg = "" if reconnects == 0 else f" · {reconnects} reconnect(s)"
+            log.info("@%s ended — %s · %d file%s · %s%s",
                      user, ui.human_duration(elapsed), len(files),
                      "" if len(files) == 1 else "s", ui.human_size(total),
-                     extra={"ev": "rec_end"})
+                     extra_seg, extra={"ev": "rec_end"})
         else:
-            # rc=-2 is the dead-stream guard (no bytes ever arrived).
+            # rc=-2 dead-stream guard (no bytes ever arrived).
             log.info("@%s ended — %s · no data (dead stream)",
                      user, ui.human_duration(elapsed), extra={"ev": "rec_end"})
         for f in files:
@@ -326,8 +457,10 @@ class StateMachine:
 
     # ── lock helpers ──────────────────────────────────────────────────────
 
-    def _acquire_lock(self) -> None:
+    def _acquire_lock(self, username: str | None = None) -> None:
         if not self._lock_held:
+            # Stamp the user onto the lock so the lockfile names who's recording.
+            self.lock.username = username
             self.lock.__enter__()
             self._lock_held = True
 
@@ -350,6 +483,13 @@ class StateMachine:
         """Register one finished recording in the shared queue. Shared by the
         daemon uploader thread and the one-shot record_once drain so both build
         the caption and handle failures identically."""
+        # A file present at handoff that's gone by enqueue means it was lost
+        # (e.g. an orphaned writer's unlinked inode). Report it honestly instead
+        # of enqueuing a phantom row the dispatcher will fail as "file missing".
+        if not job.file_path.exists():
+            log.error("recorder: %s vanished before enqueue — recording lost, "
+                      "not enqueued", job.file_path.name, extra={"ev": "lost"})
+            return
         try:
             upload_path = _remux_for_telegram(job.file_path)
             caption = (f"@{job.username} · tiktok · live · "

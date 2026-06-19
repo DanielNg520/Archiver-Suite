@@ -38,6 +38,16 @@ class RecorderConfig:
     lock_path:           str
     tiktok_users:        tuple[str, ...]
     tiktok_cookies_file: str | None
+    # ── Reconnect-on-premature-exit (see state._wait_for_recording_done) ──
+    # yt-dlp can exit while the broadcast is still live (rotated m3u8 URL,
+    # expired token, transient ffmpeg input error). Rather than finalize a
+    # truncated recording, re-confirm liveness and relaunch on a fresh URL.
+    reconnect_enabled:        bool  = True
+    live_confirm_samples:     int   = 3     # is_live() polls to confirm still-live
+    live_confirm_interval_s:  float = 2.0   # gap between those polls
+    reconnect_backoff_base_s: float = 2.0   # backoff = base·2^streak, capped 30s
+    max_zero_byte_reconnects: int   = 3     # consecutive no-data reconnects → stop
+    max_session_minutes:      float = 0.0   # 0 = no cap on total session length
 
     @classmethod
     def load(cls) -> "RecorderConfig":
@@ -66,4 +76,10 @@ class RecorderConfig:
                                            "~/.config/archiver-suite/locks/tiktok.lock")),
             tiktok_users        = users,
             tiktok_cookies_file = cookies,
+            reconnect_enabled        = bool(rec.get("reconnect_enabled", True)),
+            live_confirm_samples     = int(rec.get("live_confirm_samples", 3)),
+            live_confirm_interval_s  = float(rec.get("live_confirm_interval_s", 2.0)),
+            reconnect_backoff_base_s = float(rec.get("reconnect_backoff_base_s", 2.0)),
+            max_zero_byte_reconnects = int(rec.get("max_zero_byte_reconnects", 3)),
+            max_session_minutes      = float(rec.get("max_session_minutes", 0.0)),
         )
