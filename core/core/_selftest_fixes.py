@@ -91,6 +91,39 @@ def test_rearm_failed_twin(tmp: Path) -> None:
     store.close()
 
 
+def test_cancel_survives_reintroduction(tmp: Path) -> None:
+    print("\n── ingest does NOT re-arm a CANCELLED twin ──")
+    store = ItemStore.open(str(tmp / "cancel_rearm.db"))
+
+    p1 = tmp / "first.mp4"
+    make_video(p1)
+    res1 = register_file(store, p1, source="orphaned", platform="orphaned",
+                         username="100", chat_id="100", caption="first.mp4")
+    check(res1.outcome is IngestOutcome.INSERTED, "first copy inserted")
+
+    # Deliberate abort: cancel parks the row in 'failed' with CANCELLED_MARKER.
+    check(store.cancel(res1.item_id), "row cancelled (manual abort)")
+    check(store.get(res1.item_id).status == "failed", "cancelled row is failed")
+
+    # Re-introduce identical bytes — must NOT resurrect the deliberate abort.
+    p2 = tmp / "second.mp4"
+    copy_bytes(p1, p2)
+    res2 = register_file(store, p2, source="orphaned", platform="orphaned",
+                         username="100", chat_id="100", caption="second.mp4")
+    check(res2.outcome is not IngestOutcome.REARMED,
+          f"cancelled twin NOT re-armed by re-introduction (got {res2.outcome})")
+    check(store.get(res1.item_id).status == "failed",
+          "cancelled row stays failed after re-introduction")
+    check(len(store.list_items(limit=100)) == 1,
+          "still exactly one row (incoming dedup-collapsed, no data lost)")
+
+    # The explicit single-row override still works.
+    check(store.retry(res1.item_id) and
+          store.get(res1.item_id).status == "pending",
+          "retry(id) overrides cancel and re-arms the row")
+    store.close()
+
+
 # ── 2. ingest does NOT re-arm a PENDING twin (normal dedup intact) ────────────
 
 def test_pending_twin_still_dedups(tmp: Path) -> None:
@@ -164,6 +197,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         test_rearm_failed_twin(tmp)
+        test_cancel_survives_reintroduction(tmp)
         test_pending_twin_still_dedups(tmp)
         test_reconcile_converts_ts(tmp)
     print(f"\nALL PASS ({_checks} checks)")

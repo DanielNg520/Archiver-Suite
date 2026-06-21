@@ -27,7 +27,8 @@ from pathlib import Path
 
 from core import (
     ClaimContentionError, QueueStore, Item, DeletePolicy, RecorderDeletePolicy,
-    BatchPolicy, ORPHANED_SOURCE, subfolder_of, DeletionGuard, is_split_group,
+    BatchPolicy, FailedRetryPolicy, ORPHANED_SOURCE, subfolder_of,
+    DeletionGuard, is_split_group,
 )
 from core.files import media_bucket
 from .tg_router import TelegramRouter, RouteError
@@ -46,10 +47,14 @@ log = logging.getLogger(__name__)
 # beside its .mp4 preview) and must ship as-is, not be re-converted at send.
 _PREPPED_AT_INGEST_SOURCES = {"archiver", ORPHANED_SOURCE}
 
-# How often the drain loop re-runs its housekeeping pair: failed-row retention
-# GC and the stuck-'sending' watchdog. The retention WINDOW is
-# config.failed_retention_days and the stuck threshold config.stuck_claim_min;
-# this is just how often we check. The watchdog used to run only at startup,
+# How often the drain loop re-runs its housekeeping: the failed-queue
+# maintenance chain (drop missing-file tombstones → retention GC → auto-retry
+# the survivors) and the stuck-'sending' watchdog. The retention WINDOW is
+# config.failed_retention_days, auto-retry is gated by the auto_retry_failed
+# policy, and the stuck threshold is config.stuck_claim_min; this is just how
+# often we check. All of it lives here, in the queue owner, so failed-row
+# lifecycle doesn't depend on the archiver loop being alive. The watchdog used
+# to run only at startup,
 # which left a row wedged in 'sending' (e.g. by a manual `queue cancel` race)
 # stranded until the next dispatcher restart — self-healing should not require
 # a restart. Safe mid-loop: the drain is serial, so at the top of an iteration
@@ -137,6 +142,37 @@ def _suppress_duplicate(store: QueueStore, guard: DeletionGuard,
              "deleted" if removed else "kept (safebrake)")
 
 
+def run_housekeeping(store: QueueStore, config: DispatcherConfig) -> None:
+    """One pass of the drain's periodic maintenance. Extracted from the loop so
+    it can be exercised directly (Seam 25) — the loop just calls it on a timer.
+
+    Failed-queue maintenance, in this order on purpose:
+      1. delete failed rows whose file is gone — they can never deliver, so
+         re-queuing one would only waste the send retry budget claiming a
+         vanished path. Always runs, regardless of policy.
+      2. retention backstop: drop present-file rows still failing after the
+         window — caps unbounded growth of genuinely-stuck rows. Runs BEFORE
+         the auto-retry re-queue on purpose: a row failing past the window is
+         permanent, so it must be retired rather than re-armed. If auto-retry
+         ran first it would move EVERY failed row to pending, leaving this sweep
+         nothing to act on — the cap would silently never fire, and a poison row
+         would cycle pending→failed→pending forever (the retry storm this
+         backstop exists to prevent).
+      3. re-queue the remaining (recent, present-file) failed rows when
+         auto_retry_failed is on, so a transient cause heals without a manual
+         `reset failed`. Delete-first + prune-first mean only rows that are
+         present AND within the window are re-armed.
+
+    Then the stuck-'sending' watchdog: recover rows wedged in 'sending' by a
+    crashed predecessor without waiting for a restart. Safe mid-loop — the drain
+    is serial, so nothing of ours is in flight here; only stale claims match."""
+    store.delete_failed_missing()
+    store.prune_failed(config.failed_retention_days)
+    if FailedRetryPolicy(config.policy_store).enabled():
+        store.reset_failed(None, None)
+    store.reset_stuck_sending(older_than_minutes=config.stuck_claim_min)
+
+
 async def drain_forever(
     config:        DispatcherConfig,
     store:         QueueStore,
@@ -186,12 +222,7 @@ async def drain_forever(
         now = time.monotonic()
         if now - last_housekeeping >= _HOUSEKEEPING_EVERY_S:
             try:
-                store.prune_failed(config.failed_retention_days)
-                # Periodic watchdog: recover rows wedged in 'sending' without
-                # waiting for a restart (this loop is serial, so nothing of
-                # ours is in flight here — only stale claims can match).
-                store.reset_stuck_sending(
-                    older_than_minutes=config.stuck_claim_min)
+                run_housekeeping(store, config)
             except Exception as exc:
                 # Housekeeping must never kill the daemon.
                 log.exception("drain: housekeeping raised: %s", exc)

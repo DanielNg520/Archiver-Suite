@@ -10,6 +10,8 @@ Subcommands:
   bootstrap              One-shot: absorb existing on-disk archive into DB +
                          seed extractor archives + set date_floor checkpoints.
   reset failed           Re-queue failed uploads
+  auto-retry             Show/toggle automatic per-cycle re-queue of failed
+                         uploads (default ON; missing-file rows always cleaned)
   reset uploads          Re-queue ALL uploads (no re-download)
   reset user             Full wipe for one user (re-download + re-upload)
   reset all              Nuke DB rows + checkpoints for EVERY user
@@ -168,6 +170,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform", default=None,
         help="Destination platform for auto-sort (default instagram).")
     au_sub.add_parser("unset", help="Remove the setting (back to default: off)")
+
+    # ── auto-retry (toggle) ───
+    s_ar = sub.add_parser(
+        "auto-retry",
+        help="Show/toggle automatic re-queue of failed uploads. Default OFF "
+             "(opt-in: a permanently-failing row would otherwise re-arm itself "
+             "every pass and starve the queue). Applied by the dispatcher's "
+             "periodic housekeeping (this command just sets the shared policy). "
+             "Failed rows whose file is missing are always cleaned up there, "
+             "regardless of this setting.")
+    ar_sub = s_ar.add_subparsers(dest="ar_action", required=False, metavar="ACTION",
+                                 help="omit to print state; 'set'/'unset' to change")
+    ar_set = ar_sub.add_parser("set", help="Enable or disable auto-retry")
+    ar_set.add_argument("--enabled", choices=["true", "false"], required=True)
+    ar_sub.add_parser("unset", help="Remove the setting (back to default: off)")
 
     # ── local (user-managed folders treated as platforms, no download) ───
     s_local = sub.add_parser(
@@ -612,6 +629,31 @@ def cmd_auto_sort(args, config: Config, db: ItemStore) -> int:
     return 0
 
 
+def cmd_auto_retry(args, config: Config, db: ItemStore) -> int:
+    """Show/toggle the global auto_retry_failed policy."""
+    from core import FailedRetryPolicy
+
+    store  = config.policy_store
+    policy = FailedRetryPolicy(store)
+    action = getattr(args, "ar_action", None)
+    if action == "set":
+        value = args.enabled == "true"
+        store.set(policy.KEY, value)
+        log.info("auto-retry set: global → %s (key=%s)", value, policy.KEY)
+        log.info("Applied by the dispatcher's housekeeping (~15 min cadence).")
+        return 0
+    if action == "unset":
+        removed = store.unset(policy.KEY)
+        log.info("auto-retry unset: %s",
+                 "removed (back to default: on)" if removed else "was not set")
+        return 0
+    value, source = store.explain(policy.KEY, default=policy.DEFAULT)
+    log.info("auto-retry (key=%s): %s  (from %s)", policy.KEY, value, source)
+    log.info("  (the dispatcher always cleans up failed rows with a missing "
+             "file, regardless of this setting.)")
+    return 0
+
+
 def cmd_local(args, config: Config, db: ItemStore) -> int:
     """Manage the list of user-managed 'local' platforms (no download)."""
     from core import is_chat_id
@@ -684,7 +726,7 @@ def cmd_backfill(args, config: Config, db: ItemStore) -> int:
     return 0
 
 
-def cmd_run(args, config: Config, db: ItemStore) -> int:
+def cmd_run(args, config: Config, db: ItemStore, *, phase_cb=None) -> int:
     user_filter = args.user.lstrip("@") if args.user else None
 
     if getattr(args, "full_history", False):
@@ -709,6 +751,7 @@ def cmd_run(args, config: Config, db: ItemStore) -> int:
     results = asyncio.run(arch.run(
         platform_filter = args.platform,
         user_filter     = user_filter,
+        on_user         = phase_cb,
     ))
 
     log.info("")
@@ -1608,6 +1651,8 @@ def cmd_loop(args, config: Config, db: ItemStore) -> int:
     import time
     from datetime import datetime, timezone, timedelta
 
+    from . import loop_state
+
     if args.min_sleep < 1 or args.max_sleep < args.min_sleep:
         log.error("Invalid sleep bounds: min=%.0f max=%.0f", args.min_sleep, args.max_sleep)
         return 2
@@ -1663,9 +1708,12 @@ def cmd_loop(args, config: Config, db: ItemStore) -> int:
             run_n += 1
             run_start = time.monotonic()
             loop_logger.info("── run #%d starting ────────────────────────────────", run_n)
+            loop_state.write_running(run_n)
 
             try:
-                rc = cmd_run(args, config, db)
+                rc = cmd_run(args, config, db, phase_cb=(
+                    lambda p, u, _n=run_n:
+                        loop_state.write_running(_n, platform=p, user=u)))
             except KeyboardInterrupt:
                 stop_requested[0] = True
                 loop_logger.warning("run #%d interrupted by user", run_n)
@@ -1705,6 +1753,7 @@ def cmd_loop(args, config: Config, db: ItemStore) -> int:
             loop_logger.info("sleeping %.0f sec (%.2f h) — next run at %s UTC",
                              sleep_secs, sleep_secs / 3600,
                              wake_at.strftime("%Y-%m-%d %H:%M:%S"))
+            loop_state.write_sleeping(run_n, time.time() + sleep_secs)
 
             slept = 0.0
             while slept < sleep_secs and not stop_requested[0]:
@@ -1714,6 +1763,7 @@ def cmd_loop(args, config: Config, db: ItemStore) -> int:
 
     finally:
         signal.signal(signal.SIGINT, prev_handler)
+        loop_state.clear()   # a stopped loop must not read back as 'sleeping'
         ended_at = datetime.now(timezone.utc)
         uptime = ended_at - started_at
         loop_logger.info("════════════════════════════════════════════════════════════")
@@ -1769,7 +1819,7 @@ def main() -> int:
         "config", "platform", "run-settings", "migrate", "policy",
         "dedup-policy", "safebrake", "purge-sent", "stats", "ingest", "queue",
         "backfill", "auto-ingest", "local", "download", "sort", "auto-sort",
-        "banned",
+        "auto-retry", "banned",
     }
     if args.cmd == "reset" and args.reset_cmd in {"failed", "user"}:
         config_only = True
@@ -1802,6 +1852,7 @@ def main() -> int:
             "auto-ingest":  cmd_auto_ingest,
             "sort":         cmd_sort,
             "auto-sort":    cmd_auto_sort,
+            "auto-retry":   cmd_auto_retry,
             "local":        cmd_local,
             "download":     cmd_download,
             "backfill":     cmd_backfill,

@@ -39,6 +39,33 @@ log = logging.getLogger(__name__)
 
 _CLAIM_RETRIES = 5
 
+# SEND-ORDER CLUSTERING. The queue drains by (priority, discovered_at), which
+# alone scatters a user's media: files downloaded in a later run get a later
+# discovered_at, so another user who started in between sorts ahead of them and
+# the first user's uploads end up split across the timeline. We instead order by
+# the *cluster's anchor* — the FIRST-APPEARANCE time per (platform, username),
+# i.e. MIN(discovered_at) over ALL that user's rows — so a user's whole block
+# stays contiguous, positioned where that user first entered the queue, and
+# files enqueued for them later join that block instead of going to the tail.
+#
+# First-appearance (not "oldest pending") is deliberate: a per-pending anchor
+# shifts as items drain, so once a user's earliest items are sent their later
+# items would lose their place and interleave again. Anchoring on the stable
+# first-appearance keeps singles and >ALBUM_MAX runs contiguous across claims.
+# It's a correlated MIN over (platform, username) — cheap via idx_items_user_disc.
+#
+# cl_prio keeps priority authoritative at cluster granularity (a higher-priority
+# recorder/orphaned cluster still drains first); within a cluster rows keep
+# (priority, discovered_at) order. Album membership is unchanged — this only
+# decides which anchor is claimed next, never what gathers into the album.
+_CLUSTER_COLS = (
+    "(SELECT MIN(priority) FROM items c "
+    " WHERE c.platform=items.platform AND c.username=items.username) AS cl_prio, "
+    "(SELECT MIN(discovered_at) FROM items c "
+    " WHERE c.platform=items.platform AND c.username=items.username) AS cl_disc"
+)
+_CLUSTER_ORDER = "cl_prio ASC, cl_disc ASC, priority ASC, discovered_at ASC"
+
 # busy_timeout (schema.connect) already blocks-and-retries inside SQLite for
 # brief writer contention. But a bulk producer can hold the single WAL writer
 # lock past that window, and a momentary lock must never kill a long-running
@@ -78,6 +105,18 @@ _ALLOWED: dict[str, frozenset[str]] = {
 }
 
 _ERROR_CAP = 1000
+
+# A manually `cancel`-led row is parked in status='failed' (no schema room for a
+# distinct 'cancelled' status without a lockstep version bump), so it must be
+# told apart from a genuine delivery failure: a deliberate abort, unlike a
+# transient failure, must NOT be resurrected by the bulk reset paths
+# (auto_retry_failed housekeeping or `reset failed`). We stamp this sentinel as
+# the row's last_error and the reset chokepoint (_reset_to_pending) skips any row
+# carrying it. The targeted `retry(id)` clears last_error, so it remains the
+# explicit way to force one cancelled row back. Kept short and bracketed so it
+# can't be mistaken for (or collide with) a real server error string, and it
+# contains no LIKE wildcards (% _) so the prefix match is literal.
+CANCELLED_MARKER = "[cancelled]"
 
 
 def now_iso() -> str:
@@ -364,12 +403,20 @@ class ItemStore:
         re-introduced but its only twin had permanently failed: those bytes
         were never delivered, so the row is re-armed rather than the incoming
         copy being dropped as a dedup. Guarded on 'failed' so a racing delivery
-        (a twin reset/resent out from under us) is never overwritten."""
+        (a twin reset/resent out from under us) is never overwritten.
+
+        Also skips a deliberately-cancelled row (CANCELLED_MARKER): a manual
+        abort is durable across the automatic re-arm paths just as it is across
+        the bulk resets (see _reset_to_pending) — re-introducing the file must
+        not resurrect it. The incoming copy is then dedup-collapsed against the
+        kept file (byte-identical, no data lost); retry(id) remains the explicit
+        single-row override."""
         cur = self.conn.execute(
             """UPDATE items SET status='pending', attempts=0, claimed_at=NULL,
                    sent_at=NULL, last_error=NULL
-               WHERE id=? AND status='failed'""",
-            (item_id,),
+               WHERE id=? AND status='failed'
+                 AND (last_error IS NULL OR last_error NOT LIKE ?)""",
+            (item_id, CANCELLED_MARKER + "%"),
         )
         self._commit()
         return cur.rowcount > 0
@@ -387,14 +434,20 @@ class ItemStore:
     # ── Dispatcher side: the state machine ────────────────────────────────
 
     def claim_next(self) -> Item | None:
-        """Atomically claim the highest-priority pending item (pending →
+        """Atomically claim the next pending item in send order (pending →
         sending). Returns None when nothing is pending. Raises
-        ClaimContentionError when retries are exhausted under contention."""
+        ClaimContentionError when retries are exhausted under contention.
+
+        Send order is cluster-aware (see _CLUSTER_ORDER): the next item is the
+        head of the earliest-anchored (platform, username) cluster, so a user's
+        items drain contiguously rather than interleaving with others'."""
         for _ in range(_CLAIM_RETRIES):
             with self._immediate() as cur:
                 row = cur.execute(
-                    """SELECT id FROM items WHERE status='pending'
-                       ORDER BY priority ASC, discovered_at ASC LIMIT 1"""
+                    f"""SELECT id FROM (
+                            SELECT id, priority, discovered_at, {_CLUSTER_COLS}
+                              FROM items WHERE status='pending'
+                        ) ORDER BY {_CLUSTER_ORDER} LIMIT 1"""
                 ).fetchone()
                 if row is None:
                     return None
@@ -426,8 +479,10 @@ class ItemStore:
         eligible — see the gate below). Raises ClaimContentionError when
         retries are exhausted under contention.
 
-        The group is defined by the highest-priority pending row (the
-        "anchor") and everything sharing its (platform, username, source,
+        The anchor is the head of the earliest-anchored (platform, username)
+        cluster in send order (see _CLUSTER_ORDER) — so a user's media drains
+        contiguously instead of interleaving with other users'. The album is
+        then everything sharing the anchor's (platform, username, source,
         group_key/caption, media-bucket):
 
           - source in the key  → an album is never mixed across producers.
@@ -467,11 +522,16 @@ class ItemStore:
                 if not gated:
                     anchor = cur.execute(
                         f"""SELECT id, platform, username, source, file_path,
-                                  {GROUP_DISC} AS group_disc,
-                                  IFNULL(chat_id,'') AS chat_disc,
-                                  IFNULL(topic_id,-1) AS topic_disc
-                             FROM items WHERE status='pending'
-                            ORDER BY priority ASC, discovered_at ASC LIMIT 1"""
+                                  group_disc, chat_disc, topic_disc
+                             FROM (
+                                SELECT id, platform, username, source, file_path,
+                                       priority, discovered_at,
+                                       {GROUP_DISC} AS group_disc,
+                                       IFNULL(chat_id,'') AS chat_disc,
+                                       IFNULL(topic_id,-1) AS topic_disc,
+                                       {_CLUSTER_COLS}
+                                  FROM items WHERE status='pending'
+                             ) ORDER BY {_CLUSTER_ORDER} LIMIT 1"""
                     ).fetchone()
                     if anchor is None:
                         return []
@@ -479,11 +539,16 @@ class ItemStore:
                 else:
                     pending = cur.execute(
                         f"""SELECT id, platform, username, source, file_path,
-                                  discovered_at, {GROUP_DISC} AS group_disc,
-                                  IFNULL(chat_id,'') AS chat_disc,
-                                  IFNULL(topic_id,-1) AS topic_disc
-                             FROM items WHERE status='pending'
-                            ORDER BY priority ASC, discovered_at ASC"""
+                                  discovered_at, group_disc, chat_disc, topic_disc
+                             FROM (
+                                SELECT id, platform, username, source, file_path,
+                                       priority, discovered_at,
+                                       {GROUP_DISC} AS group_disc,
+                                       IFNULL(chat_id,'') AS chat_disc,
+                                       IFNULL(topic_id,-1) AS topic_disc,
+                                       {_CLUSTER_COLS}
+                                  FROM items WHERE status='pending'
+                             ) ORDER BY {_CLUSTER_ORDER}"""
                     ).fetchall()
                     chosen = self._select_eligible_group(
                         cur, pending, GROUP_DISC, max_items, min_batch, flush_age_s,
@@ -542,8 +607,8 @@ class ItemStore:
         self, cur, pending, group_disc_sql: str, max_items: int,
         min_batch, flush_age_s,
     ) -> list:
-        """Scan pending rows (already priority-ordered) and return the first
-        group that clears the min-batch gate; [] if none is ready yet.
+        """Scan pending rows (already in cluster send order) and return the
+        first group that clears the min-batch gate; [] if none is ready yet.
 
         A non-'single' group is eligible when it has >= min_batch(anchor)
         in-bucket items, OR its oldest item has aged past flush_age_s(anchor)
@@ -718,6 +783,37 @@ class ItemStore:
                      n, older_than_days)
         return n
 
+    def delete_failed_missing(self) -> int:
+        """Delete terminal 'failed' rows whose file is gone from disk. Returns
+        rows deleted.
+
+        A failed row whose bytes no longer exist can never be delivered — it's a
+        pure tombstone. Re-queuing it (auto_retry_failed) would just have the
+        dispatcher claim a vanished path and burn the retry budget re-failing it,
+        so this cleanup runs UNCONDITIONALLY and BEFORE any auto-retry sweep.
+
+        Same tombstone trade-off as prune_failed: dropping the row lets a future
+        reconcile re-enqueue that exact path if the file ever reappears — which
+        is the correct behavior. A blank/NULL file_path is treated as missing.
+
+        stat() per failed row, in Python rather than SQL (SQLite can't see the
+        filesystem); 'failed' is a small, inert set so this stays cheap."""
+        from pathlib import Path as _Path
+
+        rows = self.conn.execute(
+            "SELECT id, file_path FROM items WHERE status='failed'"
+        ).fetchall()
+        gone = [r["id"] for r in rows
+                if not r["file_path"] or not _Path(r["file_path"]).exists()]
+        if not gone:
+            return 0
+        with self._immediate() as cur:
+            cur.executemany("DELETE FROM items WHERE id=?",
+                            [(i,) for i in gone])
+        log.info("cleanup: deleted %d failed row(s) whose file is missing",
+                 len(gone))
+        return len(gone)
+
     def get(self, item_id: int) -> Item | None:
         r = self.conn.execute(
             "SELECT * FROM items WHERE id=?", (item_id,),
@@ -869,11 +965,16 @@ class ItemStore:
         return cur.rowcount > 0
 
     def cancel(self, item_id: int) -> bool:
-        """pending|sending → failed. CLI manual abort."""
+        """pending|sending → failed. CLI manual abort.
+
+        Stamps CANCELLED_MARKER into last_error so the bulk reset paths
+        (auto_retry_failed housekeeping and `reset failed`) treat this as a
+        deliberate abort and never resurrect it. Force one back with retry(id),
+        which clears last_error."""
         cur = self.conn.execute(
-            """UPDATE items SET status='failed', claimed_at=NULL
+            """UPDATE items SET status='failed', claimed_at=NULL, last_error=?
                    WHERE id=? AND status IN ('pending','sending')""",
-            (item_id,),
+            (CANCELLED_MARKER + " manual abort", item_id),
         )
         self._commit()
         return cur.rowcount > 0
@@ -893,11 +994,16 @@ class ItemStore:
 
     def _reset_to_pending(self, statuses: tuple[str, ...],
                           platform: str | None, username: str | None) -> int:
+        # Skip deliberately-cancelled rows: cancel() parks them in 'failed' with
+        # CANCELLED_MARKER, and a manual abort must survive every bulk reset
+        # (auto_retry housekeeping AND `reset failed`/`reset uploads`). retry(id)
+        # remains the explicit single-row override (it clears last_error).
         marks = ",".join("?" * len(statuses))
         sql = (f"UPDATE items SET status='pending', claimed_at=NULL, "
                f"sent_at=NULL, attempts=0, last_error=NULL "
-               f"WHERE status IN ({marks})")
-        params: list = list(statuses)
+               f"WHERE status IN ({marks}) "
+               f"AND (last_error IS NULL OR last_error NOT LIKE ?)")
+        params: list = list(statuses) + [CANCELLED_MARKER + "%"]
         if platform:
             sql += " AND platform=?"; params.append(platform)
         if username:

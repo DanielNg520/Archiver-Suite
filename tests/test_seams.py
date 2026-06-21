@@ -371,7 +371,11 @@ def test_startup_sweep_seam(tmp: Path) -> None:
                     identifier="rec_failed", file_path=str(failed_f),
                     content_hash=full_hash(failed_f))
         fid = db.id_of(str(failed_f))
-        db.cancel(fid)                     # → failed (terminal)
+        # A REAL terminal failure (burn the retry budget), NOT a manual cancel:
+        # cancel is now durable and must never be swept back to pending, so using
+        # it here would wrongly assert the sweep re-arms an abort. claim_next is
+        # this row (only pending left after (a) was sent).
+        db.mark_failed(db.claim_next().id, error="send failed", max_retries=0)
         ok(db.get(fid).status == "failed", "  precondition: row is failed")
 
         # (c) a brand-NEW file with no row → sweep registers it.
@@ -1567,6 +1571,222 @@ def test_banned_word_sanitizer_seam(tmp: Path) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Seam 25 — dispatcher housekeeping owns failed-queue maintenance
+# Failed-upload lifecycle (retire dead tombstones + re-queue the rest) lives
+# ENTIRELY in the dispatcher's periodic housekeeping (drain.run_housekeeping),
+# the queue owner — not in the archiver loop. The contract, three ways:
+#   • a 'failed' row whose file is GONE is deleted every pass (always, no policy)
+#   • the REMAINING (present-file) failed rows are re-queued only when
+#     auto_retry_failed is on (default OFF — opt-in, so a poison row can't
+#     re-arm itself into a perpetual re-upload storm)
+#   • delete-first ordering ⇒ a missing-file row is never re-armed to 'pending'
+#     and so never costs a wasted send attempt on a vanished path
+# Plus the retention backstop still caps present-file rows stuck past the window.
+# A regression here either resurrects vanished files into wasted sends or
+# silently stops failed uploads from ever retrying.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_failed_housekeeping_seam(tmp: Path) -> None:
+    section("Seam 25: dispatcher housekeeping ↔ failed-queue maintenance")
+    from core import PolicyStore, FailedRetryPolicy
+    from dispatcher.drain import run_housekeeping
+    from dispatcher.config import DispatcherConfig
+
+    def _cfg(db_path: str, ps: PolicyStore, retention: float):
+        # Only telegram/default_chat_id/db_path/policy_store are required; the
+        # rest default. failed_retention_days drives the retention backstop.
+        return DispatcherConfig(
+            telegram=None, default_chat_id="-1", db_path=db_path,
+            policy_store=ps, failed_retention_days=retention)
+
+    def _make_failed(db, where: Path, *, present: bool, ident: str) -> str:
+        fp = where / f"{ident}.mp4"
+        if present:
+            _write_media(fp, ident.encode())
+        db.add_item(source="archiver", platform="x", username="al",
+                    identifier=ident, file_path=str(fp), priority=10)
+        db.conn.execute("UPDATE items SET status='failed', attempts=3 "
+                        "WHERE id=?", (db.id_of(str(fp)),))
+        db.conn.commit()
+        return str(fp)
+
+    def _status(db, fp):
+        r = db.get(db.id_of(fp)) if db.id_of(fp) is not None else None
+        return r.status if r else None
+
+    # ── auto_retry ON (opt-in): present → re-queued, missing → deleted ──
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        present = _make_failed(db, tmp / "on", present=True, ident="keep")
+        missing = _make_failed(db, tmp / "on", present=False, ident="gone")
+        ps = PolicyStore(); ps.set(FailedRetryPolicy.KEY, True)
+        run_housekeeping(db, _cfg(db_path, ps, retention=0))  # ON, prune off
+        ok(_status(db, present) == "pending",
+           "auto_retry ON: present-file failed row re-queued to pending")
+        ok(db.id_of(missing) is None,
+           "missing-file failed row DELETED (can never deliver), not re-queued")
+    finally:
+        db.close()
+
+    # ── auto_retry OFF: present stays failed, missing still deleted ──
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        present = _make_failed(db, tmp / "off", present=True, ident="keep")
+        missing = _make_failed(db, tmp / "off", present=False, ident="gone")
+        ps = PolicyStore(); ps.set(FailedRetryPolicy.KEY, False)
+        run_housekeeping(db, _cfg(db_path, ps, retention=0))
+        ok(_status(db, present) == "failed",
+           "auto_retry OFF: present-file failed row left for a manual reset")
+        ok(db.id_of(missing) is None,
+           "missing-file cleanup runs even with auto_retry OFF (unconditional)")
+    finally:
+        db.close()
+
+    # ── retention backstop: an old present-file failed row is pruned ──
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        old = _make_failed(db, tmp / "ret", present=True, ident="stale")
+        # Backdate discovered_at past the window so prune_failed catches it;
+        # auto_retry OFF keeps it 'failed' (else it'd be re-queued, not pruned).
+        db.conn.execute("UPDATE items SET discovered_at='2000-01-01T00:00:00Z' "
+                        "WHERE id=?", (db.id_of(old),))
+        db.conn.commit()
+        ps = PolicyStore(); ps.set(FailedRetryPolicy.KEY, False)
+        run_housekeeping(db, _cfg(db_path, ps, retention=7))
+        ok(db.id_of(old) is None,
+           "retention backstop prunes a present-file row stuck past the window")
+    finally:
+        db.close()
+
+    # ── backstop wins over auto_retry: an old row is PRUNED, not resurrected ──
+    # The conflict guard. With auto_retry ON, prune MUST run before the re-queue;
+    # otherwise reset_failed would move the row to pending first and the cap
+    # would never fire (a permanent failure cycling forever — the storm).
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        old = _make_failed(db, tmp / "storm", present=True, ident="stale")
+        db.conn.execute("UPDATE items SET discovered_at='2000-01-01T00:00:00Z' "
+                        "WHERE id=?", (db.id_of(old),))
+        db.conn.commit()
+        ps = PolicyStore(); ps.set(FailedRetryPolicy.KEY, True)
+        run_housekeeping(db, _cfg(db_path, ps, retention=7))
+        ok(db.id_of(old) is None,
+           "auto_retry ON: a row failing past the window is pruned, not re-armed "
+           "(prune-before-reorder prevents the perpetual-retry storm)")
+    finally:
+        db.close()
+
+    # ── a manually-cancelled row survives auto_retry; retry(id) forces it back ──
+    # cancel() parks the row in 'failed' with CANCELLED_MARKER. A deliberate
+    # abort must NOT be resurrected by auto_retry's bulk reset_failed — only the
+    # targeted retry(id) override (which clears last_error) brings it back.
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        fp = tmp / "cancel" / "abort.mp4"
+        _write_media(fp, b"abort")
+        db.add_item(source="archiver", platform="x", username="al",
+                    identifier="abort", file_path=str(fp), priority=10)
+        cid = db.id_of(str(fp))
+        ok(db.cancel(cid), "cancel: pending row parked as a manual abort")
+        ps = PolicyStore(); ps.set(FailedRetryPolicy.KEY, True)
+        run_housekeeping(db, _cfg(db_path, ps, retention=0))  # auto_retry ON
+        ok(db.get(cid).status == "failed",
+           "auto_retry ON does NOT resurrect a cancelled row (CANCELLED_MARKER)")
+        ok(db.retry(cid) and db.get(cid).status == "pending",
+           "targeted retry(id) overrides cancel and re-arms the row")
+    finally:
+        db.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 26 — producer enqueue order ↔ dispatcher claim_batch SEND ORDER
+# A user's media must drain CONTIGUOUSLY, not interleave with other users'.
+# The queue's raw (priority, discovered_at) order scatters a user whose files
+# arrive across multiple runs: files downloaded later get a later discovered_at,
+# so another user who appeared in between would sort ahead of them. claim_batch
+# instead anchors each (platform, username) cluster on its FIRST-APPEARANCE time
+# (core.store._CLUSTER_COLS), so later-enqueued files join the user's existing
+# block. The contract holds across the cases that actually broke — single-bucket
+# items (one send each) and >ALBUM_MAX runs (multiple albums) — while priority
+# still dominates (a live recorder cluster drains before an archiver backlog).
+# A regression here re-scatters a user's uploads across the timeline.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_send_order_clustering_seam(tmp: Path) -> None:
+    section("Seam 26: enqueue order ↔ claim_batch send-order clustering")
+    from core import ItemStore
+
+    def _seed(plan, ext: str) -> ItemStore:
+        """plan: [(username, count, discovered_at)] — simulates same-user files
+        arriving in separate runs, interleaved with another user's run."""
+        db = _fresh_db()
+        k = 0
+        for user, count, ts in plan:
+            for _ in range(count):
+                f = _write_media(tmp / f"{ext[1:]}/{user}/{user}_{k}{ext}",
+                                 f"{user}{k}".encode())
+                db.add_item(source="archiver", platform="x", username=user,
+                            identifier=f"{user}_{k}", file_path=str(f), priority=10)
+                db.conn.execute("UPDATE items SET discovered_at=? WHERE id=?",
+                                (ts, db.id_of(str(f))))
+                k += 1
+        db.conn.commit()
+        return db
+
+    def _drain(db) -> list:
+        out = []
+        while (b := db.claim_batch(max_items=10)):
+            out.append((b[0].username, len(b)))
+        return out
+
+    # alice appears first (run @:01), bob runs in between (@:02), alice runs
+    # again (@:03). Without clustering, alice's :03 files sort after bob's :02.
+    interleaved = [("alice", 2, "2024-01-01T00:00:01Z"),
+                   ("bob",   2, "2024-01-01T00:00:02Z"),
+                   ("alice", 2, "2024-01-01T00:00:03Z")]
+
+    # Single-bucket (.gif): each file is its own send; the recompute-prone case.
+    db = _seed(interleaved, ".gif")
+    try:
+        ok(_drain(db) == [("alice", 1)] * 4 + [("bob", 1)] * 2,
+           "single-bucket: all of alice's files drain before bob's (contiguous)")
+    finally:
+        db.close()
+
+    # Album bucket, over the 10-item cap: alice 8@:01 + 5@:03 = 13 photos, bob
+    # 3@:02 between. Alice's two albums must stay adjacent, ahead of bob.
+    db = _seed([("alice", 8, "2024-01-01T00:00:01Z"),
+                ("bob",   3, "2024-01-01T00:00:02Z"),
+                ("alice", 5, "2024-01-01T00:00:03Z")], ".jpg")
+    try:
+        ok(_drain(db) == [("alice", 10), ("alice", 3), ("bob", 3)],
+           "over-cap: alice's two albums drain back-to-back, then bob")
+    finally:
+        db.close()
+
+    # Priority still dominates the cluster anchor: a recorder single (priority 5)
+    # for a user who appeared LATE (@09:00) must still precede alice's pri-10
+    # backlog that appeared at :01.
+    db = _seed([("alice", 2, "2024-01-01T00:00:01Z")], ".jpg")
+    try:
+        rec = _write_media(tmp / "rec" / "zoe.mp4", b"REC")
+        db.add_item(source="recorder", platform="tiktok", username="zoe",
+                    identifier="rec_1", file_path=str(rec), priority=5)
+        db.conn.execute("UPDATE items SET discovered_at='2024-01-01T09:00:00Z' "
+                        "WHERE id=?", (db.id_of(str(rec)),))
+        db.conn.commit()
+        ok(_drain(db) == [("zoe", 1), ("alice", 2)],
+           "priority wins over first-appearance: recorder pri-5 cluster drains first")
+    finally:
+        db.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
     print("cross-worker seam integration tests")
@@ -1608,6 +1828,8 @@ def main() -> int:
         test_topic_routing_seam(tmp / "s22")
         test_split_album_seam(tmp / "s23")
         test_banned_word_sanitizer_seam(tmp / "s24")
+        test_failed_housekeeping_seam(tmp / "s25")
+        test_send_order_clustering_seam(tmp / "s26")
 
     print(f"\nALL PASS ({_checks} checks)")
     return 0

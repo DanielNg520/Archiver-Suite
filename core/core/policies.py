@@ -232,6 +232,40 @@ class SortPolicy(BooleanPolicy):
         return value.strip()
 
 
+class FailedRetryPolicy(BooleanPolicy):
+    """Whether the DISPATCHER's periodic housekeeping auto-re-queues
+    terminally-'failed' uploads, so a failure caused by a transient condition
+    (a chat that was briefly unreachable, a network blip that outlived the
+    per-send retry budget) heals on its own instead of waiting for a manual
+    `archiver reset failed`. Lives in the queue owner (dispatcher.drain), so it
+    runs on the ~15-min housekeeping cadence regardless of the archiver loop.
+
+    Global toggle, default OFF — a file that fails for a PERMANENT reason
+    (oversized, corrupt, a media Telegram rejects) would otherwise get re-armed
+    every housekeeping pass and burn its full send-retry budget again, turning a
+    single poison row into a perpetual re-upload storm that starves the rest of
+    the queue. Opt in with auto_retry_failed=true in config.toml (or
+    `archiver auto-retry set --enabled true`) once failures are known-transient;
+    otherwise heal them deliberately with `archiver reset failed`.
+
+    Independent of the missing-file sweep, which is unconditional cleanup: a
+    'failed' row whose file is gone from disk can never succeed, so the
+    dispatcher deletes it every housekeeping pass regardless of this policy (see
+    ItemStore.delete_failed_missing — run BEFORE this re-queue, so a missing
+    file is never re-armed)."""
+    KEY     = "auto_retry_failed"
+    DEFAULT = False
+
+    def enabled(self) -> bool:
+        """Global-scope read (no platform/user dimension for this toggle)."""
+        value = self._store.get(self.KEY, default=self.DEFAULT)
+        if not isinstance(value, bool):
+            log.warning("policy %s: non-bool %r — using %s",
+                        self.KEY, value, self.DEFAULT)
+            return self.DEFAULT
+        return value
+
+
 # ── Validation ────────────────────────────────────────────────────────────────
 
 def validate_overrides(

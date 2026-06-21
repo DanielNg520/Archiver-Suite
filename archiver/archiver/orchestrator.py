@@ -149,8 +149,13 @@ class Archiver:
 
     async def run(self,
                   platform_filter: str | None = None,
-                  user_filter:     str | None = None) -> dict[str, dict]:
-        """Run a full cycle. Returns per-(platform, user) results."""
+                  user_filter:     str | None = None,
+                  on_user=None) -> dict[str, dict]:
+        """Run a full cycle. Returns per-(platform, user) results.
+
+        on_user(platform_name, username) — optional progress hook called as each
+        user's archive begins, so a supervisor (the loop's phase heartbeat) can
+        report exactly which platform/user is being scanned right now."""
         if not self._verify_output_dir():
             return {
                 "preflight": {
@@ -185,7 +190,8 @@ class Archiver:
         # Downloading writes pending rows straight into the shared items
         # table; the dispatcher drains them asynchronously. There is no
         # enqueue handoff and no reconcile bridge — one table, one truth.
-        await self._run_platforms(platforms, user_filter, run_time, results)
+        await self._run_platforms(platforms, user_filter, run_time, results,
+                                  on_user)
         if self.config.reconcile_after_run:
             # Post-run sweep reconciles+uploads EVERY enabled platform
             # (download-disabled ones included), so they're covered here.
@@ -201,6 +207,10 @@ class Archiver:
                     await self._reconcile_one_platform(platform, user_filter)
         self._maybe_ingest_orphaned(known_platform_names)
         self._maybe_backfill_hashes()
+        # NOTE: failed-queue maintenance (delete missing-file tombstones +
+        # auto_retry_failed re-queue) lives in the DISPATCHER's housekeeping
+        # (dispatcher.drain), not here — the dispatcher owns the upload queue,
+        # so that GC runs on its ~15-min cadence regardless of this loop.
         self._report_banned()
         return results
 
@@ -302,6 +312,7 @@ class Archiver:
         user_filter: str | None,
         run_time: datetime,
         results: dict[str, dict],
+        on_user=None,
     ) -> None:
         """The per-platform / per-user loop."""
         for platform in platforms:
@@ -338,6 +349,11 @@ class Archiver:
                     continue
 
                 key = f"{platform.name}/{username}"
+                if on_user is not None:
+                    try:
+                        on_user(platform.name, username)
+                    except Exception:
+                        pass   # a status hook must never break the run
                 try:
                     results[key] = await self._archive_user(
                         platform, username, run_time,

@@ -83,6 +83,13 @@ CREATE INDEX IF NOT EXISTS idx_items_user_status
 CREATE INDEX IF NOT EXISTS idx_items_user_uploaddate
     ON items (platform, username, upload_date);
 
+-- Send-order clustering: claim_batch anchors each (platform, username) cluster
+-- on its first-appearance MIN(discovered_at) so a user's media drains
+-- contiguously (core.store._CLUSTER_COLS). discovered_at as the trailing column
+-- makes that correlated MIN an index-leftmost lookup, not a per-user row scan.
+CREATE INDEX IF NOT EXISTS idx_items_user_disc
+    ON items (platform, username, discovered_at);
+
 CREATE TABLE IF NOT EXISTS checkpoints (
     platform     TEXT NOT NULL,
     username     TEXT NOT NULL,

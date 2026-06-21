@@ -47,6 +47,12 @@ TIKTOK_LOCK   = Path("~/.config/archiver-suite/locks/tiktok.lock").expanduser()
 # duplicated here on purpose so ops keeps importing no worker package.
 PROGRESS_FILE = Path("~/.config/dispatcher/progress.json").expanduser()
 PROGRESS_STALE_S = 30.0
+# Phase heartbeat written by `archiver loop` (archiver/loop_state.py): tells us
+# whether the archiver is mid-scan or resting between cycles. Read as a plain
+# artifact — path duplicated here on purpose so ops keeps importing no worker
+# package. No staleness window (a rest phase legitimately lasts hours); the
+# writer-pid liveness check below is what guards against a stale file.
+ARCHIVER_LOOP_FILE = Path("~/.config/archiver/loop.json").expanduser()
 
 LABELS = {
     "dispatcher": "com.duy.dispatcher",
@@ -380,6 +386,27 @@ def archive_volume_path() -> str | None:
         conn.close()
 
 
+def archiver_loop_phase() -> dict | None:
+    """The loop's current phase ('running' a scan / 'sleeping' between loops),
+    or None when the file is absent, malformed, or its writer pid is gone
+    (a foreground `archiver run`, or an old loop that predates this file, has
+    no heartbeat — the caller falls back to plain liveness). Mirrors the
+    progress-file pattern: ops reads the artifact directly, importing nothing
+    from the archiver."""
+    import json
+    try:
+        data = json.loads(ARCHIVER_LOOP_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("phase") not in ("running", "sleeping"):
+        return None
+    try:
+        os.kill(int(data["pid"]), 0)   # signal 0: existence check only
+    except (OSError, ValueError):
+        return None
+    return data
+
+
 def archiver_last_run() -> str | None:
     conn = _connect_ro(SUITE_DB)
     if conn is None:
@@ -413,6 +440,28 @@ def _humanize_age(iso_ts: str) -> str:
     if secs < 5400:
         return f"{int(secs // 60)}m ago"
     return f"{int(secs // 3600)}h ago"
+
+
+def _humanize_age_epoch(epoch: float) -> str:
+    """'12m ago' / '3h ago' from a past epoch timestamp — the epoch-input twin
+    of _humanize_age (which parses ISO strings from the DB)."""
+    secs = time.time() - epoch
+    if secs < 90:
+        return f"{int(secs)}s ago"
+    if secs < 5400:
+        return f"{int(secs // 60)}m ago"
+    return f"{int(secs // 3600)}h ago"
+
+
+def _humanize_until(epoch: float) -> str:
+    """'in 47m' / 'in 1h' from a future epoch timestamp; 'due now' once past.
+    The countdown twin of _humanize_age, for the loop's next-run time."""
+    secs = epoch - time.time()
+    if secs <= 0:
+        return "due now"
+    if secs < 5400:
+        return f"in {max(1, int(secs // 60))}m"
+    return f"in {int(secs // 3600)}h"
 
 
 def _disk_fields(path: str = "/") -> tuple[str, float] | None:
@@ -647,6 +696,33 @@ def render() -> str:
     # ── archiver ──
     pid, owner = live["archiver"]
     rows = []
+    # Phase: is the loop mid-scan right now, or resting between cycles? The
+    # header's running/NOT-running only proves the process exists — this row
+    # says which of the two things an alive loop is actually doing.
+    phase = archiver_loop_phase() if pid else None
+    if phase:
+        run_n = phase.get("run_n")
+        tag = f"  ·  run #{run_n}" if run_n else ""
+        if phase["phase"] == "running":
+            plat, usr = phase.get("platform"), phase.get("user")
+            if plat and usr:
+                head = _c(f"◉ scanning {plat}/@{usr}", _GREEN)
+                extra = tag
+            elif plat:
+                head = _c(f"◉ scanning {plat}", _GREEN)
+                extra = tag
+            else:
+                # No target yet — between users, or the pre/post-scan phases
+                # (reconcile / ingest / backfill). Show how long we've been here.
+                since = phase.get("since")
+                head = _c("◉ scanning", _GREEN)
+                extra = tag + (f"  ·  {_humanize_age_epoch(since)}" if since else "")
+            rows.append(_row("phase", head + _c(extra, _DIM)))
+        else:
+            wake = phase.get("wake_at")
+            nxt = f"  ·  next run {_humanize_until(wake)}" if wake else ""
+            rows.append(_row("phase",
+                _c("○ resting between loops", _TEXT) + _c(tag + nxt, _DIM)))
     lr = archiver_last_run()
     ad = archiver_details()
     if ad is not None:

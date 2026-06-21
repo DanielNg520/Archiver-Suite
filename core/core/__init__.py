@@ -8,13 +8,15 @@ recorder, and ops instead of being copied into each.
 
 from .models import Item, Status, TERMINAL
 from .schema import connect, db_path, DEFAULT_DB_PATH, SchemaVersionError
-from .store import ClaimContentionError, IllegalTransition, ItemStore, now_iso
+from .store import (
+    ClaimContentionError, IllegalTransition, ItemStore, now_iso, CANCELLED_MARKER,
+)
 from .stores import ProducerStore, QueueStore, AdminStore
 from .policy_store import PolicyStore
 from .policies import (
     DeletePolicy, RecorderDeletePolicy, DedupPolicy, BooleanPolicy,
     BatchPolicy, AutoIngestPolicy, DownloadPolicy, ProtectionPolicy,
-    SortPolicy, validate_overrides,
+    SortPolicy, FailedRetryPolicy, validate_overrides,
 )
 from .files import cleanup_sidecars
 from .deletion import DeletionGuard
@@ -34,10 +36,12 @@ __all__ = [
     "Item", "Status", "TERMINAL",
     "connect", "db_path", "DEFAULT_DB_PATH", "SchemaVersionError",
     "ClaimContentionError", "IllegalTransition", "ItemStore", "now_iso",
+    "CANCELLED_MARKER",
     "ProducerStore", "QueueStore", "AdminStore",
     "PolicyStore", "DeletePolicy", "RecorderDeletePolicy", "DedupPolicy",
     "BooleanPolicy", "BatchPolicy", "AutoIngestPolicy", "DownloadPolicy",
-    "ProtectionPolicy", "SortPolicy", "validate_overrides", "cleanup_sidecars",
+    "ProtectionPolicy", "SortPolicy", "FailedRetryPolicy",
+    "validate_overrides", "cleanup_sidecars",
     "DeletionGuard",
     "dedup_user", "DedupReport", "DupGroup",
     "register_file", "IngestResult", "IngestOutcome",

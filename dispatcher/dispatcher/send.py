@@ -61,7 +61,7 @@ from typing import Any
 
 from telethon import TelegramClient, utils as tg_utils
 from telethon.errors import FloodWaitError, ImageProcessFailedError
-from telethon.tl import types as tg_types
+from telethon.tl import functions as tg_functions, types as tg_types
 
 from core.files import media_bucket
 from core import media_prep, Sanitizer
@@ -528,9 +528,12 @@ class TelethonSendStrategy(SendStrategy):
                 # with explicit attributes — the only way to get correct
                 # per-video geometry in a multi-item album.
                 payload = [
-                    await self._build_album_item(
-                        fp, thumbs.get(fp),
-                        batch_pos=i + 1, batch_total=len(file_paths),
+                    await self._materialize(
+                        peer,
+                        await self._build_album_item(
+                            fp, thumbs.get(fp),
+                            batch_pos=i + 1, batch_total=len(file_paths),
+                        ),
                     )
                     for i, fp in enumerate(file_paths)
                 ]
@@ -676,6 +679,24 @@ class TelethonSendStrategy(SendStrategy):
         return tg_types.InputMediaUploadedDocument(
             file=handle, mime_type=mime, attributes=attrs, thumb=thumb_handle,
         )
+
+    async def _materialize(self, peer: Any, uploaded):
+        """Turn a freshly-uploaded InputMediaUploadedDocument into a stable
+        InputMediaDocument via messages.uploadMedia, the way Telethon's own
+        album path does.
+
+        Grouped SendMultiMedia requires every item to reference media Telegram
+        has already materialized into a document. Handing it the raw 'uploaded'
+        handle races server-side processing: a source file that needs a beat of
+        inspection isn't a document yet when the grouped send references it, and
+        Telegram returns MediaEmptyError — which is why passthrough source .mp4s
+        intermittently failed in albums while clean .tgprep remuxes (instant to
+        materialize) won the race. uploadMedia forces that step to complete here,
+        per item, before the atomic album send."""
+        assert self._client is not None
+        result = await self._client(tg_functions.messages.UploadMediaRequest(
+            peer=peer, media=uploaded))
+        return tg_utils.get_input_media(result)
 
     async def _build_album_item(self, file_path: str, thumb: str | None = None,
                                 *, batch_pos: int | None = None,
