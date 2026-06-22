@@ -176,6 +176,60 @@ def run_housekeeping(store: QueueStore, config: DispatcherConfig) -> None:
     store.reset_stuck_sending(older_than_minutes=config.stuck_claim_min)
 
 
+async def recover_media_empty(
+    *, send_strategy: SendStrategy, store: QueueStore, guard: DeletionGuard,
+    config: DispatcherConfig, peer, topic_id,
+    present: list[Item], batch_dupes: list[tuple[Item, int]],
+    delete_policy: DeletePolicy, recorder_delete_policy: RecorderDeletePolicy,
+) -> tuple[int, int]:
+    """Recover from an album-level MediaEmptyError by re-sending each item
+    INDIVIDUALLY with the streamable net forced ON.
+
+    Album sends are atomic, so a single undeliverable item (an Instagram VP9
+    clip Telegram won't take as-is; a xiaohongshu single-frame mjpeg/webp "video")
+    rejects the whole 10-item batch. Per-item, with ensure_streamable=True:
+      • good H.264 items deliver,
+      • convertible ones (VP9 → H.264) are re-encoded by media_prep and deliver,
+      • only genuinely-dead media quarantines.
+    Turns 'lose all 10' into 'deliver the 9, isolate the 1'. Returns
+    (delivered, quarantined). Extracted for direct testing (Seam 11)."""
+    delivered = quarantined = 0
+    for it in present:
+        r = await send_strategy.send(
+            peer=peer, file_path=it.file_path,
+            caption=config.sanitizer.sanitize(caption_for(it)),
+            ensure_streamable=True,          # force re-encode of non-H.264 video
+            filetype_tag=it.source == ORPHANED_SOURCE,
+            topic_id=topic_id,
+        )
+        if r.ok:
+            store.mark_sent(it.id)
+            try:
+                maybe_delete(store, it.id, delete_policy=delete_policy,
+                             recorder_delete_policy=recorder_delete_policy,
+                             guard=guard)
+            except Exception as e:
+                log.exception("drain: id=%d cleanup raised: %s", it.id, e)
+            delivered += 1
+        elif r.flood_wait_s is not None:
+            store.requeue(it.id, reason=f"floodwait {r.flood_wait_s}s (fallback)")
+            await asyncio.sleep(r.flood_wait_s + 1)
+        elif r.media_empty:
+            store.quarantine(it.id, error=r.error or "MediaEmptyError")
+            quarantined += 1
+        else:
+            store.mark_failed(it.id, error=r.error or "unknown",
+                              max_retries=config.max_retries)
+    # Held-back in-batch dupes: re-evaluate next claim (a now-delivered twin will
+    # be suppressed by sent_twin; otherwise they get their own turn).
+    for it, _twin_id in batch_dupes:
+        store.requeue(it.id, reason="album fell back to per-item sends")
+    log.warning("@%s album media-rejected → per-item fallback: %d delivered, "
+                "%d quarantined", present[0].username, delivered, quarantined,
+                extra={"ev": "album-fallback"})
+    return delivered, quarantined
+
+
 async def drain_forever(
     config:        DispatcherConfig,
     store:         QueueStore,
@@ -401,21 +455,22 @@ async def drain_forever(
             await asyncio.sleep(result.flood_wait_s + 1)
 
         elif result.media_empty:
-            # Telegram rejected the media for this destination. Retrying within
-            # the budget is futile and, because these rows hold the oldest
-            # discovered_at, they'd sit at the head of the queue and block
-            # everything behind them. Quarantine the whole (atomic) batch on the
-            # first hit — terminal 'failed', no CANCELLED_MARKER — so the drain
-            # moves straight on to deliverable content. Often transient, so
-            # `reset failed` re-arms them once the condition clears.
-            for it in present:
-                store.quarantine(it.id, error=result.error or "MediaEmptyError")
-            for it, _twin_id in batch_dupes:
-                store.quarantine(it.id, error=result.error or "MediaEmptyError")
-            log.warning("@%s media rejected by destination — quarantined %d "
-                        "item(s) (recover with `reset failed`): %s",
-                        head.username, len(present) + len(batch_dupes),
-                        result.error, extra={"ev": "quarantine"})
+            # Telegram rejected the media. Don't burn the retry budget and don't
+            # let it head-of-line block — but DON'T write off the whole batch
+            # either: album atomicity means one bad item (a VP9 clip / a
+            # single-frame mjpeg "video") fails all 10. Re-send each item
+            # individually with the streamable net ON, so good and convertible
+            # (VP9 → H.264) items deliver and only truly-dead media quarantines
+            # ('failed', no CANCELLED_MARKER → `reset failed` can recover it).
+            await recover_media_empty(
+                send_strategy=send_strategy, store=store, guard=guard,
+                config=config, peer=peer, topic_id=topic_id,
+                present=present, batch_dupes=batch_dupes,
+                delete_policy=delete_policy,
+                recorder_delete_policy=recorder_delete_policy,
+            )
+            if len(present) > 1:
+                await asyncio.sleep(config.inter_album_sleep)
 
         else:
             # Whole-batch failure: every row gets an attempt counted. Since

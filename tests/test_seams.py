@@ -772,16 +772,23 @@ def test_full_drain_seam(tmp: Path) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _MediaEmptySend:
-    """Fake strategy: albums hit MediaEmptyError, singles succeed. Proves a
-    poison album is quarantined while deliverable singles still flow."""
+    """Fake strategy modeling the real poison: an ALBUM send hits MediaEmptyError
+    (album atomicity — one bad item fails all). The per-item fallback then sends
+    each single: a file whose name contains 'bad' stays MediaEmptyError (a truly
+    undeliverable clip media_prep can't fix); everything else delivers (a good
+    H.264 item, or a VP9 the net re-encoded). Proves: deliver the good, isolate
+    the bad — never write off the whole album."""
     def __init__(self):
         self.album_attempts = 0
-        self.sent_singles: list[str] = []
+        self.single_sends: list[str] = []
 
     async def send(self, *, peer, file_path, caption, ensure_streamable=True,
                    filetype_tag=False, topic_id=None):
         from dispatcher.send import SendResult
-        self.sent_singles.append(file_path)
+        self.single_sends.append(file_path)
+        if "bad" in Path(file_path).name:
+            return SendResult(ok=False, error="MediaEmptyError: rejected",
+                              media_empty=True)
         return SendResult(ok=True)
 
     async def send_album(self, *, peer, file_paths, caption, topic_id=None):
@@ -792,7 +799,7 @@ class _MediaEmptySend:
 
 
 def test_media_empty_quarantine_seam(tmp: Path) -> None:
-    section("Seam 11: MediaEmptyError ↔ fail-fast quarantine")
+    section("Seam 11: MediaEmptyError ↔ per-item fallback (deliver good, isolate bad)")
     from core import (ItemStore, PolicyStore, DeletePolicy, RecorderDeletePolicy,
                       BatchPolicy, DeletionGuard, CANCELLED_MARKER)
     from core.hashing import full_hash
@@ -805,10 +812,12 @@ def test_media_empty_quarantine_seam(tmp: Path) -> None:
     try:
         ps = PolicyStore()
         ps.set(BatchPolicy.SIZE_KEY, 1)   # let the small album send immediately
-        # A 2-photo album (poison) + a recorder single (deliverable).
-        a1 = _write_media(tmp / "x" / "al" / "a1.jpg", b"A1")
-        a2 = _write_media(tmp / "x" / "al" / "a2.jpg", b"A2")
-        for f, ident in ((a1, "a1"), (a2, "a2")):
+        # A 3-photo album whose send hits MediaEmptyError: two good items + one
+        # undeliverable ('bad'). Plus a recorder single that must still flow.
+        good1 = _write_media(tmp / "x" / "al" / "good1.jpg", b"G1")
+        good2 = _write_media(tmp / "x" / "al" / "good2.jpg", b"G2")
+        bad   = _write_media(tmp / "x" / "al" / "bad_vp9.jpg", b"BAD")
+        for f, ident in ((good1, "g1"), (good2, "g2"), (bad, "b1")):
             db.add_item(source="archiver", platform="x", username="al",
                         identifier=ident, file_path=str(f), priority=10,
                         content_hash=full_hash(f))
@@ -840,21 +849,21 @@ def test_media_empty_quarantine_seam(tmp: Path) -> None:
 
         asyncio.run(_run())
 
-        a1_row = store.get(store.id_of(str(a1)))
-        ok(a1_row.status == "failed",
-           "poison album quarantined to terminal 'failed' on first hit")
-        ok(a1_row.attempts <= 1,
-           "quarantine did NOT cycle the retry budget (attempts<=1, no storm)")
         ok(fake.album_attempts == 1,
-           "the album was attempted exactly ONCE, not re-claimed repeatedly")
-        ok(not (a1_row.last_error or "").startswith(CANCELLED_MARKER),
+           "album attempted once, then fell back to per-item (no retry storm)")
+        ok(store.get(store.id_of(str(good1))).status == "sent" and
+           store.get(store.id_of(str(good2))).status == "sent",
+           "good album items DELIVERED individually (not lost with the bad one)")
+        bad_row = store.get(store.id_of(str(bad)))
+        ok(bad_row.status == "failed" and bad_row.attempts <= 1,
+           "only the undeliverable item quarantined (no retry-budget churn)")
+        ok(not (bad_row.last_error or "").startswith(CANCELLED_MARKER),
            "quarantine leaves a plain failure (reset failed can recover it)")
         ok(store.get(store.id_of(str(rec))).status == "sent",
            "deliverable recorder single still sent — poison didn't block it")
-        # Recovery: reset failed re-arms the quarantined rows (transient cleared).
         n = store.reset_failed(None, None)
-        ok(n == 2 and store.get(store.id_of(str(a1))).status == "pending",
-           "reset failed re-arms quarantined rows (transient-recovery path)")
+        ok(n == 1 and store.get(store.id_of(str(bad))).status == "pending",
+           "reset failed re-arms only the quarantined item (recovery path)")
     finally:
         try: store.close()
         except Exception: pass
