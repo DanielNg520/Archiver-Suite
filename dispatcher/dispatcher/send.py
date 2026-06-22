@@ -63,7 +63,7 @@ from telethon import TelegramClient, utils as tg_utils
 from telethon.errors import (
     FloodWaitError, ImageProcessFailedError, MediaEmptyError,
 )
-from telethon.tl import functions as tg_functions, types as tg_types
+from telethon.tl import types as tg_types
 
 from core.files import media_bucket
 from core import media_prep, Sanitizer
@@ -517,27 +517,30 @@ class TelethonSendStrategy(SendStrategy):
         # caption only on the first item; rest None.
         captions: list[str | None] = [caption] + [None] * (len(file_paths) - 1)
 
-        # Photo albums are sent the original way (paths): Telethon resizes
-        # photos and the 1×1 placeholder bug is video-only, so there's nothing
-        # to fix and no reason to bypass its photo handling. Video albums need
-        # the custom path — see _build_album_item. Albums are homogeneous
-        # (drain groups by media bucket), so the anchor's bucket decides.
+        # Photo albums go through their own normalize-and-send path; video albums
+        # are handled below. Both ultimately use Telethon's native list send.
+        # Albums are homogeneous (drain groups by media bucket), so the anchor's
+        # bucket decides which path we take.
         is_video_album = media_bucket(file_paths[0]) == "video"
         if not is_video_album:
             return await self._send_photo_album(
                 peer, file_paths, captions, topic_id=topic_id)
 
-        # Album items must be STREAMABLE to deliver as one group: Telegram
-        # rejects a grouped SendMultiMedia with MediaEmptyError if any item is a
-        # codec/container it can't stream (chiefly Instagram VP9; the single-send
-        # path already re-encodes these, but the album path historically didn't —
-        # so one VP9 clip would fail the whole atomic batch). Re-encode each
-        # non-streamable item to H.264 here (media_prep.streamable_temp probes
-        # first and passes already-streamable files through untouched, so the
-        # 82K H.264 archive pays only a cheap ffprobe). Converted temps are
-        # cleaned up after the send. Keeping this IN the album path is what lets
-        # a VP9-poisoned album still ship as ONE album instead of degrading to
-        # singles via the drain's per-item fallback.
+        # HOW we build a video album matters: pre-building each item as an
+        # InputMediaUploadedDocument with an explicit DocumentAttributeVideo and
+        # grouping those is REJECTED by Telegram (MediaEmptyError on
+        # SendMultiMedia) — empirically, whether the upload is parallel or native
+        # and whether or not the doc is pre-materialized. The custom path existed
+        # to force per-video geometry (Telethon adds no video attrs without
+        # hachoir), but Telegram derives a valid mp4's width/height/duration
+        # server-side anyway, so the hint was unnecessary AND fatal when grouped.
+        # Telethon's native list send (which builds + materializes each item its
+        # own way) groups correctly, so we hand it the paths directly.
+        #
+        # We still re-encode non-streamable items to H.264 first
+        # (media_prep.streamable_temp — probe-and-passthrough for the H.264
+        # archive, convert VP9/odd codecs) so every clip plays inline; converted
+        # temps are cleaned up after the send.
         prepped: dict[str, str] = {}          # original fp → converted temp path
         send_paths: list[str] = []
         for fp in file_paths:
@@ -548,32 +551,13 @@ class TelethonSendStrategy(SendStrategy):
             else:
                 send_paths.append(fp)
 
-        # Poster frames for each clip, built once so they survive retries; same
-        # black/white-fade-in fix as the single-send path. Keyed by the path we
-        # actually send (the converted temp when one was produced).
-        thumbs = {
-            sp: await asyncio.to_thread(make_thumbnail, sp) for sp in send_paths
-        }
         try:
             async def _do():
-                # Telethon's album path (_send_album) doesn't forward an
-                # `attributes=` argument, so bare paths would give every video
-                # the same 1×1 placeholder. Pre-build each item as InputMedia
-                # with explicit attributes — the only way to get correct
-                # per-video geometry in a multi-item album.
-                payload = [
-                    await self._materialize(
-                        peer,
-                        await self._build_album_item(
-                            sp, thumbs.get(sp),
-                            batch_pos=i + 1, batch_total=len(send_paths),
-                        ),
-                    )
-                    for i, sp in enumerate(send_paths)
-                ]
                 await self._client.send_file(
-                    peer, payload, caption=captions, supports_streaming=True,
+                    peer, send_paths, caption=captions, supports_streaming=True,
                     reply_to=topic_id,
+                    progress_callback=self._progress_cb(
+                        file_paths[0], batch_total=len(send_paths)),
                 )
             return await self._send_with_retries(
                 _do, what=f"album[{len(send_paths)}] {Path(file_paths[0]).name}…",
@@ -581,12 +565,6 @@ class TelethonSendStrategy(SendStrategy):
             )
         finally:
             self._progress_done()
-            for t in thumbs.values():
-                if t:
-                    try:
-                        os.unlink(t)
-                    except OSError:
-                        pass
             for t in prepped.values():        # clean the re-encode temps
                 try:
                     os.unlink(t)
@@ -717,55 +695,6 @@ class TelethonSendStrategy(SendStrategy):
         )
         return tg_types.InputMediaUploadedDocument(
             file=handle, mime_type=mime, attributes=attrs, thumb=thumb_handle,
-        )
-
-    async def _materialize(self, peer: Any, uploaded):
-        """Turn a freshly-uploaded InputMediaUploadedDocument into a stable
-        InputMediaDocument via messages.uploadMedia, the way Telethon's own
-        album path does.
-
-        Grouped SendMultiMedia requires every item to reference media Telegram
-        has already materialized into a document. Handing it the raw 'uploaded'
-        handle races server-side processing: a source file that needs a beat of
-        inspection isn't a document yet when the grouped send references it, and
-        Telegram returns MediaEmptyError — which is why passthrough source .mp4s
-        intermittently failed in albums while clean .tgprep remuxes (instant to
-        materialize) won the race. uploadMedia forces that step to complete here,
-        per item, before the atomic album send."""
-        assert self._client is not None
-        result = await self._client(tg_functions.messages.UploadMediaRequest(
-            peer=peer, media=uploaded))
-        return tg_utils.get_input_media(result)
-
-    async def _build_album_item(self, file_path: str, thumb: str | None = None,
-                                *, batch_pos: int | None = None,
-                                batch_total: int | None = None):
-        """Upload one video and wrap it as an InputMediaUploadedDocument for an
-        album send, injecting explicit display geometry when we have it.
-
-        Only called for video albums (see send_album). Telethon's _send_album
-        accepts pre-built InputMedia and preserves the baked-in attributes,
-        which is how we get per-item dimensions the path-list album API can't
-        express. If the probe failed for this file, we still upload it as a
-        video document — just without the explicit attribute (status quo for
-        that one file), never as a photo.
-
-        `thumb` is a local JPEG poster path (or None); when present it is
-        uploaded and baked in so the album item gets a real preview frame
-        instead of a server-picked black/white fade-in frame."""
-        video_attrs = await asyncio.to_thread(_video_attributes, file_path)
-        # Strip any ".tgprep" marker from the album item's filename too (same
-        # reason as the single path) — an explicit DocumentAttributeFilename
-        # overrides the basename get_attributes would otherwise derive.
-        display = self._display_name(file_path)
-        name_attr = ([tg_types.DocumentAttributeFilename(display)]
-                     if display != Path(file_path).name else [])
-        return await self._upload_document(
-            file_path,
-            attributes=(video_attrs or []) + name_attr,  # [] → no override
-            thumb_path=thumb, supports_streaming=True, force_document=False,
-            progress_cb=self._progress_cb(
-                file_path, batch_pos=batch_pos, batch_total=batch_total),
         )
 
     async def _send_with_retries(
