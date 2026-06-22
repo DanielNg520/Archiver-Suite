@@ -527,10 +527,32 @@ class TelethonSendStrategy(SendStrategy):
             return await self._send_photo_album(
                 peer, file_paths, captions, topic_id=topic_id)
 
+        # Album items must be STREAMABLE to deliver as one group: Telegram
+        # rejects a grouped SendMultiMedia with MediaEmptyError if any item is a
+        # codec/container it can't stream (chiefly Instagram VP9; the single-send
+        # path already re-encodes these, but the album path historically didn't —
+        # so one VP9 clip would fail the whole atomic batch). Re-encode each
+        # non-streamable item to H.264 here (media_prep.streamable_temp probes
+        # first and passes already-streamable files through untouched, so the
+        # 82K H.264 archive pays only a cheap ffprobe). Converted temps are
+        # cleaned up after the send. Keeping this IN the album path is what lets
+        # a VP9-poisoned album still ship as ONE album instead of degrading to
+        # singles via the drain's per-item fallback.
+        prepped: dict[str, str] = {}          # original fp → converted temp path
+        send_paths: list[str] = []
+        for fp in file_paths:
+            tmp = await asyncio.to_thread(media_prep.streamable_temp, Path(fp))
+            if tmp is not None:
+                prepped[fp] = str(tmp)
+                send_paths.append(str(tmp))
+            else:
+                send_paths.append(fp)
+
         # Poster frames for each clip, built once so they survive retries; same
-        # black/white-fade-in fix as the single-send path. fp → thumb-path|None.
+        # black/white-fade-in fix as the single-send path. Keyed by the path we
+        # actually send (the converted temp when one was produced).
         thumbs = {
-            fp: await asyncio.to_thread(make_thumbnail, fp) for fp in file_paths
+            sp: await asyncio.to_thread(make_thumbnail, sp) for sp in send_paths
         }
         try:
             async def _do():
@@ -543,19 +565,19 @@ class TelethonSendStrategy(SendStrategy):
                     await self._materialize(
                         peer,
                         await self._build_album_item(
-                            fp, thumbs.get(fp),
-                            batch_pos=i + 1, batch_total=len(file_paths),
+                            sp, thumbs.get(sp),
+                            batch_pos=i + 1, batch_total=len(send_paths),
                         ),
                     )
-                    for i, fp in enumerate(file_paths)
+                    for i, sp in enumerate(send_paths)
                 ]
                 await self._client.send_file(
                     peer, payload, caption=captions, supports_streaming=True,
                     reply_to=topic_id,
                 )
             return await self._send_with_retries(
-                _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
-                payload_bytes=self._payload_bytes(file_paths),
+                _do, what=f"album[{len(send_paths)}] {Path(file_paths[0]).name}…",
+                payload_bytes=self._payload_bytes(send_paths),
             )
         finally:
             self._progress_done()
@@ -565,6 +587,11 @@ class TelethonSendStrategy(SendStrategy):
                         os.unlink(t)
                     except OSError:
                         pass
+            for t in prepped.values():        # clean the re-encode temps
+                try:
+                    os.unlink(t)
+                except OSError:
+                    pass
 
     async def _send_photo_album(
         self,
