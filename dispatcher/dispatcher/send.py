@@ -526,50 +526,40 @@ class TelethonSendStrategy(SendStrategy):
             return await self._send_photo_album(
                 peer, file_paths, captions, topic_id=topic_id)
 
-        # HOW we build a video album matters: pre-building each item as an
-        # InputMediaUploadedDocument with an explicit DocumentAttributeVideo and
-        # grouping those is REJECTED by Telegram (MediaEmptyError on
-        # SendMultiMedia) — empirically, whether the upload is parallel or native
-        # and whether or not the doc is pre-materialized. The custom path existed
-        # to force per-video geometry (Telethon adds no video attrs without
-        # hachoir), but Telegram derives a valid mp4's width/height/duration
-        # server-side anyway, so the hint was unnecessary AND fatal when grouped.
-        # Telethon's native list send (which builds + materializes each item its
-        # own way) groups correctly, so we hand it the paths directly.
+        # HOW a video album is built matters. Pre-building each item as an
+        # InputMediaUploadedDocument and grouping those is REJECTED by Telegram
+        # (MediaEmptyError on SendMultiMedia) — proven by bisection against the
+        # live account across every combination: parallel (fast_upload) OR native
+        # upload, with OR without explicit DocumentAttributeVideo, materialized OR
+        # not. Only Telethon's NATIVE list send groups reliably (it uploads and
+        # materializes each item its own way), so we hand it the raw paths.
+        # Telegram derives a valid mp4's geometry server-side, so no explicit
+        # attributes are needed — and supplying them is itself what breaks the
+        # group.
         #
-        # We still re-encode non-streamable items to H.264 first
-        # (media_prep.streamable_temp — probe-and-passthrough for the H.264
-        # archive, convert VP9/odd codecs) so every clip plays inline; converted
-        # temps are cleaned up after the send.
-        prepped: dict[str, str] = {}          # original fp → converted temp path
-        send_paths: list[str] = []
-        for fp in file_paths:
-            tmp = await asyncio.to_thread(media_prep.streamable_temp, Path(fp))
-            if tmp is not None:
-                prepped[fp] = str(tmp)
-                send_paths.append(str(tmp))
-            else:
-                send_paths.append(fp)
-
+        # We deliberately do NOT re-encode inline here. Native ships VP9 fine, and
+        # an inline ffmpeg pass per item was a heavy, per-restart bottleneck that
+        # made a 10-clip album look "stuck". A genuinely-undeliverable item is
+        # caught by the drain's per-item fallback (recover_media_empty), which
+        # re-encodes only that item, only when needed.
+        #
+        # Cost: native list send uploads serially (no fast_upload fan-out). That's
+        # the right trade here — albums are archiver carousels of small clips;
+        # large media (recordings) ship as SINGLE sends, which DO use fast_upload.
+        async def _do():
+            await self._client.send_file(
+                peer, file_paths, caption=captions, supports_streaming=True,
+                reply_to=topic_id,
+                progress_callback=self._progress_cb(
+                    file_paths[0], batch_total=len(file_paths)),
+            )
         try:
-            async def _do():
-                await self._client.send_file(
-                    peer, send_paths, caption=captions, supports_streaming=True,
-                    reply_to=topic_id,
-                    progress_callback=self._progress_cb(
-                        file_paths[0], batch_total=len(send_paths)),
-                )
             return await self._send_with_retries(
-                _do, what=f"album[{len(send_paths)}] {Path(file_paths[0]).name}…",
-                payload_bytes=self._payload_bytes(send_paths),
+                _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
+                payload_bytes=self._payload_bytes(file_paths),
             )
         finally:
             self._progress_done()
-            for t in prepped.values():        # clean the re-encode temps
-                try:
-                    os.unlink(t)
-                except OSError:
-                    pass
 
     async def _send_photo_album(
         self,

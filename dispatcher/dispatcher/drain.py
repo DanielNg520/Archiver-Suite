@@ -66,6 +66,21 @@ _PREPPED_AT_INGEST_SOURCES = {"archiver", ORPHANED_SOURCE}
 # upload — e.g. launchd restart mid-send — strands exactly one such row).
 _HOUSEKEEPING_EVERY_S = 15 * 60
 
+# Circuit breaker: a SYSTEMIC fault (Telegram unreachable, auth lost, a wedged
+# connection) makes every send fail the same way. Without a breaker the drain
+# would churn the queue at full speed, burning each item's retry budget and
+# marking thousands 'failed' during what is really a transient outage. So we
+# count CONSECUTIVE systemic failures (network/stall/unknown — NOT item-specific
+# ones like MediaEmptyError or a missing file, which say nothing about Telegram's
+# health) and, once the threshold trips, pause the whole drain for a cooldown
+# instead of hammering. Any single success resets the count. This mirrors the
+# archiver's per-platform circuit breaker (core.store.bump_circuit_fail), kept
+# in-memory here because the dispatcher's fault domain is the one shared session,
+# not per-platform. Tuned conservative: a real backlog never sees 8 genuine
+# systemic failures back-to-back, but an outage trips within seconds.
+_CIRCUIT_TRIP_AT   = 8
+_CIRCUIT_COOLDOWN_S = 60.0
+
 
 def is_tiktok_live(item: Item) -> bool:
     return item.platform.lower() == "tiktok" and item.source.lower() == "recorder"
@@ -271,10 +286,30 @@ async def drain_forever(
     # run it immediately (covering startup), then every _HOUSEKEEPING_EVERY_S.
     last_housekeeping = 0.0
 
+    # Circuit breaker state: consecutive SYSTEMIC send failures (see constant).
+    consecutive_fails = 0
+
     while True:
         if stop_event is not None and stop_event.is_set():
             log.info("drain: stop requested, exiting cleanly")
             return
+
+        if consecutive_fails >= _CIRCUIT_TRIP_AT:
+            log.error("circuit: %d consecutive systemic send failures — pausing "
+                      "%.0fs before retrying (Telegram unreachable / session "
+                      "problem?)", consecutive_fails, _CIRCUIT_COOLDOWN_S,
+                      extra={"ev": "circuit"})
+            # Interruptible cooldown so a stop request is still honored promptly.
+            try:
+                if stop_event is not None:
+                    await asyncio.wait_for(stop_event.wait(),
+                                           timeout=_CIRCUIT_COOLDOWN_S)
+                    return  # woke because stop was set
+                else:
+                    await asyncio.sleep(_CIRCUIT_COOLDOWN_S)
+            except asyncio.TimeoutError:
+                pass        # cooldown elapsed → try again with a clean slate
+            consecutive_fails = 0
 
         now = time.monotonic()
         if now - last_housekeeping >= _HOUSEKEEPING_EVERY_S:
@@ -413,6 +448,7 @@ async def drain_forever(
             )
 
         if result.ok:
+            consecutive_fails = 0          # a success clears the circuit breaker
             # All-or-nothing: the whole batch went up as one atomic send,
             # so mark every row sent together, then run delete gate per row.
             for it in present:
@@ -475,7 +511,11 @@ async def drain_forever(
         else:
             # Whole-batch failure: every row gets an attempt counted. Since
             # the album is atomic, none were posted — all are eligible to
-            # retry (or hit failed at max_retries) together.
+            # retry (or hit failed at max_retries) together. This arm is the
+            # SYSTEMIC bucket (network/stall/unknown), so it advances the circuit
+            # breaker; an item-specific outcome (media_empty above, missing file,
+            # unroutable) never reaches here and so never trips it.
+            consecutive_fails += 1
             statuses: set[str] = set()
             for it in present:
                 statuses.add(store.mark_failed(

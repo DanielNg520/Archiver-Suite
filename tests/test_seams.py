@@ -869,6 +869,76 @@ def test_media_empty_quarantine_seam(tmp: Path) -> None:
         except Exception: pass
 
 
+class _AlwaysFailSend:
+    """Every send fails with a SYSTEMIC (network) error — models Telegram down."""
+    def __init__(self):
+        self.calls = 0
+
+    async def send(self, *, peer, file_path, caption, ensure_streamable=True,
+                   filetype_tag=False, topic_id=None):
+        from dispatcher.send import SendResult
+        self.calls += 1
+        return SendResult(ok=False, error="network down")
+
+    async def send_album(self, *, peer, file_paths, caption, topic_id=None):
+        from dispatcher.send import SendResult
+        self.calls += 1
+        return SendResult(ok=False, error="network down")
+
+
+def test_circuit_breaker_seam(tmp: Path) -> None:
+    section("Seam 11b: dispatcher circuit breaker pauses on systemic failure")
+    import dispatcher.drain as drain_mod
+    from core import (ItemStore, PolicyStore, DeletePolicy, RecorderDeletePolicy,
+                      BatchPolicy, DeletionGuard)
+    from core.hashing import full_hash
+    from dispatcher.config import DispatcherConfig
+    from dispatcher.tg_router import TelegramRouter
+
+    orig_trip, orig_cd = drain_mod._CIRCUIT_TRIP_AT, drain_mod._CIRCUIT_COOLDOWN_S
+    drain_mod._CIRCUIT_TRIP_AT = 3
+    drain_mod._CIRCUIT_COOLDOWN_S = 30.0   # long: we catch the drain mid-cooldown
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        ps = PolicyStore(); ps.set(BatchPolicy.SIZE_KEY, 1)
+        for i in range(10):
+            f = _write_media(tmp / "rec" / "u" / f"u_{i}.mp4", bytes([i]) * 50)
+            db.add_item(source="recorder", platform="tiktok", username="u",
+                        identifier=f"rec_{i}", file_path=str(f), priority=5,
+                        content_hash=full_hash(f))
+        db.close()
+        cfg = DispatcherConfig(
+            telegram=None, default_chat_id="-100123", db_path=db_path,
+            policy_store=ps, poll_interval_s=0.01, max_retries=4,
+            inter_album_sleep=0.0, stuck_claim_min=10, failed_retention_days=0)
+        store = ItemStore.open(db_path)
+        fake = _AlwaysFailSend()
+        stop = asyncio.Event()
+
+        async def _run():
+            task = asyncio.create_task(drain_mod.drain_forever(
+                cfg, store, fake, TelegramRouter(default_chat_id="-100123"),
+                DeletePolicy(ps), RecorderDeletePolicy(ps), BatchPolicy(ps),
+                DeletionGuard(ps), stop_event=stop))
+            for _ in range(500):
+                await asyncio.sleep(0.01)
+                if fake.calls >= 3:
+                    break
+            await asyncio.sleep(0.15)   # let it reach the cooldown gate
+            stop.set(); await task
+
+        asyncio.run(_run())
+        ok(fake.calls == 3,
+           f"breaker tripped at threshold: {fake.calls} sends then paused, not "
+           f"all 10 churned through")
+    finally:
+        drain_mod._CIRCUIT_TRIP_AT = orig_trip
+        drain_mod._CIRCUIT_COOLDOWN_S = orig_cd
+        try: store.close()
+        except Exception: pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Seam 12 — full-history gate: core.store flag ↔ archiver._compute_date_min
 # The gate (needs_full_history) and the cutoff computation live in different
@@ -1929,6 +1999,7 @@ def main() -> int:
         test_full_history_gate_seam()
         test_full_drain_seam(tmp / "s10")
         test_media_empty_quarantine_seam(tmp / "s11")
+        test_circuit_breaker_seam(tmp / "s11b")
         _reset_config()
         test_in_batch_dedup_integrity_seam(tmp / "s15")
         test_lock_cwd_independence_seam(tmp / "s16")
