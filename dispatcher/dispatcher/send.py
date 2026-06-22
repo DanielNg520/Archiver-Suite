@@ -193,7 +193,7 @@ class TelethonSendStrategy(SendStrategy):
         max_flood_wait_s: int   = 600,
         stall_base_timeout_s: float = 600.0,
         stall_min_rate_kib_s: float = 64.0,
-        upload_connections: int = 4,
+        upload_connections: int = 8,   # fast_upload.MAX_CONNECTIONS (see config)
         progress: ProgressReporter | None = None,
         sanitizer: Sanitizer | None = None,
     ):

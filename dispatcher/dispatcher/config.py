@@ -115,9 +115,15 @@ class DispatcherConfig:
     stall_min_rate_kib_s: float = 64.0
     # Parallel upload: number of concurrent MTProto connections used to push a
     # big file's parts (the "FastTelethon" fan-out). 1 restores Telethon's stock
-    # single-connection serial upload. Capped internally at fast_upload.
-    # MAX_CONNECTIONS. Tune via UPLOAD_CONNECTIONS in ~/.config/dispatcher/.env.
-    upload_connections: int = 4
+    # single-connection serial upload. Default 8 = fast_upload.MAX_CONNECTIONS,
+    # the optimal-and-safe ceiling for heavy media: it saturates a fast uplink
+    # (each connection is throttled by Telegram, so N connections ≈ N× until the
+    # link's bandwidth caps), while staying within what the home DC tolerates on
+    # one auth key — past 8 is diminishing returns + FloodWait/politeness risk,
+    # which is why fast_upload caps there. Bounded memory regardless (≤ workers×2
+    # parts of 512 KiB). Lower it via UPLOAD_CONNECTIONS in ~/.config/dispatcher/
+    # .env on a constrained/metered link.
+    upload_connections: int = 8
 
     @classmethod
     def load(cls, *, require_telegram: bool = True) -> "DispatcherConfig":
@@ -147,7 +153,7 @@ class DispatcherConfig:
             failed_retention_days = float(_opt("FAILED_RETENTION_DAYS", "7")),
             stall_base_timeout_s  = float(_opt("STALL_BASE_TIMEOUT_S", "600")),
             stall_min_rate_kib_s  = float(_opt("STALL_MIN_RATE_KIB_S", "64")),
-            upload_connections    = int(_opt("UPLOAD_CONNECTIONS", "4")),
+            upload_connections    = int(_opt("UPLOAD_CONNECTIONS", "8")),
         )
 
     def config_toml_path(self) -> Path:
