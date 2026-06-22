@@ -11,6 +11,7 @@ Run: PYTHONPATH=core:archiver python core/core/_selftest_fixes.py
 Requires ffmpeg/ffprobe on PATH.
 """
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -192,6 +193,24 @@ def test_reconcile_converts_ts(tmp: Path) -> None:
     store.close()
 
 
+def test_instance_lock(tmp: Path) -> None:
+    print("\n── single-instance lock refuses a second holder ──")
+    from core import InstanceLock, InstanceAlreadyRunning
+    d = tmp / "locks"
+    with InstanceLock("archiver", lock_dir=d) as first:
+        check(first.holder_pid() == os.getpid(), "holder pid recorded")
+        try:
+            with InstanceLock("archiver", lock_dir=d):
+                check(False, "second holder should not have acquired")
+        except InstanceAlreadyRunning:
+            check(True, "second 'archiver' instance refused while first holds it")
+        with InstanceLock("recorder", lock_dir=d):
+            check(True, "a different worker name locks independently")
+    # Released on exit → re-acquirable (kernel frees flock, no stale-PID dance).
+    with InstanceLock("archiver", lock_dir=d):
+        check(True, "lock re-acquired after the first holder exited")
+
+
 def main() -> None:
     print("fixes self-test")
     with tempfile.TemporaryDirectory() as d:
@@ -200,6 +219,7 @@ def main() -> None:
         test_cancel_survives_reintroduction(tmp)
         test_pending_twin_still_dedups(tmp)
         test_reconcile_converts_ts(tmp)
+        test_instance_lock(tmp)
     print(f"\nALL PASS ({_checks} checks)")
 
 

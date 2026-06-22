@@ -453,6 +453,14 @@ def main(argv: list[str] | None = None) -> int:
         log.error("no handler for %s/%s", args.command, sub)
         return 2
     try:
+        # Single-instance guard: only one `recorder start` may run at a time
+        # (two would fight over the same TikTok session + capture dirs).
+        # InstanceAlreadyRunning is a RuntimeError, so the handler below reports
+        # it cleanly. Other subcommands (config, stop, watch, …) are not gated.
+        if args.command == "start":
+            from core import InstanceLock
+            with InstanceLock("recorder"):
+                return handler(args)
         return handler(args)
     except RuntimeError as e:
         log.error("%s", e)

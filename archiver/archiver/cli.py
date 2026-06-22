@@ -1874,7 +1874,21 @@ def main() -> int:
             "purge-sent":   cmd_purge_sent,
             "migrate":      cmd_migrate,
         }
-        return dispatch[args.cmd](args, config, db)
+        handler = dispatch[args.cmd]
+        # Single-instance guard for the long-running / download work commands:
+        # two of these in parallel would double-download and race the queue.
+        # All share the "archiver" lock so `loop`, `run`, `start`, `bootstrap`
+        # are mutually exclusive (the loop runs `run` IN-PROCESS, so no
+        # self-deadlock). Quick admin/read commands are never gated.
+        if args.cmd in {"loop", "run", "start", "bootstrap"}:
+            from core import InstanceLock, InstanceAlreadyRunning
+            try:
+                with InstanceLock("archiver"):
+                    return handler(args, config, db)
+            except InstanceAlreadyRunning as exc:
+                log.error("%s", exc)
+                return 1
+        return handler(args, config, db)
     finally:
         db.close()
 

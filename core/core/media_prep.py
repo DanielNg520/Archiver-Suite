@@ -345,6 +345,16 @@ def clean_upload_name(path: "str | Path") -> str:
     return name.replace(tag, ".", 1) if tag in name else name
 
 
+def clean_upload_stem(path: "str | Path") -> str:
+    """The display STEM (no extension) with the internal '.tgprep' marker
+    stripped — for captions that list filenames (orphaned-folder batches, split
+    albums). Path(...).stem alone leaves the tag visible (a '<stem>.tgprep.mp4'
+    file stems to '<stem>.tgprep'), leaking the internal marker into the message;
+    this is the caption-side companion to clean_upload_name (which keeps the
+    extension for the file's display name)."""
+    return Path(clean_upload_name(path)).stem
+
+
 def is_nonstreamable_video(path: Path) -> bool:
     """True when `path` is a readable video Telegram CAN'T stream inline (wrong
     container/codec). Used by producers that deliberately ship a non-streamable

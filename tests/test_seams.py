@@ -762,6 +762,105 @@ def test_full_drain_seam(tmp: Path) -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Seam 11 — MediaEmptyError ↔ fail-fast quarantine (queue can't head-of-line jam)
+# Telegram occasionally rejects uploaded media for a destination (MediaEmptyError),
+# often transiently. The send envelope must NOT retry it 4x (a backoff storm), and
+# the drain must NOT let it cycle attempts at the head of the queue — one poison
+# album would otherwise starve the whole drain (the real 3-hour outage). Contract:
+# media_empty ⇒ terminal 'failed' on the FIRST hit, no CANCELLED_MARKER, so the
+# drain moves on AND `reset failed` can recover it once the cause clears.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _MediaEmptySend:
+    """Fake strategy: albums hit MediaEmptyError, singles succeed. Proves a
+    poison album is quarantined while deliverable singles still flow."""
+    def __init__(self):
+        self.album_attempts = 0
+        self.sent_singles: list[str] = []
+
+    async def send(self, *, peer, file_path, caption, ensure_streamable=True,
+                   filetype_tag=False, topic_id=None):
+        from dispatcher.send import SendResult
+        self.sent_singles.append(file_path)
+        return SendResult(ok=True)
+
+    async def send_album(self, *, peer, file_paths, caption, topic_id=None):
+        from dispatcher.send import SendResult
+        self.album_attempts += 1
+        return SendResult(ok=False, error="MediaEmptyError: rejected",
+                          media_empty=True)
+
+
+def test_media_empty_quarantine_seam(tmp: Path) -> None:
+    section("Seam 11: MediaEmptyError ↔ fail-fast quarantine")
+    from core import (ItemStore, PolicyStore, DeletePolicy, RecorderDeletePolicy,
+                      BatchPolicy, DeletionGuard, CANCELLED_MARKER)
+    from core.hashing import full_hash
+    from dispatcher.drain import drain_forever
+    from dispatcher.config import DispatcherConfig
+    from dispatcher.tg_router import TelegramRouter
+
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        ps = PolicyStore()
+        ps.set(BatchPolicy.SIZE_KEY, 1)   # let the small album send immediately
+        # A 2-photo album (poison) + a recorder single (deliverable).
+        a1 = _write_media(tmp / "x" / "al" / "a1.jpg", b"A1")
+        a2 = _write_media(tmp / "x" / "al" / "a2.jpg", b"A2")
+        for f, ident in ((a1, "a1"), (a2, "a2")):
+            db.add_item(source="archiver", platform="x", username="al",
+                        identifier=ident, file_path=str(f), priority=10,
+                        content_hash=full_hash(f))
+        rec = _write_media(tmp / "rec" / "bo" / "bo_1.mp4", b"REC")
+        db.add_item(source="recorder", platform="tiktok", username="bo",
+                    identifier="rec_bo_1", file_path=str(rec), priority=5,
+                    content_hash=full_hash(rec))
+        db.close()
+
+        cfg = DispatcherConfig(
+            telegram=None, default_chat_id="-100123", db_path=db_path,
+            policy_store=ps, poll_interval_s=0.01, max_retries=4,
+            inter_album_sleep=0.0, stuck_claim_min=10, failed_retention_days=0)
+        store = ItemStore.open(db_path)
+        fake = _MediaEmptySend()
+        stop = asyncio.Event()
+
+        async def _run():
+            task = asyncio.create_task(drain_forever(
+                cfg, store, fake, TelegramRouter(default_chat_id="-100123"),
+                DeletePolicy(ps), RecorderDeletePolicy(ps), BatchPolicy(ps),
+                DeletionGuard(ps), stop_event=stop))
+            for _ in range(400):
+                await asyncio.sleep(0.01)
+                c = store.counts_by_status()
+                if c.get("pending", 0) == 0 and c.get("sending", 0) == 0:
+                    break
+            stop.set(); await task
+
+        asyncio.run(_run())
+
+        a1_row = store.get(store.id_of(str(a1)))
+        ok(a1_row.status == "failed",
+           "poison album quarantined to terminal 'failed' on first hit")
+        ok(a1_row.attempts <= 1,
+           "quarantine did NOT cycle the retry budget (attempts<=1, no storm)")
+        ok(fake.album_attempts == 1,
+           "the album was attempted exactly ONCE, not re-claimed repeatedly")
+        ok(not (a1_row.last_error or "").startswith(CANCELLED_MARKER),
+           "quarantine leaves a plain failure (reset failed can recover it)")
+        ok(store.get(store.id_of(str(rec))).status == "sent",
+           "deliverable recorder single still sent — poison didn't block it")
+        # Recovery: reset failed re-arms the quarantined rows (transient cleared).
+        n = store.reset_failed(None, None)
+        ok(n == 2 and store.get(store.id_of(str(a1))).status == "pending",
+           "reset failed re-arms quarantined rows (transient-recovery path)")
+    finally:
+        try: store.close()
+        except Exception: pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Seam 12 — full-history gate: core.store flag ↔ archiver._compute_date_min
 # The gate (needs_full_history) and the cutoff computation live in different
 # packages; the contract is "armed user ⇒ None cutoff ⇒ whole-timeline walk",
@@ -1501,8 +1600,10 @@ def test_split_album_seam(tmp: Path) -> None:
     store = ItemStore.open(db_file)
     parts = []
     for n in range(3):
-        f = _write_media(tmp / "x" / "alice" / f"bigvideo_part{n:03d}.mp4",
-                         bytes([n]) * 300)
+        # Part 1 carries the internal ".tgprep" marker on disk (a remuxed copy):
+        # it must ship as that real file but be NAMED cleanly in the caption.
+        stem = f"bigvideo_part{n:03d}" + (".tgprep" if n == 1 else "")
+        f = _write_media(tmp / "x" / "alice" / f"{stem}.mp4", bytes([n]) * 300)
         parts.append(f)
         # Distinct per-part captions on purpose: only the shared group_key may
         # bind them, never a coincidentally-equal caption.
@@ -1522,11 +1623,12 @@ def test_split_album_seam(tmp: Path) -> None:
     ok(len(fake.sent_albums) == 1 and len(fake.sent_albums[0]) == 3,
        "all 3 split parts shipped as ONE album despite min_batch=10 (gate-exempt)")
     ok(sorted(Path(p).name for p in fake.sent_albums[0]) ==
-       ["bigvideo_part000.mp4", "bigvideo_part001.mp4", "bigvideo_part002.mp4"],
-       "the album holds exactly the three parts of the one split original")
+       ["bigvideo_part000.mp4", "bigvideo_part001.tgprep.mp4",
+        "bigvideo_part002.mp4"],
+       "the album ships the real files incl. the .tgprep-marked part")
     cap = fake.album_captions[0]
     ok(cap == "bigvideo_part000\nbigvideo_part001\nbigvideo_part002",
-       "split album caption lists each part stem (one per line), no icon header")
+       "caption lists clean part stems — the .tgprep marker is stripped, not leaked")
     store = ItemStore.open(db_file)
     ok(store.counts_by_status().get("sent", 0) == 3,
        "all three part rows are terminal 'sent'")
@@ -1817,6 +1919,7 @@ def main() -> int:
         _reset_config()
         test_full_history_gate_seam()
         test_full_drain_seam(tmp / "s10")
+        test_media_empty_quarantine_seam(tmp / "s11")
         _reset_config()
         test_in_batch_dedup_integrity_seam(tmp / "s15")
         test_lock_cwd_independence_seam(tmp / "s16")

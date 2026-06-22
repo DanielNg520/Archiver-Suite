@@ -60,7 +60,9 @@ from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, utils as tg_utils
-from telethon.errors import FloodWaitError, ImageProcessFailedError
+from telethon.errors import (
+    FloodWaitError, ImageProcessFailedError, MediaEmptyError,
+)
 from telethon.tl import functions as tg_functions, types as tg_types
 
 from core.files import media_bucket
@@ -117,11 +119,21 @@ class SendResult:
     file(s) during photo processing (IMAGE_PROCESS_FAILED). It's deterministic,
     so the retry envelope returns immediately and the caller normalizes the
     image(s) with image_fix before a single re-send rather than burning retries.
+
+    media_empty flags MediaEmptyError — Telegram rejected the uploaded media for
+    this destination. Retrying the identical send within the budget is futile and,
+    at the head of the queue, blocks everything behind it (a single poison album
+    starves the whole drain). So the envelope returns immediately and the caller
+    QUARANTINES the batch (terminal 'failed', one hit) to keep the queue moving.
+    It is frequently transient (a server-side hiccup for that chat), so quarantined
+    rows stay recoverable via `archiver reset failed` once the condition clears —
+    no bytes or files are given up.
     """
     ok:                   bool
     error:                str | None = None
     flood_wait_s:         int | None = None
     image_process_failed: bool = False
+    media_empty:          bool = False
 
 
 # ── Strategy ABC ──────────────────────────────────────────────────────────
@@ -773,6 +785,24 @@ class TelethonSendStrategy(SendStrategy):
                     ok=False,
                     error=f"{type(e).__name__}: {e}",
                     image_process_failed=True,
+                )
+
+            except MediaEmptyError as e:
+                # Telegram rejected the uploaded media for this destination.
+                # Retrying the identical send within the budget cannot help and,
+                # because the failing rows hold the oldest discovered_at, they sit
+                # at the head of the queue and block everything behind them. Bail
+                # out on the FIRST hit (no 4x backoff storm) and let the caller
+                # quarantine the batch so the drain moves on. Often transient, so
+                # `reset failed` recovers it later — see SendResult.media_empty.
+                log.warning(
+                    "telethon: media rejected by destination (%s): %s — "
+                    "quarantining (recover with `reset failed`)", what, e,
+                )
+                return SendResult(
+                    ok=False,
+                    error=f"{type(e).__name__}: {e}",
+                    media_empty=True,
                 )
 
             except (TimeoutError, asyncio.TimeoutError):

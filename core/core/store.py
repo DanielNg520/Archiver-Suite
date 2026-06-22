@@ -709,6 +709,24 @@ class ItemStore:
                 return r["status"]
             return new_status
 
+    def quarantine(self, item_id: int, *, error: str) -> str:
+        """sending → failed TERMINALLY on the first hit, regardless of the retry
+        budget. For deterministic-per-moment rejections (MediaEmptyError) where
+        retrying within the budget is futile AND keeps a head-of-line row cycling,
+        blocking the queue. Unlike cancel() this leaves NO CANCELLED_MARKER, so a
+        quarantined row is a plain failure: `reset failed` re-arms it once the
+        (often transient) cause clears. Guarded on 'sending'. Returns the status."""
+        with self._immediate() as cur:
+            n = self._guarded_set(
+                cur, item_id, to=Status.FAILED.value, allowed_from={"sending"},
+                set_sql=", last_error=?, claimed_at=NULL",
+                params=((error or "")[:_ERROR_CAP],),
+            )
+        if n == 0:
+            log.warning("quarantine: id=%d not in 'sending' — no-op", item_id)
+            return "no-op"
+        return Status.FAILED.value
+
     def requeue(self, item_id: int, *, reason: str | None = None) -> None:
         """sending → pending WITHOUT burning a retry (FloodWait: we waited
         the server-requested time; the request itself wasn't a failure).

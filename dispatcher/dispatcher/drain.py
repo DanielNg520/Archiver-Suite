@@ -31,6 +31,7 @@ from core import (
     DeletionGuard, is_split_group,
 )
 from core.files import media_bucket
+from core import media_prep
 from .tg_router import TelegramRouter, RouteError
 
 from .config import DispatcherConfig
@@ -83,7 +84,8 @@ def orphaned_caption(batch: list[Item]) -> str:
     loose file (no subfolder) → just its stem."""
     head = batch[0]
     sub = subfolder_of(head.chat_id, head.group_key)
-    lines = ([sub] if sub else []) + [Path(it.file_path).stem for it in batch]
+    lines = ([sub] if sub else []) + [
+        media_prep.clean_upload_stem(it.file_path) for it in batch]
     return "\n".join(lines)
 
 
@@ -111,7 +113,8 @@ def album_caption_for(batch: list[Item]) -> str:
         # A split original's parts: list every part name so all are visible
         # (Telegram shows only the first item's caption). Works for both
         # producers regardless of how each part is otherwise captioned.
-        return "\n".join(Path(it.file_path).stem for it in batch)
+        return "\n".join(media_prep.clean_upload_stem(it.file_path)
+                         for it in batch)
     if head.source == ORPHANED_SOURCE:
         return orphaned_caption(batch)
     if head.caption:
@@ -396,6 +399,23 @@ async def drain_forever(
                 store.requeue(it.id, reason=f"floodwait {result.flood_wait_s}s "
                                             "(held as in-batch duplicate)")
             await asyncio.sleep(result.flood_wait_s + 1)
+
+        elif result.media_empty:
+            # Telegram rejected the media for this destination. Retrying within
+            # the budget is futile and, because these rows hold the oldest
+            # discovered_at, they'd sit at the head of the queue and block
+            # everything behind them. Quarantine the whole (atomic) batch on the
+            # first hit — terminal 'failed', no CANCELLED_MARKER — so the drain
+            # moves straight on to deliverable content. Often transient, so
+            # `reset failed` re-arms them once the condition clears.
+            for it in present:
+                store.quarantine(it.id, error=result.error or "MediaEmptyError")
+            for it, _twin_id in batch_dupes:
+                store.quarantine(it.id, error=result.error or "MediaEmptyError")
+            log.warning("@%s media rejected by destination — quarantined %d "
+                        "item(s) (recover with `reset failed`): %s",
+                        head.username, len(present) + len(batch_dupes),
+                        result.error, extra={"ev": "quarantine"})
 
         else:
             # Whole-batch failure: every row gets an attempt counted. Since
