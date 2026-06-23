@@ -22,13 +22,12 @@ Cleanup guarantees, honestly stated:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-from core import paths
+from core import heartbeat, paths
 
 log = logging.getLogger(__name__)
 
@@ -53,24 +52,19 @@ class TikTokLock:
         self.username: str | None = None
 
     def __enter__(self) -> "TikTokLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+        # The lockfile is a pid-stamped heartbeat: written atomically (so the
+        # archiver never reads a half-written file) and read back through the
+        # same liveness gate, so a crashed recorder's lock self-heals to
+        # not-held instead of starving TikTok archiving.
+        heartbeat.write_atomic(self.path, {
             "pid":        self.pid,
             "started_at": _now_iso(),
             "block":      "download",
             "username":   self.username,
-        }
-        # Write atomically so the archiver never reads a half-written file.
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload))
-        os.replace(tmp, self.path)
+        })
         log.debug("tiktok lock acquired (pid=%d) at %s", self.pid, self.path)
         return self
 
     def __exit__(self, *exc) -> None:
-        try:
-            self.path.unlink(missing_ok=True)
-            log.debug("tiktok lock released")
-        except OSError as e:
-            log.warning("failed to remove lockfile %s — manual cleanup "
-                        "may be needed: %s", self.path, e)
+        heartbeat.clear(self.path)
+        log.debug("tiktok lock released")

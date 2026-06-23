@@ -72,8 +72,20 @@ def read_live(
         if time.time() - data.get("updated_at", 0) > stale_after_s:
             return None
     try:
-        os.kill(int(data["pid"]), 0)   # signal 0: existence check only
-    except (OSError, ValueError, KeyError):
+        pid = int(data["pid"])
+    except (KeyError, ValueError, TypeError):
+        return None       # no usable pid → can't prove liveness → treat as dead
+    # signal 0 is an existence probe. ProcessLookupError ⇒ the writer is gone
+    # (dead → None); PermissionError ⇒ the process EXISTS but is owned by another
+    # user (alive → keep). Distinguishing them matters for a multi-user host; on
+    # the suite's single-user setup PermissionError simply never fires.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass
+    except OSError:
         return None
     return data
 

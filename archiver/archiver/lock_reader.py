@@ -13,19 +13,19 @@ the implementation guide's shared on-disk layout.
 
 from __future__ import annotations
 
-from core import paths
+from core import heartbeat, paths
 
 # Cross-process contract: one definition in core.paths (recorder writes it).
 LOCK_PATH = paths.tiktok_lock()
 
 
 def tiktok_lock_held() -> bool:
-    """True if the recorder currently holds the TikTok download lock.
+    """True only when a LIVE recorder holds the TikTok download lock.
 
-    Presence of the file is the signal; contents (pid/started_at) are for
-    human debugging only. A stale lock (recorder crashed without cleanup)
-    is a known failure mode handled operationally in Slice 5's runbook,
-    not here — this function intentionally does no liveness check, to keep
-    the read side dead-simple and dependency-free.
-    """
-    return LOCK_PATH.exists()
+    The lockfile is a pid-stamped JSON heartbeat, so we gate on the writer pid
+    being alive (core.heartbeat). This SELF-HEALS the stale-lock failure mode: a
+    recorder SIGKILLed mid-recording leaves the file behind, and a bare
+    existence check would block TikTok downloads forever; gating on liveness lets
+    the archiver resume the moment the recorder is gone. A live recorder's lock
+    still reads as held, so an in-progress recording is never trampled."""
+    return heartbeat.read_live(LOCK_PATH) is not None

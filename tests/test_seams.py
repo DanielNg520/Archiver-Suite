@@ -65,6 +65,19 @@ def _fresh_db() -> "object":
     return ItemStore.open(p)
 
 
+def _dead_pid() -> int:
+    """A pid guaranteed not to be alive right now (for stale-heartbeat tests)."""
+    p = 999_999
+    while True:
+        try:
+            os.kill(p, 0)
+        except ProcessLookupError:
+            return p
+        except OSError:
+            pass        # alive (or not ours) — try a higher number
+        p += 1
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Seam 1 — the TikTok soft-lock: recorder writes, archiver reads
 # ══════════════════════════════════════════════════════════════════════════════
@@ -81,14 +94,20 @@ def test_lock_seam(tmp: Path) -> None:
     lr.LOCK_PATH = lock_path
     try:
         ok(not lr.tiktok_lock_held(), "no lock initially → archiver downloads")
-        with TikTokLock(str(lock_path), recorder_pid=4321):
+        # Default pid = this live test process, so the lock reads as held.
+        with TikTokLock(str(lock_path)):
             ok(lock_path.exists(), "recorder __enter__ wrote the lockfile")
             ok(lr.tiktok_lock_held(), "archiver SEES the lock while recording")
         ok(not lr.tiktok_lock_held(), "recorder __exit__ removed the lock")
-        # Stale lock (recorder SIGKILLed): file persists → still 'held' (the
-        # reader does no liveness check, by design — operational concern).
-        lock_path.write_text('{"pid": 999}')
-        ok(lr.tiktok_lock_held(), "stale lockfile still reads as held (no liveness)")
+        # Stale lock (recorder SIGKILLed without cleanup): file persists but its
+        # pid is dead → the reader's liveness gate SELF-HEALS it to not-held, so
+        # TikTok archiving resumes instead of starving forever.
+        lock_path.write_text(f'{{"pid": {_dead_pid()}}}')
+        ok(not lr.tiktok_lock_held(),
+           "stale lock (dead writer pid) self-heals to not-held")
+        # A lock owned by a LIVE process still blocks (no false resume).
+        lock_path.write_text(f'{{"pid": {os.getpid()}}}')
+        ok(lr.tiktok_lock_held(), "lock with a live writer pid still reads held")
     finally:
         lr.LOCK_PATH = orig
 

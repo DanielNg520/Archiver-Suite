@@ -664,7 +664,10 @@ def render() -> str:
     # ── recorder ──
     pid, owner = live["recorder"]
     rows = []
-    held = TIKTOK_LOCK.exists()
+    # Held only when a LIVE recorder owns it (same liveness gate the archiver
+    # uses): a crashed recorder's stale lock reads as not-held, so ops doesn't
+    # report a phantom recording and matches what the archiver actually does.
+    held = _heartbeat.read_live(TIKTOK_LOCK) is not None
     info = tiktok_lock_info() if held else None
     rd = recorder_details()
     if rd is not None:
