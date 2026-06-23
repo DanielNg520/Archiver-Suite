@@ -28,11 +28,10 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import tempfile
 from pathlib import Path
 
-from core import ffprobe
+from core import ffmpeg, ffprobe
 
 log = logging.getLogger(__name__)
 
@@ -108,18 +107,12 @@ def make_safe_photo(path: str) -> str | None:
         vf = (f"scale='min({target},iw)':'min({target},ih)'"
               ":force_original_aspect_ratio=decrease,"
               "crop=trunc(iw/2)*2:trunc(ih/2)*2")
-        try:
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-v", "error", "-i", str(src),
-                 "-vf", vf, "-pix_fmt", "yuvj420p", "-q:v", q, tmp],
-                capture_output=True, text=True, timeout=_CONVERT_TIMEOUT_S,
-            )
-        except (subprocess.SubprocessError, OSError) as e:
-            log.warning("image_fix: ffmpeg failed for %s: %s", src.name, e)
-            break
-        if r.returncode != 0:
-            log.warning("image_fix: ffmpeg rc=%d for %s: %s",
-                        r.returncode, src.name, r.stderr.strip()[:200])
+        ok = ffmpeg.run_ffmpeg(
+            ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+             "-vf", vf, "-pix_fmt", "yuvj420p", "-q:v", q, tmp],
+            what=f"photo-normalize {src.name}", timeout=_CONVERT_TIMEOUT_S,
+        )
+        if not ok:
             break
         try:
             size = os.path.getsize(tmp)

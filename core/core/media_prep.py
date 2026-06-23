@@ -47,7 +47,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ffprobe
+from . import ffmpeg, ffprobe
 from .files import VIDEO_EXTS
 
 log = logging.getLogger(__name__)
@@ -229,17 +229,7 @@ def _codecs_copyable(p: _Probe) -> bool:
 # ── Convert ───────────────────────────────────────────────────────────────────
 
 def _run_ffmpeg(cmd: list[str], what: str) -> bool:
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                            timeout=_CONVERT_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError) as e:
-        log.warning("media_prep: ffmpeg failed (%s): %s", what, e)
-        return False
-    if r.returncode != 0:
-        log.warning("media_prep: ffmpeg rc=%d (%s): %s",
-                    r.returncode, what, (r.stderr or "").strip()[:300])
-        return False
-    return True
+    return ffmpeg.run_ffmpeg(cmd, what=what, timeout=_CONVERT_TIMEOUT_S)
 
 
 def _convert(src: Path, p: _Probe) -> Path | None:

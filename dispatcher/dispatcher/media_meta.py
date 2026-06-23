@@ -28,12 +28,11 @@ from __future__ import annotations
 
 import logging
 import os
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from core import ffprobe
+from core import ffmpeg, ffprobe
 from core.files import media_bucket
 
 log = logging.getLogger(__name__)
@@ -206,17 +205,11 @@ def make_thumbnail(file_path: str) -> str | None:
         "-f", "mjpeg",
         out,
     ]
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=_THUMB_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError) as e:
-        log.warning("thumbnail: %s: ffmpeg failed (%s) — uploading without an "
-                    "explicit thumbnail", Path(file_path).name, e)
-        _discard(out)
-        return None
-    if r.returncode != 0 or not Path(out).exists() or Path(out).stat().st_size == 0:
-        log.warning("thumbnail: %s: ffmpeg produced no frame (rc=%d) — uploading "
-                    "without an explicit thumbnail", Path(file_path).name,
-                    r.returncode)
+    ok = ffmpeg.run_ffmpeg(
+        cmd, what=f"thumbnail {Path(file_path).name}", timeout=_THUMB_TIMEOUT_S)
+    if not ok or not Path(out).exists() or Path(out).stat().st_size == 0:
+        log.warning("thumbnail: %s: no frame produced — uploading without an "
+                    "explicit thumbnail", Path(file_path).name)
         _discard(out)
         return None
     return out
