@@ -139,7 +139,7 @@ class TelegramRouter:
             item.platform, item.username, source=item.source)
 
     def chat_id_for_item(self, item) -> str:
-        """Bare chat_id for one item (back-compat / explain). See
+        """Bare chat_id for one item (back-compat / tests). See
         destination_for_item for the chat+topic pair the sender uses."""
         return self.destination_for_item(item).chat_id
 
@@ -166,39 +166,3 @@ class TelegramRouter:
                 return Destination(v, _topic_env(k))
         # Global default layer: TELEGRAM_CHAT_ID / TELEGRAM_TOPIC.
         return Destination(self.default_chat_id, _topic_env("TELEGRAM_CHAT_ID"))
-
-    def chat_id_for(
-        self,
-        platform: str,
-        username: str,
-        *,
-        source: str | None = None,
-    ) -> str:
-        return self._destination_from_env(
-            platform, username, source=source).chat_id
-
-    def peer_for(self, platform: str, username: str, *, source: str | None = None):
-        return self._destination_from_env(
-            platform, username, source=source).peer
-
-    def explain(
-        self,
-        platform: str,
-        username: str,
-        *,
-        source: str | None = None,
-    ) -> str:
-        if _is_tiktok_live(platform, source):
-            uk = _user_key("tiktok_live", username)
-            if os.environ.get(uk, "").strip():
-                return f"{os.environ[uk]} (via {uk})"
-            pk = _platform_key("tiktok_live")
-            if os.environ.get(pk, "").strip():
-                return f"{os.environ[pk]} (via {pk})"
-        uk = _user_key(platform, username)
-        if os.environ.get(uk, "").strip():
-            return f"{os.environ[uk]} (via {uk})"
-        pk = _platform_key(platform)
-        if os.environ.get(pk, "").strip():
-            return f"{os.environ[pk]} (via {pk})"
-        return f"{self.default_chat_id} (global TELEGRAM_CHAT_ID)"

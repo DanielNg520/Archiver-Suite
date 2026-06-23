@@ -44,7 +44,7 @@ from .config import (
 from .drain import drain_forever
 from .instance_lock import DispatcherAlreadyRunning, DispatcherInstanceLock
 from .progress import ProgressReporter, describe, read_progress
-from .send import TelethonSendStrategy
+from .send import TelethonSendStrategy, SessionUnauthorized
 from .tg_router import TelegramRouter, Destination
 
 log = logging.getLogger(__name__)
@@ -104,6 +104,13 @@ async def _run_drain(config: DispatcherConfig) -> None:
                 guard=guard,
                 stop_event=stop_event,
             )
+        except SessionUnauthorized:
+            # Session died mid-run. The drain is serial, so the only rows in
+            # 'sending' are the batch that was in flight — revert them to pending
+            # immediately (older_than_minutes=0) so the next authorized run
+            # retries them, then let the fatal propagate to a clean CLI exit.
+            store.reset_stuck_sending(older_than_minutes=0)
+            raise
         finally:
             store.close()
 

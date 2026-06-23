@@ -55,13 +55,15 @@ import abc
 import asyncio
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from telethon import TelegramClient, utils as tg_utils
 from telethon.errors import (
-    FloodWaitError, ImageProcessFailedError, MediaEmptyError,
+    AuthKeyError, FloodWaitError, ImageProcessFailedError, MediaEmptyError,
+    UnauthorizedError,
 )
 from telethon.tl import types as tg_types
 
@@ -103,6 +105,17 @@ def _video_attributes(file_path: str):
         duration=meta.duration, w=meta.width, h=meta.height,
         supports_streaming=True,
     )]
+
+
+class SessionUnauthorized(RuntimeError):
+    """The Telegram session is no longer usable — never logged in, revoked,
+    expired, or the account was deactivated/banned. This is FATAL and not
+    retryable: every send would fail identically, so the daemon must stop
+    rather than spin its retry/circuit-breaker machinery forever or block on an
+    interactive login prompt. Subclasses RuntimeError so the CLI's existing
+    top-level handler turns it into a clean message + non-zero exit (which
+    launchd surfaces) instead of a traceback. The in-flight 'sending' rows are
+    recovered by the next run's startup watchdog, so nothing is lost."""
 
 
 # ── Result shape ──────────────────────────────────────────────────────────
@@ -272,7 +285,25 @@ class TelethonSendStrategy(SendStrategy):
         self._client = TelegramClient(
             self._session_name, self._api_id, self._api_hash,
         )
-        await self._client.start(phone=self._phone)
+        # Connect and verify authorization WITHOUT Telethon's interactive login.
+        # A headless daemon (launchd) has no terminal: client.start() would block
+        # forever on the code prompt, or EOF into a restart crash-loop, on a dead
+        # session. Fail fast with a clear, actionable message instead. Only when
+        # a human is at a TTY (manual first-run) do we allow the interactive
+        # login flow so the session can be created in the first place.
+        await self._client.connect()
+        if not await self._client.is_user_authorized():
+            if sys.stdin.isatty():
+                await self._client.start(phone=self._phone)
+            else:
+                await self._client.disconnect()
+                raise SessionUnauthorized(
+                    f"Telegram session {self._session_name!r} is not authorized "
+                    "(never logged in, revoked, expired, or the account was "
+                    "deactivated). Run `dispatcher start` once from an "
+                    "interactive terminal to log in; refusing to block a "
+                    "headless daemon on a login prompt."
+                )
         log.info("telethon: connected (session=%s)", self._session_name)
         return self
 
@@ -375,6 +406,26 @@ class TelethonSendStrategy(SendStrategy):
                 media_prep.is_nonstreamable_video, Path(file_path))
         send_path = str(prepped) if prepped is not None else file_path
 
+        # Photo pre-flight (proactive compatibility, mirroring the album path).
+        # A photo Telegram's pipeline would refuse is normalized to a safe JPEG
+        # BEFORE the first send rather than only after an IMAGE_PROCESS_FAILED
+        # bounce, so single sends and album sends are made compatible the same
+        # way. One that can't become a clean photo (aspect ratio beyond the
+        # photo limit) ships as a downloadable document instead. Photos never
+        # take the video conversion path (prepped is always None for them), so
+        # this and the streamable net are mutually exclusive.
+        photo_temp: str | None = None
+        if not as_document and media_bucket(send_path) == "photo":
+            verdict = await asyncio.to_thread(image_fix.photo_needs_fix, send_path)
+            if verdict is None:
+                as_document = True                      # un-fixable AR → document
+            elif verdict is True:
+                photo_temp = await asyncio.to_thread(
+                    image_fix.make_safe_photo, send_path)
+                if photo_temp:
+                    send_path = photo_temp
+            # verdict False → already compatible; send as-is.
+
         if as_document:
             # A pure document send: no video attributes, no poster thumb, no
             # streaming flag. Telegram stores the bytes verbatim for download.
@@ -450,16 +501,12 @@ class TelethonSendStrategy(SendStrategy):
             )
         finally:
             self._progress_done()
-            if prepped is not None:
-                try:
-                    os.unlink(prepped)
-                except OSError:
-                    pass
-            if thumb:
-                try:
-                    os.unlink(thumb)
-                except OSError:
-                    pass
+            for tmp in (prepped, photo_temp, thumb):
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
         if result.ok or not result.image_process_failed:
             return result
 
@@ -706,6 +753,18 @@ class TelethonSendStrategy(SendStrategy):
             try:
                 await asyncio.wait_for(send_fn(), timeout=timeout_s)
                 return SendResult(ok=True)
+
+            except (UnauthorizedError, AuthKeyError) as e:
+                # The session died under us (revoked/expired/deactivated). This
+                # is permanent: every subsequent send fails identically, so
+                # retrying or letting the circuit breaker spin a cooldown loop
+                # only hammers Telegram with doomed uploads. Surface it as fatal
+                # so the daemon stops cleanly — the startup auth check then keeps
+                # it down with an actionable message until the session is fixed.
+                raise SessionUnauthorized(
+                    f"Telegram session rejected mid-send ({type(e).__name__}: "
+                    f"{e}) while sending {what}"
+                ) from e
 
             except FloodWaitError as e:
                 if e.seconds > self._max_flood_wait_s:

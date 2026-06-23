@@ -26,12 +26,13 @@ WHAT WE DO
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
 import tempfile
 from pathlib import Path
+
+from core import ffprobe
 
 log = logging.getLogger(__name__)
 
@@ -53,22 +54,17 @@ _TARGETS = ((4096, "2"), (2048, "5"), (1280, "8"))
 def image_dimensions(path: str) -> tuple[int, int] | None:
     """(width, height) via ffprobe, or None if it can't be read (corrupt or
     an encoding ffprobe rejects — which Telegram would reject too)."""
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "stream=width,height", "-of", "json", path],
-            capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S,
-        )
-    except (subprocess.SubprocessError, OSError) as e:
-        log.warning("image_fix: ffprobe failed for %s: %s", Path(path).name, e)
-        return None
-    if out.returncode != 0:
+    data = ffprobe.probe_json(
+        path, select_streams="v:0", show_entries="stream=width,height",
+        timeout=_PROBE_TIMEOUT_S,
+    )
+    if data is None:
         return None
     try:
-        streams = json.loads(out.stdout).get("streams") or []
+        streams = data.get("streams") or []
         w = int(streams[0]["width"])
         h = int(streams[0]["height"])
-    except (ValueError, KeyError, IndexError, json.JSONDecodeError):
+    except (ValueError, KeyError, IndexError, TypeError):
         return None
     if w <= 0 or h <= 0:
         return None

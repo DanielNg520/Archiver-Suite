@@ -26,7 +26,6 @@ DISPLAY vs CODED dimensions
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
@@ -34,6 +33,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from core import ffprobe
 from core.files import media_bucket
 
 log = logging.getLogger(__name__)
@@ -128,28 +128,19 @@ def probe_video(file_path: str) -> VideoMeta | None:
     if media_bucket(file_path) != "video":
         return None
 
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries",
-        "stream=width,height,sample_aspect_ratio,duration:"
-        "stream_tags=rotate:stream_side_data=rotation:"
-        "format=duration",
-        "-of", "json",
+    data = ffprobe.probe_json(
         file_path,
-    ]
-    try:
-        out = subprocess.run(
-            cmd, capture_output=True, timeout=_PROBE_TIMEOUT_S,
-        )
-        if out.returncode != 0:
-            raise RuntimeError(
-                out.stderr.decode(errors="replace").strip() or "non-zero exit")
-        data = json.loads(out.stdout or b"{}")
-    except (OSError, subprocess.TimeoutExpired, RuntimeError,
-            json.JSONDecodeError) as e:
-        log.warning("probe: %s: ffprobe failed (%s) — uploading without "
-                    "explicit video attributes", Path(file_path).name, e)
+        select_streams="v:0",
+        show_entries=(
+            "stream=width,height,sample_aspect_ratio,duration:"
+            "stream_tags=rotate:stream_side_data=rotation:"
+            "format=duration"
+        ),
+        timeout=_PROBE_TIMEOUT_S,
+    )
+    if data is None:
+        log.warning("probe: %s: ffprobe failed — uploading without explicit "
+                    "video attributes", Path(file_path).name)
         return None
 
     streams = data.get("streams") or []

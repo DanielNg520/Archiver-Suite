@@ -40,7 +40,6 @@ split_group_key so the dispatcher ships them as a single ordered album.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import subprocess
@@ -48,6 +47,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import ffprobe
 from .files import VIDEO_EXTS
 
 log = logging.getLogger(__name__)
@@ -174,21 +174,12 @@ class _Probe:
 def _probe(path: Path) -> _Probe | None:
     """Container + first video/audio codec + size + duration, or None if the
     file isn't a readable video (ffprobe missing/failed, or no video stream)."""
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=format_name,duration,size:stream=codec_type,codec_name",
-        "-of", "json", str(path),
-    ]
-    try:
-        out = subprocess.run(cmd, capture_output=True, timeout=_PROBE_TIMEOUT_S)
-    except (OSError, subprocess.SubprocessError) as e:
-        log.warning("media_prep: ffprobe failed for %s: %s", path.name, e)
-        return None
-    if out.returncode != 0:
-        return None
-    try:
-        data = json.loads(out.stdout or b"{}")
-    except json.JSONDecodeError:
+    data = ffprobe.probe_json(
+        path,
+        show_entries="format=format_name,duration,size:stream=codec_type,codec_name",
+        timeout=_PROBE_TIMEOUT_S,
+    )
+    if data is None:
         return None
 
     fmt = data.get("format") or {}
@@ -326,6 +317,12 @@ def streamable_temp(path: Path) -> Path | None:
     the raw file would have, which is no worse than the status quo."""
     if not prep_enabled():
         return None
+    # Extension gate, matching prepare(). WITHOUT it a still image (.jpg/.webp)
+    # slips through: ffprobe reports a single-frame mjpeg/png "video" stream, so
+    # _is_streamable says False and we'd "re-encode" the photo into a 0-second
+    # h264 .mp4 Telegram can't play. Only real video containers are candidates.
+    if path.suffix.lower() not in PREP_VIDEO_EXTS:
+        return None
     p = _probe(path)
     if p is None or _is_streamable(p):
         return None
@@ -364,6 +361,11 @@ def is_nonstreamable_video(path: Path) -> bool:
 
     False for non-videos (images/audio/probe failure) and already-streamable
     videos — those keep the normal streaming-video send path."""
+    # Extension gate, matching prepare()/streamable_temp: a still image probes as
+    # a single-frame mjpeg/png "video", which would otherwise be misreported here
+    # as a non-streamable video and shipped as a document.
+    if path.suffix.lower() not in PREP_VIDEO_EXTS:
+        return False
     p = _probe(path)
     return p is not None and not _is_streamable(p)
 
