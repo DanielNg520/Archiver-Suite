@@ -293,6 +293,7 @@ efficiency**. Mechanisms, by layer:
 | Half-written files | `stability.is_stable()` skip | `reconcile`, sweeps |
 | Orphaned ffmpeg children | process-group kill | `recorder.capture` |
 | Truncated live recording | reconnect on premature still-live exit | `recorder.capture` |
+| **Stale TikTok soft-lock** (recorder crashed holding it) | **`held` gated on writer-pid liveness — a dead-writer lock self-heals to not-held so TikTok archiving resumes** | `archiver.lock_reader`, `ops.health` via `core.heartbeat` |
 | Per-platform download failure | circuit breaker + cookie-refresh self-heal | `archiver.orchestrator`, `cookies.py` |
 | Banned/gone accounts | auto-retire to a banned roster | `archiver` (see auto-ban note) |
 | Failed-queue growth | retention prune (before auto-retry, to avoid retry storms) | `drain.run_housekeeping` |
@@ -305,9 +306,10 @@ These are the only places workers couple. They are covered by
 
 1. **The DB handoff** — producer writes `pending`, dispatcher claims it. One
    table, one truth (`models.py`).
-2. **TikTok soft-lock** — recorder writes `locks/tiktok.lock`; archiver reads
-   presence and skips TikTok download. One-way (`recorder.lock` ↔
-   `archiver.lock_reader`).
+2. **TikTok soft-lock** — recorder writes `locks/tiktok.lock`; archiver skips
+   TikTok download while a LIVE recorder holds it. The lock is a pid-stamped
+   heartbeat, so the read is liveness-gated: a crashed recorder's stale lock
+   self-heals to not-held. One-way (`recorder.lock` ↔ `archiver.lock_reader`).
 3. **content_hash** — every producer stamps it at enqueue so dedup works across
    producers/paths.
 4. **Orphaned chat_id folders** — folder name `-100…[.t<topic>]` IS the
@@ -374,6 +376,10 @@ Codebase-wide consolidation pass (same branch):
 - **`core.paths`** centralizes every cross-process artifact path (tiktok lock,
   progress, loop, pid) that was duplicated between each writer and ops — the
   seam contracts now have one definition each.
+- **Stale-lock self-healing** at the recorder↔archiver seam: the TikTok lock
+  read is now liveness-gated (`core.heartbeat`), so a crashed recorder no longer
+  starves TikTok archiving forever. `core.heartbeat` liveness was also made
+  precise (ProcessLookupError = dead, PermissionError = alive).
 
 Deliberately left as-is (consolidation would add indirection or change
 user-visible output for little gain): the per-worker CLI `main()` dispatch
