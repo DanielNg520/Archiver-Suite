@@ -35,6 +35,12 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(_core_pkg))
     from core import db_path as _core_db_path
 
+# core is now importable (installed, or path-injected above). The shared
+# heartbeat reader gives ops the SAME liveness/staleness semantics the workers
+# write with, so the rules can't drift between writer and monitor. Still no
+# *worker* package imported — core is the shared library.
+from core import heartbeat as _heartbeat
+
 # Single source of truth: one DB for the whole suite. ops still imports no
 # *service* package (dispatcher/recorder/archiver) — it only borrows the
 # canonical DB path from the shared `core` library so the location isn't
@@ -253,18 +259,11 @@ def upload_progress_fields() -> dict | None:
     when idle/stale/writer-dead. Returns name (+ batch tag), the 0..1 fraction
     complete, and a human transfer detail (bytes · rate · ETA) — the renderer
     turns the fraction into a progress bar."""
-    import json
-    try:
-        p = json.loads(PROGRESS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(p, dict) or "sent" not in p or "total" not in p:
-        return None
-    if time.time() - p.get("updated_at", 0) > PROGRESS_STALE_S:
-        return None
-    try:
-        os.kill(int(p["pid"]), 0)
-    except (OSError, ValueError):
+    p = _heartbeat.read_live(
+        PROGRESS_FILE, stale_after_s=PROGRESS_STALE_S,
+        validate=lambda d: "sent" in d and "total" in d,
+    )
+    if p is None:
         return None
     sent, total = p["sent"], p["total"]
     frac = (sent / total) if total else 0.0
@@ -393,18 +392,10 @@ def archiver_loop_phase() -> dict | None:
     no heartbeat — the caller falls back to plain liveness). Mirrors the
     progress-file pattern: ops reads the artifact directly, importing nothing
     from the archiver."""
-    import json
-    try:
-        data = json.loads(ARCHIVER_LOOP_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or data.get("phase") not in ("running", "sleeping"):
-        return None
-    try:
-        os.kill(int(data["pid"]), 0)   # signal 0: existence check only
-    except (OSError, ValueError):
-        return None
-    return data
+    return _heartbeat.read_live(
+        ARCHIVER_LOOP_FILE,
+        validate=lambda d: d.get("phase") in ("running", "sleeping"),
+    )
 
 
 def archiver_last_run() -> str | None:

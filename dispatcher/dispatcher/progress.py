@@ -14,10 +14,11 @@ is gone, so a crashed dispatcher can never leave a lying status behind.
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from pathlib import Path
+
+from core import heartbeat
 
 DEFAULT_PATH = Path("~/.config/dispatcher/progress.json").expanduser()
 
@@ -62,37 +63,20 @@ class ProgressReporter:
 
     def clear(self) -> None:
         """Remove the heartbeat — call when a send finishes either way."""
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+        heartbeat.clear(self.path)
 
     def _write(self, state: dict) -> None:
-        try:
-            tmp = self.path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(state), encoding="utf-8")
-            os.replace(tmp, self.path)   # atomic: readers see old or new, never torn
-        except OSError:
-            pass                          # telemetry must never break an upload
+        heartbeat.write_atomic(self.path, state)
 
 
 # ── reader side ────────────────────────────────────────────────────────────
 
 def read_progress(path: Path = DEFAULT_PATH) -> dict | None:
     """Current upload state, or None if idle / stale / writer gone."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or "sent" not in data or "total" not in data:
-        return None
-    if time.time() - data.get("updated_at", 0) > STALE_AFTER_S:
-        return None
-    try:
-        os.kill(int(data["pid"]), 0)     # signal 0: existence check only
-    except (OSError, ValueError):
-        return None
-    return data
+    return heartbeat.read_live(
+        path, stale_after_s=STALE_AFTER_S,
+        validate=lambda d: "sent" in d and "total" in d,
+    )
 
 
 def _human_bytes(n: float) -> str:

@@ -18,10 +18,11 @@ the archiver.
 
 from __future__ import annotations
 
-import json
 import os
 import time
 from pathlib import Path
+
+from core import heartbeat
 
 DEFAULT_PATH = Path("~/.config/archiver/loop.json").expanduser()
 
@@ -55,32 +56,13 @@ def clear(path: Path = DEFAULT_PATH) -> None:
     """Remove the heartbeat — call when the loop exits, so a stopped loop
     doesn't read back as forever 'sleeping' (belt-and-suspenders with the
     pid-liveness check on the reader)."""
-    try:
-        path.unlink()
-    except OSError:
-        pass
+    heartbeat.clear(path)
 
 
 def _write(state: dict, path: Path) -> None:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(state), encoding="utf-8")
-        os.replace(tmp, path)   # atomic: readers see old or new, never torn
-    except OSError:
-        pass                     # status must never break the loop
+    heartbeat.write_atomic(path, state)
 
 
 def read(path: Path = DEFAULT_PATH) -> dict | None:
     """Current loop phase, or None if absent / malformed / writer gone."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or data.get("phase") not in _PHASES:
-        return None
-    try:
-        os.kill(int(data["pid"]), 0)   # signal 0: existence check only
-    except (OSError, ValueError):
-        return None
-    return data
+    return heartbeat.read_live(path, validate=lambda d: d.get("phase") in _PHASES)
