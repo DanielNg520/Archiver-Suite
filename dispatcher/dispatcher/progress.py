@@ -18,9 +18,9 @@ import os
 import time
 from pathlib import Path
 
-from core import heartbeat
+from core import heartbeat, paths
 
-DEFAULT_PATH = Path("~/.config/dispatcher/progress.json").expanduser()
+DEFAULT_PATH = paths.dispatcher_progress()
 
 # Heartbeat older than this is a dead upload (writer throttles to 1s, so a
 # live upload refreshes far more often even on a crawling link).

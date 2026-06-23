@@ -13,9 +13,10 @@ the implementation guide's shared on-disk layout.
 
 from __future__ import annotations
 
-from pathlib import Path
+from core import paths
 
-LOCK_PATH = Path("~/.config/archiver-suite/locks/tiktok.lock").expanduser()
+# Cross-process contract: one definition in core.paths (recorder writes it).
+LOCK_PATH = paths.tiktok_lock()
 
 
 def tiktok_lock_held() -> bool:

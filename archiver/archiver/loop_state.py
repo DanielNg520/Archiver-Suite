@@ -22,9 +22,9 @@ import os
 import time
 from pathlib import Path
 
-from core import heartbeat
+from core import heartbeat, paths
 
-DEFAULT_PATH = Path("~/.config/archiver/loop.json").expanduser()
+DEFAULT_PATH = paths.archiver_loop()
 
 _PHASES = ("running", "sleeping")
 

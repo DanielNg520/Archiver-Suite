@@ -40,25 +40,27 @@ except ModuleNotFoundError:
 # write with, so the rules can't drift between writer and monitor. Still no
 # *worker* package imported — core is the shared library.
 from core import heartbeat as _heartbeat
+from core import paths as _paths
 
 # Single source of truth: one DB for the whole suite. ops still imports no
 # *service* package (dispatcher/recorder/archiver) — it only borrows the
 # canonical DB path from the shared `core` library so the location isn't
 # duplicated here and can't drift from what the services actually write.
+# Cross-process artifact locations come from core.paths (the single source the
+# WORKERS write to), so the monitor can't drift from the writers. ops still
+# imports no *worker* package — core is the shared library.
 SUITE_DB      = _core_db_path()
-RECORDER_PID  = Path("~/.recorder/pid").expanduser()
-TIKTOK_LOCK   = Path("~/.config/archiver-suite/locks/tiktok.lock").expanduser()
+RECORDER_PID  = _paths.recorder_pid()
+TIKTOK_LOCK   = _paths.tiktok_lock()
 # Upload-progress heartbeat written by the dispatcher's send strategy
-# (dispatcher/progress.py). Read as a plain artifact — same staleness rules,
-# duplicated here on purpose so ops keeps importing no worker package.
-PROGRESS_FILE = Path("~/.config/dispatcher/progress.json").expanduser()
+# (dispatcher/progress.py), read with the same staleness rules via core.heartbeat.
+PROGRESS_FILE = _paths.dispatcher_progress()
 PROGRESS_STALE_S = 30.0
 # Phase heartbeat written by `archiver loop` (archiver/loop_state.py): tells us
-# whether the archiver is mid-scan or resting between cycles. Read as a plain
-# artifact — path duplicated here on purpose so ops keeps importing no worker
-# package. No staleness window (a rest phase legitimately lasts hours); the
-# writer-pid liveness check below is what guards against a stale file.
-ARCHIVER_LOOP_FILE = Path("~/.config/archiver/loop.json").expanduser()
+# whether the archiver is mid-scan or resting between cycles. No staleness window
+# (a rest phase legitimately lasts hours); the writer-pid liveness check is what
+# guards against a stale file.
+ARCHIVER_LOOP_FILE = _paths.archiver_loop()
 
 LABELS = {
     "dispatcher": "com.duy.dispatcher",

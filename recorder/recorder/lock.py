@@ -28,9 +28,13 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from core import paths
+
 log = logging.getLogger(__name__)
 
-DEFAULT_LOCK_PATH = "~/.config/archiver-suite/locks/tiktok.lock"
+# Cross-process contract: the canonical location lives in core.paths so the
+# recorder (writer) and archiver/ops (readers) can never drift apart.
+DEFAULT_LOCK_PATH = str(paths.tiktok_lock())
 
 
 def _now_iso() -> str:
