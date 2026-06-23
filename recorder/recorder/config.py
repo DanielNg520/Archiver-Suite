@@ -13,20 +13,20 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from core import db_path as _core_db_path
+from core import env
 
 load_dotenv(Path.home() / ".config" / "recorder" / ".env")
 
 CONFIG_TOML = Path.home() / ".config" / "recorder" / "config.toml"
 
-
-def _opt(key: str, default: str = "") -> str:
-    return os.environ.get(key, default).strip()
+# Shared env parsing lives in core.env.
+_opt = env.opt
 
 
 @dataclass(frozen=True)

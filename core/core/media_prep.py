@@ -47,7 +47,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ffmpeg, ffprobe
+from . import env, ffmpeg, ffprobe
 from .files import VIDEO_EXTS
 
 log = logging.getLogger(__name__)
@@ -61,39 +61,20 @@ log = logging.getLogger(__name__)
 # AUTOSPLITTER_HOME=/path         → where the AutoSplitter package lives, if not importable
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        v = int(raw)
-        return v if v > 0 else default
-    except ValueError:
-        log.warning("media_prep: %s=%r is not an int — using %d", name, raw, default)
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in ("0", "false", "no", "off", "")
-
-
 def prep_enabled() -> bool:
-    return _env_bool("ARCHIVER_MEDIA_PREP", True)
+    return env.opt_bool("ARCHIVER_MEDIA_PREP", True)
 
 
 def max_upload_bytes() -> int:
-    return _env_int("ARCHIVER_TG_MAX_UPLOAD_BYTES", 4 * 1024 ** 3)
+    return env.opt_int("ARCHIVER_TG_MAX_UPLOAD_BYTES", 4 * 1024 ** 3, min_value=1)
 
 
 def split_chunk_bytes() -> int:
-    return _env_int("ARCHIVER_SPLIT_CHUNK_BYTES", 1 * 1024 ** 3)
+    return env.opt_int("ARCHIVER_SPLIT_CHUNK_BYTES", 1 * 1024 ** 3, min_value=1)
 
 
 def delete_after_split() -> bool:
-    return _env_bool("ARCHIVER_DELETE_AFTER_SPLIT", True)
+    return env.opt_bool("ARCHIVER_DELETE_AFTER_SPLIT", True)
 
 
 # Extensions we will rescue by conversion even though they are NOT in the

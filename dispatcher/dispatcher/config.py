@@ -19,6 +19,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from core import PolicyStore, DEFAULT_DB_PATH, Sanitizer, ReloadingSanitizer
+from core import env
 
 # Load dispatcher's own .env BEFORE any os.environ reads. This is a side
 # effect on import; matches archiver's pattern. Test code that needs a
@@ -26,19 +27,10 @@ from core import PolicyStore, DEFAULT_DB_PATH, Sanitizer, ReloadingSanitizer
 load_dotenv(Path.home() / ".config" / "dispatcher" / ".env")
 
 
-# ── env-var primitives ────────────────────────────────────────────────────
+# ── env-var primitives (shared parsing lives in core.env) ──────────────────
 
-def _req(key: str) -> str:
-    val = os.environ.get(key, "").strip()
-    if not val:
-        raise RuntimeError(
-            f"Missing required env var: {key}. See .env.example."
-        )
-    return val
-
-
-def _opt(key: str, default: str = "") -> str:
-    return os.environ.get(key, default).strip()
+_req = env.req
+_opt = env.opt
 
 
 def banned_words_file_path() -> Path:
@@ -144,16 +136,16 @@ class DispatcherConfig:
             db_path           = _opt("ARCHIVER_DB", _opt("DISPATCHER_DB", default_db)),
             policy_store      = store,
             sanitizer         = ReloadingSanitizer(banned_words_file),
-            poll_interval_s   = float(_opt("POLL_INTERVAL_S", "2.0")),
-            max_retries       = int(_opt("MAX_RETRIES", "4")),
-            retry_base_delay  = float(_opt("RETRY_BASE_DELAY", "2.0")),
-            max_flood_wait_s  = int(_opt("MAX_FLOOD_WAIT_S", "600")),
-            inter_album_sleep = float(_opt("INTER_ALBUM_SLEEP", "2.0")),
-            stuck_claim_min   = int(_opt("STUCK_CLAIM_MIN", "10")),
-            failed_retention_days = float(_opt("FAILED_RETENTION_DAYS", "7")),
-            stall_base_timeout_s  = float(_opt("STALL_BASE_TIMEOUT_S", "600")),
-            stall_min_rate_kib_s  = float(_opt("STALL_MIN_RATE_KIB_S", "64")),
-            upload_connections    = int(_opt("UPLOAD_CONNECTIONS", "8")),
+            poll_interval_s   = env.opt_float("POLL_INTERVAL_S", 2.0, min_value=0.0),
+            max_retries       = env.opt_int("MAX_RETRIES", 4, min_value=1),
+            retry_base_delay  = env.opt_float("RETRY_BASE_DELAY", 2.0, min_value=0.0),
+            max_flood_wait_s  = env.opt_int("MAX_FLOOD_WAIT_S", 600, min_value=0),
+            inter_album_sleep = env.opt_float("INTER_ALBUM_SLEEP", 2.0, min_value=0.0),
+            stuck_claim_min   = env.opt_int("STUCK_CLAIM_MIN", 10, min_value=1),
+            failed_retention_days = env.opt_float("FAILED_RETENTION_DAYS", 7.0, min_value=0.0),
+            stall_base_timeout_s  = env.opt_float("STALL_BASE_TIMEOUT_S", 600.0, min_value=1.0),
+            stall_min_rate_kib_s  = env.opt_float("STALL_MIN_RATE_KIB_S", 64.0, min_value=1.0),
+            upload_connections    = env.opt_int("UPLOAD_CONNECTIONS", 8, min_value=1),
         )
 
     def config_toml_path(self) -> Path:

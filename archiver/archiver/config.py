@@ -40,32 +40,23 @@ NOTE on frozen + PolicyStore:
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from core import PolicyStore, DownloadPolicy, db_path as _core_db_path
+from core import env
 
 log = logging.getLogger(__name__)
 
 load_dotenv(Path.home() / ".config" / "archiver-suite" / ".env")
 
 
-# ── env-var primitives (secrets only) ─────────────────────────────────────────
+# ── env-var primitives (secrets only; shared parsing lives in core.env) ───────
 
-def _req(key: str) -> str:
-    val = os.environ.get(key, "").strip()
-    if not val:
-        raise RuntimeError(
-            f"Missing required env var: {key}. See .env.example."
-        )
-    return val
-
-
-def _opt(key: str, default: str = "") -> str:
-    return os.environ.get(key, default).strip()
+_req = env.req
+_opt = env.opt
 
 
 def _load_local_platforms(store: PolicyStore) -> tuple[str, ...]:
