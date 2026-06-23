@@ -32,6 +32,24 @@ from pathlib import Path
 from typing import Callable
 
 
+def pid_alive(pid: int) -> bool:
+    """Is `pid` a live process? The suite's one liveness primitive (used by
+    read_live and by the recorder's pid-file checks). signal 0 is an existence
+    probe: ProcessLookupError ⇒ gone (dead); PermissionError ⇒ the process
+    EXISTS but is owned by another user (alive — matters on a multi-user host,
+    never fires on the suite's single-user setup); any other OSError ⇒ treat as
+    dead. A non-int pid is dead."""
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
 def write_atomic(path: Path, state: dict) -> None:
     """Atomically publish `state` as JSON at `path` (creating parent dirs).
 
@@ -75,19 +93,7 @@ def read_live(
         pid = int(data["pid"])
     except (KeyError, ValueError, TypeError):
         return None       # no usable pid → can't prove liveness → treat as dead
-    # signal 0 is an existence probe. ProcessLookupError ⇒ the writer is gone
-    # (dead → None); PermissionError ⇒ the process EXISTS but is owned by another
-    # user (alive → keep). Distinguishing them matters for a multi-user host; on
-    # the suite's single-user setup PermissionError simply never fires.
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return None
-    except PermissionError:
-        pass
-    except OSError:
-        return None
-    return data
+    return data if pid_alive(pid) else None
 
 
 def clear(path: Path) -> None:

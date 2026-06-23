@@ -18,11 +18,12 @@ write-rate of the active recording.
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
+
+from core import heartbeat
 
 from . import ui
 from .config import RecorderConfig
@@ -62,10 +63,9 @@ def _pid(config: RecorderConfig) -> int | None:
     p = Path(config.state_dir).expanduser() / "pid"
     try:
         pid = int(p.read_text().strip())
-        os.kill(pid, 0)
-        return pid
     except (OSError, ValueError):
         return None
+    return pid if heartbeat.pid_alive(pid) else None
 
 
 def _lock(config: RecorderConfig) -> tuple[bool, str | None]:

@@ -31,6 +31,7 @@ import tomli_w
 
 from core import ItemStore
 from core import cli as core_cli
+from core import heartbeat
 
 from . import ui, watch
 from .config import CONFIG_TOML, RecorderConfig
@@ -58,22 +59,16 @@ def _pid_path(config: RecorderConfig) -> Path:
 
 
 def _recorder_running(pid_path: Path) -> bool:
-    """True iff the pid file names a live process. Distinguishes a dead/stale
-    pid (ProcessLookupError) from one alive but owned by another user
-    (PermissionError → still running)."""
+    """True iff the pid file names a live process. Liveness via the suite's one
+    primitive (core.heartbeat.pid_alive): a dead/stale pid reads false, one alive
+    but owned by another user reads true."""
     if not pid_path.exists():
         return False
     try:
         pid = int(pid_path.read_text().strip())
     except (OSError, ValueError):
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return heartbeat.pid_alive(pid)
 
 
 # ── start ─────────────────────────────────────────────────────────────────
