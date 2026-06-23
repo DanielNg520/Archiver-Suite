@@ -40,11 +40,29 @@ class InstanceLock:
             ...                      # only one such process runs at a time
     """
 
-    def __init__(self, name: str, *, lock_dir: "str | Path | None" = None):
-        d = Path(lock_dir).expanduser() if lock_dir else _LOCK_DIR
+    def __init__(self, name: str, *, lock_dir: "str | Path | None" = None,
+                 path: "str | Path | None" = None):
+        # `path` (a full lock-file path) wins when a caller needs a non-default
+        # location/suffix — e.g. the dispatcher keys its lock to a Telegram
+        # session file rather than a worker name. Otherwise the path is derived
+        # from `name` under the shared locks dir (or `lock_dir`).
         self.name = name
-        self.path = d / f"{name}.instance.lock"
+        if path is not None:
+            self.path = Path(path).expanduser()
+        else:
+            d = Path(lock_dir).expanduser() if lock_dir else _LOCK_DIR
+            self.path = d / f"{name}.instance.lock"
         self._file = None
+
+    def _already_running_error(self, holder: str) -> Exception:
+        """The exception raised when another instance holds the lock. Hook so a
+        subclass can surface a domain-specific message/type (the dispatcher
+        points the operator at launchctl) without re-implementing the flock."""
+        return InstanceAlreadyRunning(
+            f"another '{self.name}' instance ({holder}) is already running — "
+            f"only one may run at a time. Stop it first, or check it "
+            f"(`ops status`)."
+        )
 
     def holder_pid(self) -> int | None:
         """PID of the live holder, or None. Probe (non-blocking shared lock on a
@@ -73,11 +91,7 @@ class InstanceLock:
             text = handle.read().strip()
             handle.close()
             holder = f"pid {text}" if text.isdigit() else "an unknown pid"
-            raise InstanceAlreadyRunning(
-                f"another '{self.name}' instance ({holder}) is already running — "
-                f"only one may run at a time. Stop it first, or check it "
-                f"(`ops status`)."
-            ) from None
+            raise self._already_running_error(holder) from None
         # We hold the lock; record our pid for diagnostics.
         handle.seek(0)
         handle.truncate()
