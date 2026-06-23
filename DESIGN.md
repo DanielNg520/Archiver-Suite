@@ -139,6 +139,12 @@ to the mutable store, so the CLI can write settings without rebuilding config.
   writers, so the monitor can't drift from the workers).
 - `instance_lock.py` — generic single-instance flock; the dispatcher's
   session-keyed lock is a thin subclass (Template-Method error hook).
+- `env.py` — env-var parsing (`req`/`opt`/`opt_int`/`opt_float`/`opt_bool`).
+  Required values fail loud; optional tunables warn-and-default (a typo can't
+  crash a daemon). Every worker config reads through it.
+- `paths.py` — the single source of truth for the suite's cross-process file
+  layout (tiktok lock, dispatcher progress, archiver loop, recorder pid). The
+  seam contracts can't drift between writer and reader.
 - `deletion.py` — `DeletionGuard`: the safebrake. Every disk-deletion path runs
   through it; a protected scope is never deleted even with delete-after-upload on.
 - `sanitize.py` — banned-word stripping from filenames + captions at send.
@@ -363,5 +369,16 @@ Codebase-wide consolidation pass (same branch):
   image_fix, and media_meta.
 - **`core.InstanceLock`** absorbed the dispatcher's duplicated flock mechanism;
   `DispatcherInstanceLock` is now a thin session-keyed subclass.
+- **`core.env`** unifies env-var parsing across all worker configs (+ lenient
+  warn-and-default for optional tunables, so a config typo can't crash a daemon).
+- **`core.paths`** centralizes every cross-process artifact path (tiktok lock,
+  progress, loop, pid) that was duplicated between each writer and ops — the
+  seam contracts now have one definition each.
+
+Deliberately left as-is (consolidation would add indirection or change
+user-visible output for little gain): the per-worker CLI `main()` dispatch
+(archiver is bespoke, ops trivial), the `_human_bytes`/`_human_secs` status-line
+formatters (intentionally binary/no-space vs termui's SI style), the watch
+dashboards (different data sources), and the dir-snapshot diffs.
 - (Earlier on main) the still-image gate that stops photos being re-encoded into
   unplayable 0-second "videos".
