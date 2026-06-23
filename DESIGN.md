@@ -130,8 +130,15 @@ to the mutable store, so the CLI can write settings without rebuilding config.
 - `grouping.py` — split-part album group keys (oversize video split into parts
   that ship as one album).
 - `media_prep.py` — make a file Telegram-compatible BEFORE enqueue (see §6).
-- `ffprobe.py` — shared ffprobe subprocess/JSON/timeout plumbing (one place;
-  callers keep their own parsing).
+- `ffprobe.py` / `ffmpeg.py` — the shared probe and run wrappers (subprocess +
+  timeout + error handling in one place; callers keep their own parsing/output
+  checks). Every ffprobe/ffmpeg call in the suite funnels through these.
+- `heartbeat.py` — the cross-process status-file primitive: atomic write +
+  pid-liveness + staleness-gated read. Backs dispatcher upload progress and the
+  archiver loop phase; ops reads through it too (same liveness rules as the
+  writers, so the monitor can't drift from the workers).
+- `instance_lock.py` — generic single-instance flock; the dispatcher's
+  session-keyed lock is a thin subclass (Template-Method error hook).
 - `deletion.py` — `DeletionGuard`: the safebrake. Every disk-deletion path runs
   through it; a protected scope is never deleted even with delete-after-upload on.
 - `sanitize.py` — banned-word stripping from filenames + captions at send.
@@ -321,7 +328,8 @@ These are the only places workers couple. They are covered by
 - **Fail-fast** — config loads crash loud at startup; `SessionUnauthorized`
   stops the daemon rather than spin-looping doomed sends.
 - **Single choke point** — `fast_upload` (all big-file uploads), `core.ingest`
-  (all enqueues), `core.ffprobe` (all probes), `media_prep` (all compat).
+  (all enqueues), `core.ffprobe`/`core.ffmpeg` (all media subprocesses),
+  `core.heartbeat` (all status files), `media_prep` (all compat).
 - **Graceful degradation** — every ffprobe/ffmpeg/thumbnail/fast-path failure
   degrades to a working fallback, never an error that loses a file.
 
@@ -347,5 +355,13 @@ These are the only places workers couple. They are covered by
   replacing a silent interactive-prompt hang / circuit-breaker spin-loop.
 - **`core.ffprobe`** consolidates three duplicated ffprobe wrappers.
 - Removed dead `tg_router` helpers (`explain`/`chat_id_for`/`peer_for`).
+
+Codebase-wide consolidation pass (same branch):
+- **`core.heartbeat`** unifies the JSON status-file + pid-liveness pattern that
+  was duplicated in five places (dispatcher progress, archiver loop, ops ×3).
+- **`core.ffmpeg`** unifies the ffmpeg subprocess wrapper across media_prep,
+  image_fix, and media_meta.
+- **`core.InstanceLock`** absorbed the dispatcher's duplicated flock mechanism;
+  `DispatcherInstanceLock` is now a thin session-keyed subclass.
 - (Earlier on main) the still-image gate that stops photos being re-encoded into
   unplayable 0-second "videos".
