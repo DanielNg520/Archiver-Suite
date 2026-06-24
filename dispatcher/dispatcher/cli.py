@@ -56,6 +56,27 @@ def _setup_logging(verbose: bool) -> None:
     termui.setup_logging(verbose)
 
 
+def _assert_video_metadata_backend() -> None:
+    """Refuse to start if Telethon's video-metadata backend (hachoir) is absent.
+
+    The native video-ALBUM send (send.py) passes no explicit attributes and
+    relies on Telethon to derive each item's width/height/duration. Telethon can
+    only do that with hachoir; without it every album video uploads with a
+    degenerate DocumentAttributeVideo(w=1, h=1, duration=0) and Telegram renders
+    it as a 1x1 static IMAGE. That is silent corruption of delivered media, so we
+    fail fast (integrity first) rather than drain the queue into broken videos.
+    Single sends are immune — they attach explicit ffprobe attributes — but the
+    queue is mixed, so a hard stop is the only safe stance."""
+    import importlib.util
+    if importlib.util.find_spec("hachoir") is None:
+        raise RuntimeError(
+            "hachoir is not installed — Telethon cannot read video geometry, so "
+            "album videos would upload as 1x1 static images. Install it with "
+            "`pipx inject dispatcher hachoir` (it is a declared dependency; a "
+            "clean reinstall also pulls it in)."
+        )
+
+
 # ── Subcommand: start ─────────────────────────────────────────────────────
 
 async def _run_drain(config: DispatcherConfig) -> None:
@@ -118,6 +139,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
 def cmd_start(args: argparse.Namespace) -> int:
     config = DispatcherConfig.load(require_telegram=True)
     assert config.telegram is not None
+    _assert_video_metadata_backend()
     conns = config.upload_connections
     termui.banner("dispatcher", [
         ("upload", f"{conns} connection{'' if conns == 1 else 's'} per file"

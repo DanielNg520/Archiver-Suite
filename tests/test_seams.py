@@ -1986,6 +1986,56 @@ def test_send_order_clustering_seam(tmp: Path) -> None:
         db.close()
 
 
+def test_video_metadata_backend_seam(tmp: Path) -> None:
+    section("Seam 27: video-metadata backend (album videos must NOT ship as 1x1 images)")
+    # ROOT-CAUSE REGRESSION GUARD. The native video-ALBUM send (send.send_album)
+    # passes NO explicit attributes and relies on Telethon to derive each item's
+    # width/height/duration itself. Telethon can only do that with `hachoir`
+    # installed; without it it emits DocumentAttributeVideo(w=1, h=1, duration=0)
+    # and Telegram renders every album video as a 1x1 static IMAGE. That bug
+    # shipped silently for days because no test exercised Telethon's own metadata
+    # path — single sends attach explicit ffprobe attributes and so masked it.
+    from telethon import utils
+    from telethon.tl import types as tg_types
+
+    # 1. The dispatcher refuses to start without the backend (integrity-first).
+    from dispatcher.cli import _assert_video_metadata_backend
+    _assert_video_metadata_backend()
+    ok(True, "startup guard passes when the video-metadata backend is present")
+
+    import importlib.util
+    real_find_spec = importlib.util.find_spec
+    importlib.util.find_spec = lambda n, *a, **k: (
+        None if n == "hachoir" else real_find_spec(n, *a, **k))
+    try:
+        raised = False
+        try:
+            _assert_video_metadata_backend()
+        except RuntimeError:
+            raised = True
+        ok(raised, "startup guard FAILS FAST when the backend is missing")
+    finally:
+        importlib.util.find_spec = real_find_spec
+
+    # 2. End-to-end proof: Telethon derives REAL geometry for a real mp4 — the
+    #    exact call the album path leans on. A 160x120/1s clip must come back as
+    #    a video attribute with those non-degenerate dims, never the 1x1/0s stub.
+    if not _ffmpeg_present():
+        ok(True, "ffmpeg absent — real-geometry probe skipped (toolchain missing)")
+        return
+    mp4 = _make_video(tmp / "clip.mp4", container="mp4")
+    attrs, mime = utils.get_attributes(str(mp4))
+    vattr = next((a for a in attrs
+                  if isinstance(a, tg_types.DocumentAttributeVideo)), None)
+    ok(vattr is not None, "Telethon attaches a DocumentAttributeVideo to the mp4")
+    ok(mime == "video/mp4", "mime resolves to video/mp4 (sent as video, not photo)")
+    ok(not (vattr.w <= 1 and vattr.h <= 1 and vattr.duration <= 0),
+       f"geometry is real, not the 1x1/0s stub (w={vattr.w} h={vattr.h} "
+       f"dur={vattr.duration}) — album videos render as videos")
+    ok(vattr.w == 160 and vattr.h == 120,
+       f"derived dimensions match the source (160x120, got {vattr.w}x{vattr.h})")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
@@ -2032,6 +2082,7 @@ def main() -> int:
         test_banned_word_sanitizer_seam(tmp / "s24")
         test_failed_housekeeping_seam(tmp / "s25")
         test_send_order_clustering_seam(tmp / "s26")
+        test_video_metadata_backend_seam(tmp / "s27")
 
     print(f"\nALL PASS ({_checks} checks)")
     return 0

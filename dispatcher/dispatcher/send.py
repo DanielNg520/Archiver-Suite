@@ -580,9 +580,14 @@ class TelethonSendStrategy(SendStrategy):
         # upload, with OR without explicit DocumentAttributeVideo, materialized OR
         # not. Only Telethon's NATIVE list send groups reliably (it uploads and
         # materializes each item its own way), so we hand it the raw paths.
-        # Telegram derives a valid mp4's geometry server-side, so no explicit
-        # attributes are needed — and supplying them is itself what breaks the
-        # group.
+        # We pass NO explicit attributes: the native list send applies one
+        # attributes list to ALL items (it can't carry per-file w/h/duration),
+        # and supplying them is itself what breaks the group. Instead Telethon
+        # derives each item's geometry — but ONLY if `hachoir` is installed (a
+        # hard dependency; see pyproject). Without hachoir Telethon emits a
+        # degenerate DocumentAttributeVideo(w=1, h=1, duration=0) per item and
+        # Telegram renders every album video as a 1x1 static IMAGE. The startup
+        # backend check fails fast if it's missing.
         #
         # We deliberately do NOT re-encode inline here. Native ships VP9 fine, and
         # an inline ffmpeg pass per item was a heavy, per-restart bottleneck that

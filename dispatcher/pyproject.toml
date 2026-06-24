@@ -11,6 +11,14 @@ dependencies = [
     # is the single biggest upload-speed lever; pair it with the parallel
     # uploader (fast_upload.py) for app-grade throughput on big files.
     "cryptg>=0.4",
+    # Telethon's video-metadata backend. REQUIRED, not optional: the native
+    # video-ALBUM send (send.py) passes no explicit attributes and relies on
+    # Telethon to derive each item's width/height/duration itself — and Telethon
+    # can only do that with hachoir installed. Without it, Telethon emits a
+    # degenerate DocumentAttributeVideo(w=1, h=1, duration=0) and Telegram
+    # renders every album video as a 1x1 static IMAGE. (Single sends are immune:
+    # they attach explicit ffprobe attributes — see _video_attributes.)
+    "hachoir>=3.1",
     # Config / env
     "python-dotenv>=1.0.0",
     # TOML writer for PolicyStore (tomllib is stdlib for reading)
