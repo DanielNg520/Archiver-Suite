@@ -213,6 +213,58 @@ def _run_ffmpeg(cmd: list[str], what: str) -> bool:
     return ffmpeg.run_ffmpeg(cmd, what=what, timeout=_CONVERT_TIMEOUT_S)
 
 
+def _remux_cmd(src: Path, dst: Path) -> list[str]:
+    return ["ffmpeg", "-y", "-v", "error", "-i", str(src),
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c", "copy", "-movflags", "+faststart", str(dst)]
+
+
+def _reencode_cmd(src: Path, dst: Path) -> list[str]:
+    # -fflags +genpts rebuilds presentation timestamps from a source whose own
+    # are missing/irregular (chiefly a live-recorded .mkv), so the output mp4
+    # carries a real duration instead of a 0-length moov.
+    return ["ffmpeg", "-y", "-v", "error", "-fflags", "+genpts", "-i", str(src),
+            "-map", "0:v:0", "-map", "0:a:0?",
+            "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "256k",
+            "-movflags", "+faststart", str(dst)]
+
+
+def _accept(p: _Probe, dst: Path, mode: str, src_name: str) -> bool:
+    """Integrity gate for a freshly produced `dst`: a non-empty, readable,
+    streamable mp4 with a POSITIVE duration of (about) the source length. A
+    remux must match closely; a re-encode can drift slightly. Returns False
+    (caller discards) on any failure; never unlinks."""
+    try:
+        if not dst.exists() or dst.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    out = _probe(dst)
+    if out is None or not _is_streamable(out):
+        log.warning("media_prep: %s of %s produced a non-streamable file",
+                    mode, src_name)
+        return False
+    # A 0-duration output is the silent-failure case that motivated this gate:
+    # a stream-copy of a timestamp-less .mkv yields an mp4 that plays in tolerant
+    # local players but reads as 0:00 on Telegram. The source duration is often
+    # unknown (0) for such files, so this MUST be checked independently of the
+    # tolerance comparison below — never gate it behind p.duration > 0.
+    if out.duration <= 0:
+        log.warning("media_prep: %s of %s produced a 0-duration file — "
+                    "discarding", mode, src_name)
+        return False
+    if p.duration > 0:
+        tol = max(2.0, p.duration * 0.02)
+        if abs(out.duration - p.duration) > tol:
+            log.warning("media_prep: %s of %s changed duration %.1fs→%.1fs "
+                        "(>%.1fs) — discarding", mode, src_name,
+                        p.duration, out.duration, tol)
+            return False
+    return True
+
+
 def _convert(src: Path, p: _Probe) -> Path | None:
     """Produce a streamable mp4 next to `src`. Lossless remux when the codecs
     already pass; otherwise a visually-lossless libx264/aac re-encode. Returns
@@ -226,49 +278,29 @@ def _convert(src: Path, p: _Probe) -> Path | None:
     clean = src.with_name(f"{src.stem}.mp4")
     dst = (clean if clean != src and not clean.exists()
            else src.with_name(f"{src.stem}{_PREP_TAG}.mp4"))
+
+    # A lossless remux is preferred whenever the codecs already pass, but a
+    # stream-copy CANNOT repair a source with missing/irregular timestamps — it
+    # can produce a 0-duration mp4 that fails _accept. When the cheap remux is
+    # unusable, fall back to a full re-encode, which rebuilds timestamps and
+    # durations from decoded frames. (-c copy ignores -fflags +genpts, so the
+    # re-encode is the only path that actually fixes such a source.)
     if _codecs_copyable(p):
-        ok = _run_ffmpeg(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(src),
-             "-map", "0:v:0", "-map", "0:a:0?",
-             "-c", "copy", "-movflags", "+faststart", str(dst)],
-            what=f"remux {src.name}",
-        )
-        mode = "remux"
-    else:
-        ok = _run_ffmpeg(
-            ["ffmpeg", "-y", "-v", "error", "-i", str(src),
-             "-map", "0:v:0", "-map", "0:a:0?",
-             "-c:v", "libx264", "-crf", "18", "-preset", "medium",
-             "-pix_fmt", "yuv420p",
-             "-c:a", "aac", "-b:a", "256k",
-             "-movflags", "+faststart", str(dst)],
-            what=f"re-encode {src.name}",
-        )
-        mode = "re-encode"
+        if (_run_ffmpeg(_remux_cmd(src, dst), what=f"remux {src.name}")
+                and _accept(p, dst, "remux", src.name)):
+            log.info("media_prep: remux %s → %s (%.2f GB)", src.name, dst.name,
+                     dst.stat().st_size / 1e9)
+            return dst
+        log.info("media_prep: remux of %s unusable — re-encoding", src.name)
 
-    if not ok or not dst.exists() or dst.stat().st_size == 0:
-        _unlink(dst)
-        return None
+    if (_run_ffmpeg(_reencode_cmd(src, dst), what=f"re-encode {src.name}")
+            and _accept(p, dst, "re-encode", src.name)):
+        log.info("media_prep: re-encode %s → %s (%.2f GB)", src.name, dst.name,
+                 dst.stat().st_size / 1e9)
+        return dst
 
-    # Integrity: the output must be a readable, streamable video of (about) the
-    # same duration. A remux must match closely; a re-encode can drift slightly.
-    out = _probe(dst)
-    if out is None or not _is_streamable(out):
-        log.warning("media_prep: %s of %s produced a non-streamable file — "
-                    "discarding", mode, src.name)
-        _unlink(dst)
-        return None
-    if p.duration > 0 and out.duration > 0:
-        tol = max(2.0, p.duration * 0.02)
-        if abs(out.duration - p.duration) > tol:
-            log.warning("media_prep: %s of %s changed duration %.1fs→%.1fs "
-                        "(>%.1fs) — discarding", mode, src.name,
-                        p.duration, out.duration, tol)
-            _unlink(dst)
-            return None
-    log.info("media_prep: %s %s → %s (%.2f GB)", mode, src.name, dst.name,
-             dst.stat().st_size / 1e9)
-    return dst
+    _unlink(dst)
+    return None
 
 
 def streamable_temp(path: Path) -> Path | None:
