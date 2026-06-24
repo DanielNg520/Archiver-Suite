@@ -61,9 +61,8 @@ independence"; in practice that just meant the copies could drift against
 the one schema they all depend on. Process isolation comes from running
 separate processes — not from giving them disjoint code.)
 
-First install + one-time data migration: **MIGRATION-AND-INSTALL.md**.
-Upgrading an existing install to the current version: **UPGRADE.md**.
-Day-to-day usage of every feature: **USER-GUIDE.md**.
+Install: the **Install** section below. Day-to-day usage of every feature:
+**USER-GUIDE.md**. Dense architecture map for revising the code: **DESIGN.md**.
 
 ---
 
@@ -185,15 +184,20 @@ pipx inject --editable recorder       ./core
 pipx inject --editable ops            ./core
 ```
 
+The dispatcher needs `hachoir` (Telethon's video-metadata backend) — it ships
+as a declared dependency, so a clean `pipx install ./dispatcher` pulls it in.
+Without it, album videos upload as 1×1 static images and the dispatcher
+refuses to start.
+
 Editing `core` needs no reinstall (editable). After editing a service:
 `pipx reinstall <package> --python 3.13` (packages: `dispatcher`,
 `media-archiver`, `recorder`, `ops`).
 
-The full install, the one-time data migration from the old two databases,
-and what changed are in **MIGRATION-AND-INSTALL.md**.
-
-First run requires interactive Telegram auth (launchd can't answer the SMS
-prompt). See AUTOMATION.md step 2.
+Schema is created and migrated idempotently on first open (`PRAGMA
+user_version`, current `core.schema.SCHEMA_VERSION`) — install order doesn't
+matter and there is nothing to run by hand. First run requires interactive
+Telegram auth once (launchd can't answer the SMS prompt). See AUTOMATION.md
+step 1.
 
 ---
 
@@ -215,18 +219,21 @@ recommended *staged* rollout (given prior kernel-panic history) are in
 
 | Doc | Covers |
 |-----|--------|
-| `README.md` (this file) | architecture, install order, layout |
+| `README.md` (this file) | architecture, install, layout |
+| `DESIGN.md` | dense architecture map — modules, seams, choke points, invariants |
 | `USER-GUIDE.md` | task-oriented daily use — every upload path + commands |
-| `UPGRADE.md` | upgrading an existing install to the current version |
-| `MIGRATION-AND-INSTALL.md` | first install + one-time two-DB → suite.db migration |
 | `AUTOMATION.md` | launchd setup, staged rollout, every automated piece |
 | `archiver/README.md` | archiver CLI, env vars, platforms |
 | `dispatcher/README.md` | dispatcher CLI, env vars, queue smoke test |
 | `ops/RUNBOOK.md` | failure recovery procedures |
 
-**What this version adds** (see USER-GUIDE.md / UPGRADE.md): global content-hash
-dedup (the same bytes never upload twice; re-introduced uploads are cleaned up),
-a min-batch policy (platform albums wait for 10 items / 7 days), chat_id
-"orphaned" folders for loose files, local (download-free) platforms, a
-per-platform download toggle, and a harmonized CLI (`start`/`--once`, shared
-`stats`/`queue`/`config`).
+**Capabilities** (see USER-GUIDE.md): global content-hash dedup (the same bytes
+never upload twice; re-introduced uploads are cleaned up), a min-batch policy
+(platform albums wait for 10 items / 7 days), chat_id "orphaned" folders for
+loose files (with forum-topic routing and split-album grouping for oversize
+files), local (download-free) platforms, a per-platform download toggle,
+banned-word sanitizing of filenames/captions, auto-retirement of
+suspended/banned accounts, and a harmonized CLI (`start`/`--once`, shared
+`stats`/`queue`/`config`). Self-healing throughout: stuck-row watchdog, transient
+failed-row auto-recovery, FloodWait/stall recovery, and a circuit breaker — see
+DESIGN.md's self-healing map.

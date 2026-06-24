@@ -22,8 +22,10 @@ Three launchd user agents, each defined by a plist in
 | dispatcher | `com.duy.dispatcher` | starts at login, restarts on any exit (`KeepAlive=true`), drains the queue forever |
 | recorder | `com.duy.recorder` | starts at login, restarts on any exit, watches for lives forever |
 | archiver | `com.duy.archiver` | starts at login, runs `archiver loop` (cycle → sleep 2–4h → repeat); restarts only on *crash* (`KeepAlive{SuccessfulExit:false}`) |
+| logrotate | `com.duy.logrotate` | a calendar job (not a daemon), daily 04:05, gzip-rotates `~/.local/log/*.log` so launchd's captured output can't grow unbounded |
 
-`ThrottleInterval=30` on all three: if one crash-loops on startup, launchd
+`ops install` writes all four plists; `ops uninstall` removes them.
+`ThrottleInterval=30` on the three services: if one crash-loops on startup, launchd
 waits 30s between respawns so it can't fill your disk with crash logs before
 you intervene.
 
@@ -83,58 +85,25 @@ dispatcher owns Telegram credentials and routing.
 
 ---
 
-## Step 2 — Wire rotating logs (optional but recommended)
+## Step 2 — Install the plists (log rotation is automatic)
 
-Without this, the only logs are launchd's `.out`/`.err` files, which grow
-**unbounded**. The fix is to wire each service to a `RotatingFileHandler`
-(50 MB × 5).
-
-`log_setup.py` is still a vendorable file. Copy it into each package and
-call it:
+`ops install` generates all four launchd plists with absolute paths and writes
+them to `~/Library/LaunchAgents/`, then creates `~/.local/log`:
 
 ```
-cp ops/log_setup.py dispatcher/dispatcher/log_setup.py
-cp ops/log_setup.py recorder/recorder/log_setup.py
-cp ops/log_setup.py archiver/archiver/log_setup.py
+ops install
 ```
 
-Then in each package's `cli.py`, replace the `logging.basicConfig(...)` call
-inside `main()` (or `_setup_logging`) with:
-
-```python
-from .log_setup import setup_file_logging
-setup_file_logging("dispatcher", verbose=args.verbose)   # name per package
-```
-
-Use the matching name: `"dispatcher"`, `"recorder"`, `"archiver"`. Then
-reinstall each:
-
-```
-pipx reinstall dispatcher --python 3.13
-pipx reinstall recorder --python 3.13
-pipx reinstall media-archiver --python 3.13
-```
-
-You can defer this and do it after the staged rollout — it's not required for
-correctness, only for log hygiene.
+This does NOT start anything — the service plists activate only on
+`launchctl load` (next step), which lets you stage the rollout. The
+**logrotate** calendar job is the exception: it is harmless on its own and keeps
+launchd's captured `~/.local/log/*.log` from growing unbounded (gzip, keep 7,
+copytruncate so launchd's append fd is never orphaned). No per-package log
+wiring is needed — `ops logrotate` is the single mechanism.
 
 ---
 
-## Step 3 — Create the log directory and install plists
-
-```
-mkdir -p ~/.local/log
-cp ops/launchd/com.duy.dispatcher.plist ~/Library/LaunchAgents/
-cp ops/launchd/com.duy.recorder.plist   ~/Library/LaunchAgents/
-cp ops/launchd/com.duy.archiver.plist   ~/Library/LaunchAgents/
-```
-
-Copying the plists does NOT start anything. They activate only on
-`launchctl load`. This lets you stage the rollout below.
-
----
-
-## Step 4 — STAGED ROLLOUT (the panic-aware part)
+## Step 3 — STAGED ROLLOUT (the panic-aware part)
 
 ### Stage A — dispatcher only (lowest risk)
 
@@ -190,7 +159,7 @@ All three now run unattended. This is full automation.
 
 ---
 
-## Step 5 — Verify full automation
+## Step 4 — Verify full automation
 
 ```
 ops health

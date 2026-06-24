@@ -6,8 +6,7 @@ pending rows from the shared `suite.db` / `items` table populated by
 (priority 10). One file at a time;
 FloodWait-aware; crash-safe via a startup watchdog.
 
-Architectural context: see the root `README.md` and
-`MIGRATION-AND-INSTALL.md`.
+Architectural context: see the root `README.md` and `DESIGN.md`.
 
 ## Install
 
@@ -21,6 +20,12 @@ pipx inject --editable dispatcher ./core
 
 That puts `dispatcher` on your PATH via `~/.local/bin/dispatcher`, isolated
 in its own venv at `~/.local/pipx/venvs/dispatcher/`.
+
+`hachoir` is a declared dependency and installs automatically — it is Telethon's
+video-metadata backend. Without it, native album sends emit a degenerate 1×1/0s
+video attribute and Telegram renders every album video as a static image, so the
+dispatcher **refuses to start** if it's missing (`pipx inject dispatcher hachoir`
+to repair an old venv).
 
 After dispatcher source edits, reinstall to pick them up:
 

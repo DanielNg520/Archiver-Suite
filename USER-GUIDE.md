@@ -1,7 +1,8 @@
 # User Guide
 
 Task-oriented reference for daily use. Architecture is in **README.md**;
-upgrading is in **UPGRADE.md**.
+the dense code map is in **DESIGN.md**; unattended/launchd setup is in
+**AUTOMATION.md**.
 
 The model in one line: **producers write file-rows into one `suite.db`; the
 dispatcher uploads them to Telegram.** You mostly drop files in the right place

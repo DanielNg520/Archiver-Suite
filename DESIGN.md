@@ -86,8 +86,8 @@ State machine: `pending →claim→ sending →ok→ sent` / `→fail→ pending
 
 | module | purpose |
 |---|---|
-| `drain.py` | `drain_forever`: serial claim→send→mark; circuit breaker (`_CIRCUIT_TRIP_AT=8`/60s); `run_housekeeping` (failed GC→prune→auto-retry→stuck watchdog, every 15min); missing-file+dedup pre-filter; `recover_media_empty` (atomic-album per-item fallback) |
-| `send.py` | `TelethonSendStrategy`: FloodWait+backoff+stall-watchdog+reconnect; video/photo/doc paths; **proactive photo compat** (single+album); **fail-fast `SessionUnauthorized`** (startup `is_user_authorized`, mid-send `UnauthorizedError`/`AuthKeyError`) |
+| `drain.py` | `drain_forever`: serial claim→send→mark; circuit breaker (`_CIRCUIT_TRIP_AT=8`/60s); `run_housekeeping` (failed-missing GC→prune→**transient auto-recover** (`reset_failed_transient`, default on)→opt-in blanket `auto_retry_failed`→stuck watchdog, every 15min); missing-file+dedup pre-filter; `recover_media_empty` (atomic-album per-item fallback) |
+| `send.py` | `TelethonSendStrategy`: FloodWait+backoff+stall-watchdog+reconnect; video/photo/doc paths; **proactive photo compat** (single+album); **fail-fast `SessionUnauthorized`** (startup `is_user_authorized`, mid-send `UnauthorizedError`/`AuthKeyError`). Single video sends attach explicit ffprobe attrs; native video **albums** rely on Telethon's own per-item geometry → **`hachoir` is a hard dep** (without it album videos ship as 1×1 images; `cli._assert_video_metadata_backend` fails fast) |
 | `fast_upload.py` | FastTelethon parallel multi-conn upload (home DC, shared auth key); always falls back to serial |
 | `tg_router.py` | (platform,user)→`Destination(chat_id,topic_id)` env chain; row chat_id overrides | 
 | `media_meta.py` | ffprobe geometry→`DocumentAttributeVideo` + poster thumbnail (via core.ff*) |
@@ -101,7 +101,7 @@ State machine: `pending →claim→ sending →ok→ sent` / `→fail→ pending
 ## ops/ops/
 `health.py` (reads suite.db RO + core.paths artifacts + launchd; liveness via core.heartbeat), `logrotate.py` (copytruncate), `cli.py` (`install/uninstall/health/watch/load/unload/restart/logrotate`). launchd labels `com.duy.{dispatcher,recorder,archiver}`.
 
-## Seams (cross-process contracts; tests/test_seams.py, 172 checks, 26 seams)
+## Seams (cross-process contracts; tests/test_seams.py, 187 checks, 27 seams)
 1. **DB handoff** — producer writes `pending`, dispatcher claims. One table.
 2. **TikTok soft-lock** — recorder writes `paths.tiktok_lock()`; archiver/ops read **liveness-gated** (stale = self-heal). recorder owns write/remove.
 3. **content_hash** — all producers via `register_file` → global dedup.
@@ -109,6 +109,7 @@ State machine: `pending →claim→ sending →ok→ sent` / `→fail→ pending
 5. **split group_key** — oversize parts album together.
 6. **status files** — `paths.*` written by writer, read by ops; core.heartbeat liveness.
 7. **editable core** — all venvs import the same core (schema-bump compat).
+8. **video-metadata backend** — native album send leans on Telethon+`hachoir` for per-item geometry; missing → 1×1 image videos (startup fail-fast).
 
 ## Choke points (one definition each — change here, not at call sites)
 `register_file` (enqueue) · `claim_batch` (claim) · `fast_upload` (big upload) ·
@@ -124,7 +125,9 @@ circuit breaker (systemic) · **fail-fast SessionUnauthorized** (no spin-loop/no
 interactive hang) · **stale tiktok-lock self-heals** (pid liveness) · lenient env
 (typo'd tunable won't crash) · is_stable skip · process-group kill · reconnect on
 premature exit · cookie-refresh + per-platform breaker · auto-ban gone accounts ·
-failed-queue prune-before-retry (no storm) · logrotate.
+failed-queue prune-before-retry (no storm) · **transient failed-row auto-recover**
+(`is_transient_failure`-gated, default on; permanent poison stays quarantined) ·
+logrotate.
 
 ## Invariants
 - One row per file (`file_path` UNIQUE) and per post (`(platform,identifier)` UNIQUE).
@@ -154,8 +157,5 @@ ops/_logrotate(-m), tests/test_seams.
   over the dispatcher venv for cross-worker tests.
 - ops soft-imports core (try/except + sys.path fallback to repo); deps=[].
 - `recorder_pid` default only; a custom STATE_DIR makes ops blind to the pid.
-
-## Branch `dispatcher-compat-hardening` change set (vs main)
-photo-reencode gate · proactive photo compat · SessionUnauthorized fail-fast ·
-core.{ffprobe,ffmpeg,heartbeat,env,paths} consolidation + pid_alive ·
-InstanceLock fold · tiktok-lock self-heal · dead tg_router removal · this doc.
+- `hachoir` must be in the **dispatcher** venv (declared dep). If album videos
+  arrive as 1×1 images, that's the first thing to check.
