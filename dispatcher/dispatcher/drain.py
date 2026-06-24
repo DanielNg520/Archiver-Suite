@@ -176,16 +176,23 @@ def run_housekeeping(store: QueueStore, config: DispatcherConfig) -> None:
          nothing to act on — the cap would silently never fire, and a poison row
          would cycle pending→failed→pending forever (the retry storm this
          backstop exists to prevent).
-      3. re-queue the remaining (recent, present-file) failed rows when
-         auto_retry_failed is on, so a transient cause heals without a manual
-         `reset failed`. Delete-first + prune-first mean only rows that are
-         present AND within the window are re-armed.
+      3. re-arm TRANSIENT failures unconditionally (default on): rows whose
+         last_error is_transient_failure — network / upload-corruption /
+         server-side causes that recover unattended. Storm-SAFE because the
+         poison rows (media rejected, oversized, unroutable) that make a blanket
+         re-arm dangerous are exactly the ones the classifier skips, so they stay
+         quarantined for a deliberate `reset failed`. This is the self-healing
+         the opt-in below used to be the only way to get.
+      4. re-queue the REMAINING (recent, present-file) failed rows — including
+         permanent ones — ONLY when auto_retry_failed is opted in. Delete-first +
+         prune-first mean only present, within-window rows are re-armed.
 
     Then the stuck-'sending' watchdog: recover rows wedged in 'sending' by a
     crashed predecessor without waiting for a restart. Safe mid-loop — the drain
     is serial, so nothing of ours is in flight here; only stale claims match."""
     store.delete_failed_missing()
     store.prune_failed(config.failed_retention_days)
+    store.reset_failed_transient()
     if FailedRetryPolicy(config.policy_store).enabled():
         store.reset_failed(None, None)
     store.reset_stuck_sending(older_than_minutes=config.stuck_claim_min)

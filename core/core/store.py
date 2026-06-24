@@ -118,6 +118,41 @@ _ERROR_CAP = 1000
 # contains no LIKE wildcards (% _) so the prefix match is literal.
 CANCELLED_MARKER = "[cancelled]"
 
+# Substrings (matched case-insensitively against last_error) that mark a failure
+# as TRANSIENT — a network / upload-corruption / server-side cause that heals on
+# its own, so the row is safe to auto-re-arm. The list is deliberately SMALL and
+# specific: the classifier (is_transient_failure) defaults to PERMANENT for
+# anything not listed, so a poison row (media Telegram rejects, oversized,
+# missing file, unroutable) is never resurrected into a retry storm. Grow this
+# list only for causes proven to recover unattended.
+_TRANSIENT_FAILURE_SIGNATURES = (
+    "filepartsinvalid",   # upload corruption — Telegram retries cleanly
+    "connection",         # ConnectionError / "Connection to Telegram failed N time(s)"
+    "floodwait",          # residual flood surfacing as an error string
+    "timed out", "timeout",
+    "stall",              # send stall-watchdog deadline
+    "reconnect",
+    "servererror", "rpcerror", "internalservererror",  # transient server-side
+    "temporaryfailure", "network is unreachable", "broken pipe",
+)
+
+
+def is_transient_failure(last_error: str | None) -> bool:
+    """True only for failures KNOWN to be transient (network / upload corruption
+    / server-side) and therefore safe to auto-re-arm. Conservative by design:
+    unknown OR permanent causes (media rejected, oversized, missing file,
+    unroutable) → False, so the poison rows that make a blanket reset dangerous
+    are exactly the ones this skips. A manual abort (CANCELLED_MARKER) is never
+    transient. The bias is toward NOT re-arming — a misclassified permanent error
+    just stays quarantined for a deliberate `reset failed`, never worse than the
+    opt-in-off status quo."""
+    if not last_error:
+        return False
+    low = last_error.lower()
+    if low.startswith(CANCELLED_MARKER):
+        return False
+    return any(sig in low for sig in _TRANSIENT_FAILURE_SIGNATURES)
+
 
 def now_iso() -> str:
     """Single canonical timestamp format across the whole suite.
@@ -1003,6 +1038,35 @@ class ItemStore:
         """failed → pending. The dispatcher re-sends on its next poll; no
         re-enqueue, no cross-DB cleanup, no idempotency key to fight."""
         return self._reset_to_pending(("failed",), platform, username)
+
+    def reset_failed_transient(self) -> int:
+        """failed → pending for ONLY the rows whose last_error is_transient_failure
+        — network / upload-corruption / server-side causes that recover on their
+        own. Permanent failures (media rejected, oversized, unroutable) and
+        manually-cancelled rows are left untouched. This is the storm-SAFE,
+        default-on companion to the opt-in auto_retry_failed (which re-arms
+        everything): the poison rows that force that policy off are exactly the
+        ones this skips. Returns the number of rows re-armed.
+
+        Classification is in Python (single source of truth, testable) rather than
+        SQL LIKEs; the failed set is tiny, so the SELECT-then-UPDATE is cheap. The
+        UPDATE re-checks status='failed' so a row delivered out from under us
+        between the read and the write is never clobbered."""
+        rows = self.conn.execute(
+            "SELECT id, last_error FROM items WHERE status='failed'"
+        ).fetchall()
+        ids = [r["id"] for r in rows if is_transient_failure(r["last_error"])]
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        cur = self.conn.execute(
+            f"UPDATE items SET status='pending', claimed_at=NULL, sent_at=NULL, "
+            f"attempts=0, last_error=NULL "
+            f"WHERE id IN ({marks}) AND status='failed'",
+            ids,
+        )
+        self._commit()
+        return cur.rowcount
 
     def reset_uploads(self, platform: str | None, username: str | None) -> int:
         """Re-send everything (sent + failed) → pending. WARNING: 'sent'

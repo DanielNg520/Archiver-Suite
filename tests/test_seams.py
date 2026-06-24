@@ -1902,6 +1902,69 @@ def test_failed_housekeeping_seam(tmp: Path) -> None:
     finally:
         db.close()
 
+    # ── TRANSIENT auto-recovery (default ON, storm-safe) ──────────────────────
+    # A failure with a transient cause (network / upload corruption) heals on the
+    # ~15-min cadence with NO opt-in, while a PERMANENT one (Telegram rejecting
+    # the media) stays quarantined — so the poison-row storm that forced
+    # auto_retry_failed off never happens. This is the safe-by-default self-heal.
+    from core import is_transient_failure, CANCELLED_MARKER
+    ok(is_transient_failure("ConnectionError: Connection to Telegram failed 5 time(s)"),
+       "classifier: ConnectionError is transient")
+    ok(is_transient_failure("FilePartsInvalidError: The number of file parts is invalid"),
+       "classifier: FilePartsInvalidError is transient")
+    ok(not is_transient_failure("ImageProcessFailedError: Failure while processing image"),
+       "classifier: ImageProcessFailedError is PERMANENT (poison — never auto-armed)")
+    ok(not is_transient_failure("file missing on disk: /x/y.mp4"),
+       "classifier: missing-file is PERMANENT")
+    ok(not is_transient_failure(None) and not is_transient_failure(""),
+       "classifier: unknown/empty defaults to PERMANENT (conservative)")
+    ok(not is_transient_failure(CANCELLED_MARKER + " by user"),
+       "classifier: a manual abort is never transient")
+
+    def _fail_with(db, where: Path, ident: str, err: str) -> str:
+        fp = where / f"{ident}.mp4"
+        _write_media(fp, ident.encode())
+        db.add_item(source="archiver", platform="x", username="al",
+                    identifier=ident, file_path=str(fp), priority=10)
+        db.conn.execute("UPDATE items SET status='failed', attempts=3, last_error=? "
+                        "WHERE id=?", (err, db.id_of(str(fp))))
+        db.conn.commit()
+        return str(fp)
+
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        trans = _fail_with(db, tmp / "tr", "neterr",
+                           "ConnectionError: Connection to Telegram failed 5 time(s)")
+        perm  = _fail_with(db, tmp / "tr", "imgerr",
+                           "ImageProcessFailedError: Failure while processing image")
+        ps = PolicyStore(); ps.set(FailedRetryPolicy.KEY, False)   # opt-in OFF
+        run_housekeeping(db, _cfg(db_path, ps, retention=7))
+        ok(_status(db, trans) == "pending",
+           "auto_retry OFF: a TRANSIENT failure self-heals to pending (default on)")
+        ok(_status(db, perm) == "failed",
+           "auto_retry OFF: a PERMANENT failure stays quarantined (no poison storm)")
+    finally:
+        db.close()
+
+    # The cancelled row must survive the transient sweep too (belt-and-braces:
+    # CANCELLED_MARKER is excluded by the classifier, not just _reset_to_pending).
+    db = _fresh_db()
+    db_path = _db_file(db)
+    try:
+        fp = tmp / "trc" / "abort.mp4"
+        _write_media(fp, b"abort")
+        db.add_item(source="archiver", platform="x", username="al",
+                    identifier="abort2", file_path=str(fp), priority=10)
+        cid = db.id_of(str(fp))
+        db.cancel(cid)
+        ps = PolicyStore(); ps.set(FailedRetryPolicy.KEY, False)
+        run_housekeeping(db, _cfg(db_path, ps, retention=0))
+        ok(db.get(cid).status == "failed",
+           "transient sweep does NOT resurrect a cancelled row")
+    finally:
+        db.close()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Seam 26 — producer enqueue order ↔ dispatcher claim_batch SEND ORDER

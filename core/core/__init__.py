@@ -10,6 +10,7 @@ from .models import Item, Status, TERMINAL
 from .schema import connect, db_path, DEFAULT_DB_PATH, SchemaVersionError
 from .store import (
     ClaimContentionError, IllegalTransition, ItemStore, now_iso, CANCELLED_MARKER,
+    is_transient_failure,
 )
 from .instance_lock import InstanceLock, InstanceAlreadyRunning
 from .stores import ProducerStore, QueueStore, AdminStore
@@ -37,7 +38,8 @@ __all__ = [
     "Item", "Status", "TERMINAL",
     "connect", "db_path", "DEFAULT_DB_PATH", "SchemaVersionError",
     "ClaimContentionError", "IllegalTransition", "ItemStore", "now_iso",
-    "CANCELLED_MARKER", "InstanceLock", "InstanceAlreadyRunning",
+    "CANCELLED_MARKER", "is_transient_failure",
+    "InstanceLock", "InstanceAlreadyRunning",
     "ProducerStore", "QueueStore", "AdminStore",
     "PolicyStore", "DeletePolicy", "RecorderDeletePolicy", "DedupPolicy",
     "BooleanPolicy", "BatchPolicy", "AutoIngestPolicy", "DownloadPolicy",
