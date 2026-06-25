@@ -1910,8 +1910,9 @@ def test_failed_housekeeping_seam(tmp: Path) -> None:
     from core import is_transient_failure, CANCELLED_MARKER
     ok(is_transient_failure("ConnectionError: Connection to Telegram failed 5 time(s)"),
        "classifier: ConnectionError is transient")
-    ok(is_transient_failure("FilePartsInvalidError: The number of file parts is invalid"),
-       "classifier: FilePartsInvalidError is transient")
+    ok(not is_transient_failure("FilePartsInvalidError: The number of file parts is invalid"),
+       "classifier: FilePartsInvalidError is PERMANENT (removed from transient "
+       "signatures — auto-retry was storming; see upload-ceiling fix)")
     ok(not is_transient_failure("ImageProcessFailedError: Failure while processing image"),
        "classifier: ImageProcessFailedError is PERMANENT (poison — never auto-armed)")
     ok(not is_transient_failure("file missing on disk: /x/y.mp4"),

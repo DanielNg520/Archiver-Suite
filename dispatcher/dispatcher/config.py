@@ -116,6 +116,18 @@ class DispatcherConfig:
     # parts of 512 KiB). Lower it via UPLOAD_CONNECTIONS in ~/.config/dispatcher/
     # .env on a constrained/metered link.
     upload_connections: int = 8
+    # Fast video albums: build a video album from pre-uploaded documents
+    # (fast_upload fan-out → messages.UploadMedia → SendMultiMedia) instead of
+    # Telethon's native list send, which uploads every item SERIALLY. The big
+    # win is split-original albums (parts of one oversize video) and any batch
+    # of large clips: each item rides the same multi-connection fan-out that
+    # single sends use. Falls back to the native list send when the Telethon
+    # internals the fast path reaches into are absent. A per-item Telegram
+    # rejection still surfaces as media_empty → the drain's per-item
+    # recover_media_empty (which re-encodes) fires identically, so the
+    # converter's fallback tier is unchanged. Disable with FAST_ALBUM=0 to pin
+    # the native serial path.
+    fast_album: bool = True
 
     @classmethod
     def load(cls, *, require_telegram: bool = True) -> "DispatcherConfig":
@@ -146,6 +158,7 @@ class DispatcherConfig:
             stall_base_timeout_s  = env.opt_float("STALL_BASE_TIMEOUT_S", 600.0, min_value=1.0),
             stall_min_rate_kib_s  = env.opt_float("STALL_MIN_RATE_KIB_S", 64.0, min_value=1.0),
             upload_connections    = env.opt_int("UPLOAD_CONNECTIONS", 8, min_value=1),
+            fast_album            = env.opt_bool("FAST_ALBUM", True),
         )
 
     def config_toml_path(self) -> Path:

@@ -110,6 +110,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
         stall_base_timeout_s = config.stall_base_timeout_s,
         stall_min_rate_kib_s = config.stall_min_rate_kib_s,
         upload_connections   = config.upload_connections,
+        fast_album           = config.fast_album,
         progress         = ProgressReporter(),
         sanitizer        = config.sanitizer,
     ) as send_strategy:

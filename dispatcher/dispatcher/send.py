@@ -60,12 +60,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from telethon import TelegramClient, utils as tg_utils
+from telethon import TelegramClient, helpers, utils as tg_utils
 from telethon.errors import (
     AuthKeyError, FloodWaitError, ImageProcessFailedError, MediaEmptyError,
-    UnauthorizedError,
+    MediaInvalidError, UnauthorizedError,
 )
-from telethon.tl import types as tg_types
+from telethon.tl import functions, types as tg_types
 
 from core.files import media_bucket
 from core import media_prep, Sanitizer
@@ -207,6 +207,7 @@ class TelethonSendStrategy(SendStrategy):
         stall_base_timeout_s: float = 600.0,
         stall_min_rate_kib_s: float = 64.0,
         upload_connections: int = 8,   # fast_upload.MAX_CONNECTIONS (see config)
+        fast_album: bool = True,        # parallel video-album path (see config)
         progress: ProgressReporter | None = None,
         sanitizer: Sanitizer | None = None,
     ):
@@ -220,6 +221,7 @@ class TelethonSendStrategy(SendStrategy):
         self._stall_base_timeout_s = stall_base_timeout_s
         self._stall_min_rate_kib_s = stall_min_rate_kib_s
         self._upload_connections = upload_connections
+        self._fast_album = fast_album
         self._progress = progress
         self._sanitizer = sanitizer or Sanitizer([])
         self._client: TelegramClient | None = None
@@ -573,31 +575,32 @@ class TelethonSendStrategy(SendStrategy):
             return await self._send_photo_album(
                 peer, file_paths, captions, topic_id=topic_id)
 
-        # HOW a video album is built matters. Pre-building each item as an
-        # InputMediaUploadedDocument and grouping those is REJECTED by Telegram
-        # (MediaEmptyError on SendMultiMedia) — proven by bisection against the
-        # live account across every combination: parallel (fast_upload) OR native
-        # upload, with OR without explicit DocumentAttributeVideo, materialized OR
-        # not. Only Telethon's NATIVE list send groups reliably (it uploads and
-        # materializes each item its own way), so we hand it the raw paths.
-        # We pass NO explicit attributes: the native list send applies one
-        # attributes list to ALL items (it can't carry per-file w/h/duration),
-        # and supplying them is itself what breaks the group. Instead Telethon
-        # derives each item's geometry — but ONLY if `hachoir` is installed (a
-        # hard dependency; see pyproject). Without hachoir Telethon emits a
-        # degenerate DocumentAttributeVideo(w=1, h=1, duration=0) per item and
-        # Telegram renders every album video as a 1x1 static IMAGE. The startup
-        # backend check fails fast if it's missing.
+        # HOW a video album is built. Two paths, same delivery contract:
         #
-        # We deliberately do NOT re-encode inline here. Native ships VP9 fine, and
-        # an inline ffmpeg pass per item was a heavy, per-restart bottleneck that
-        # made a 10-clip album look "stuck". A genuinely-undeliverable item is
-        # caught by the drain's per-item fallback (recover_media_empty), which
-        # re-encodes only that item, only when needed.
+        #  FAST (default) — _send_video_album_fast: upload each item over the
+        #  multi-connection fan-out, materialize via messages.UploadMedia, group
+        #  with SendMultiMedia. UploadMedia re-derives each item's geometry +
+        #  poster SERVER-side, so the album doesn't lean on hachoir, and big
+        #  items (split-original parts, large clips) ride the same parallel
+        #  uploader single sends use instead of going up serially.
         #
-        # Cost: native list send uploads serially (no fast_upload fan-out). That's
-        # the right trade here — albums are archiver carousels of small clips;
-        # large media (recordings) ship as SINGLE sends, which DO use fast_upload.
+        #  NATIVE — Telethon's list send: one upload at a time, geometry derived
+        #  by Telethon (needs hachoir, a hard dep; without it albums render as
+        #  1x1 images). The fallback when the fast path's Telethon internals are
+        #  absent, or when FAST_ALBUM=0 pins it.
+        #
+        # An earlier note here claimed the fast path was "REJECTED by Telegram
+        # (MediaEmptyError) — materialized or not". That bisection missed the
+        # exact extraction: the album media must be get_input_media(r.document,
+        # supports_streaming=True) — the Document, with the flag — NOT the
+        # MessageMediaDocument wrapper. With that, H.264 and VP9 albums group
+        # cleanly (verified live). Either path leaves the converter alone:
+        # a per-item Telegram rejection surfaces as media_empty and the drain's
+        # recover_media_empty re-sends that item with the streamable net ON.
+        if self._fast_album and fast_upload._internals_present(self._client):
+            return await self._send_video_album_fast(
+                peer, file_paths, captions, topic_id=topic_id)
+
         async def _do():
             await self._client.send_file(
                 peer, file_paths, caption=captions, supports_streaming=True,
@@ -608,6 +611,94 @@ class TelethonSendStrategy(SendStrategy):
         try:
             return await self._send_with_retries(
                 _do, what=f"album[{len(file_paths)}] {Path(file_paths[0]).name}…",
+                payload_bytes=self._payload_bytes(file_paths),
+            )
+        finally:
+            self._progress_done()
+
+    async def _send_video_album_fast(
+        self,
+        peer: Any,
+        file_paths: list[str],
+        captions: list[str | None],
+        *,
+        topic_id: int | None = None,
+    ) -> SendResult:
+        """Group a video album from pre-uploaded documents — the parallel
+        equivalent of Telethon's serial native list send.
+
+        Per item: fast_upload fan-out → InputMediaUploadedDocument → messages.
+        UploadMedia materializes it server-side → the resulting InputMediaDocument
+        is grouped with messages.SendMultiMedia.
+
+        MINIMAL RECIPE — and it has to be. The uploaded document is built with
+        ONLY get_attributes(path, supports_streaming=True) (the _upload_document
+        defaults: attributes=None, thumb=None). Attaching an explicit
+        DocumentAttributeVideo, a poster thumb, or a DocumentAttributeFilename to
+        the to-be-grouped item makes Telegram reject the group with
+        MediaInvalid/MediaEmpty (verified live — this is the real grain of truth
+        behind the old "supplying them breaks the group" note). It costs nothing:
+        the native list send didn't carry per-item thumbs/filenames either, and
+        UploadMedia re-derives geometry AND a poster server-side (so VP9 renders
+        correctly without hachoir leaning on us). Geometry is thus double-safe;
+        the on-disk filename shows, exactly as the native path behaved.
+
+        INTEGRITY CONTRACT. The whole sequence runs inside _send_with_retries so
+        a MediaEmptyError raised at EITHER new call site — the per-item
+        UploadMedia or the group SendMultiMedia — maps to SendResult.media_empty,
+        exactly as the native send_file does today. The drain then runs its
+        per-item recover_media_empty (re-encode + single send) untouched. Same
+        for FloodWait, the stall watchdog, and a dead session. Items upload one
+        at a time (each fanned across the connections) — never N×connections at
+        once, which the home DC would throttle. A retry re-uploads from scratch
+        (fresh file_ids): correct, if not free — efficiency is the lowest build
+        priority and album retries are rare."""
+        assert self._client is not None
+        n = len(file_paths)
+        client = self._client
+
+        async def _parsed_caption(text: str | None):
+            """Match the native list send's caption handling (markdown parse via
+            the client's parse_mode). Defensive: any parse hiccup ships the raw
+            text rather than failing the album."""
+            try:
+                return await client._parse_message_text(
+                    text or "", client.parse_mode)
+            except Exception:
+                return (text or ""), None
+
+        async def _do():
+            media = []
+            for i, fp in enumerate(file_paths):
+                uploaded = await self._upload_document(
+                    fp, attributes=None, thumb_path=None,
+                    supports_streaming=True, force_document=False,
+                    progress_cb=self._progress_cb(
+                        fp, batch_pos=i + 1, batch_total=n))
+
+                # Materialize: Telegram registers the uploaded bytes as a
+                # server-side Document (re-deriving its own attributes + poster,
+                # which is why VP9 groups fine). Extract the Document WITH the
+                # streaming flag — the MessageMediaDocument wrapper form yields
+                # invalid grouping media and would MediaEmpty.
+                r = await client(functions.messages.UploadMediaRequest(
+                    peer, media=uploaded))
+                input_media = tg_utils.get_input_media(
+                    r.document, supports_streaming=True)
+
+                msg, entities = await _parsed_caption(captions[i])
+                media.append(tg_types.InputSingleMedia(
+                    media=input_media, message=msg, entities=entities,
+                    random_id=helpers.generate_random_long()))
+
+            await client(functions.messages.SendMultiMediaRequest(
+                peer, multi_media=media,
+                reply_to=(tg_types.InputReplyToMessage(topic_id)
+                          if topic_id is not None else None)))
+
+        try:
+            return await self._send_with_retries(
+                _do, what=f"album[{n}] {Path(file_paths[0]).name}… (fast)",
                 payload_bytes=self._payload_bytes(file_paths),
             )
         finally:
@@ -797,14 +888,20 @@ class TelethonSendStrategy(SendStrategy):
                     image_process_failed=True,
                 )
 
-            except MediaEmptyError as e:
+            except (MediaEmptyError, MediaInvalidError) as e:
                 # Telegram rejected the uploaded media for this destination.
-                # Retrying the identical send within the budget cannot help and,
+                # MediaInvalid is its sibling — an album whose grouped items the
+                # server won't accept together (e.g. a mixed-codec batch, which
+                # BOTH the fast and native list sends hit). Treat them the same:
+                # retrying the identical send within the budget cannot help and,
                 # because the failing rows hold the oldest discovered_at, they sit
                 # at the head of the queue and block everything behind them. Bail
                 # out on the FIRST hit (no 4x backoff storm) and let the caller
-                # quarantine the batch so the drain moves on. Often transient, so
-                # `reset failed` recovers it later — see SendResult.media_empty.
+                # quarantine the batch so the drain moves on — for an album that
+                # is recover_media_empty, which re-sends each item individually
+                # (single-codec-of-one, so it groups trivially) with the
+                # streamable net ON. Often transient, so `reset failed` recovers
+                # it later — see SendResult.media_empty.
                 log.warning(
                     "telethon: media rejected by destination (%s): %s — "
                     "quarantining (recover with `reset failed`)", what, e,
