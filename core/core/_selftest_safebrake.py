@@ -127,6 +127,36 @@ def main() -> int:
     check(db.sent_items(platform="nope") == [],
           "sent_items() empty for unknown scope")
 
+    # ── orphaned (chat_id folder) ship-and-delete: file + row, no trace ──────
+    # A chat_id folder is a drop-zone, not an archive: an uploaded orphaned item
+    # deletes BOTH its file and its row, UNCONDITIONALLY — independent of the
+    # platform-archive delete_after_upload policy. Turn that policy OFF to prove
+    # the orphaned path doesn't depend on it.
+    policy.unset(DeletePolicy.KEY)
+    check(del_pol.should_delete("orphaned", "-100777") is False,
+          "precondition: delete_after_upload is OFF")
+    of = _touch(tmp, "orphan_drop.mp4")
+    oid = _add_sent("orphaned", "orphaned", "-100777", "orphaned_drop_1", of)
+    maybe_delete(db, oid, delete_policy=del_pol,
+                 recorder_delete_policy=rec_pol, guard=guard)
+    check(not Path(of).exists(),
+          "orphaned file removed despite delete_after_upload OFF")
+    check(db.get(oid) is None,
+          "orphaned ROW removed too — chat_id folder leaves no trace")
+
+    # Safebrake coupling: a PROTECTED orphaned scope keeps BOTH file and row.
+    # Deleting the row while the file remains would let the ingester re-upload
+    # it, so row-deletion is coupled to the file actually being gone.
+    policy.set(ProtectionPolicy.KEY, True, platform="orphaned", username="-100888")
+    pof = _touch(tmp, "orphan_protected.mp4")
+    poid = _add_sent("orphaned", "orphaned", "-100888", "orphaned_prot_1", pof)
+    maybe_delete(db, poid, delete_policy=del_pol,
+                 recorder_delete_policy=rec_pol, guard=guard)
+    check(Path(pof).exists(), "safebraked orphaned file KEPT")
+    check(db.get(poid) is not None,
+          "safebraked orphaned ROW KEPT too (file present ⇒ row stays as the "
+          "re-ingest guard)")
+
     # ── unset restores deletability ─────────────────────────────────────────
     policy.unset(ProtectionPolicy.KEY, platform="x", username="alice")
     check(prot.is_protected("x", "alice") is False, "unset clears protection")

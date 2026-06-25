@@ -30,6 +30,7 @@ from pathlib import Path
 
 from core import (
     QueueStore, Status, DeletePolicy, RecorderDeletePolicy, DeletionGuard,
+    ORPHANED_SOURCE,
 )
 
 log = logging.getLogger(__name__)
@@ -51,12 +52,30 @@ def maybe_delete(store: QueueStore, item_id: int, *,
             Path(item.file_path).name, item.status,
         )
         return
-    if item.source.lower() == "recorder":
+    source = item.source.lower()
+    is_orphaned = source == ORPHANED_SOURCE
+    if source == "recorder":
         should_delete = recorder_delete_policy.should_delete_recording()
+    elif is_orphaned:
+        # A chat_id folder is a pure drop-zone: once a file is uploaded, both it
+        # and its row are useless, so orphaned items ship-and-delete (file + row)
+        # UNCONDITIONALLY — independent of the platform-archive delete_after_upload
+        # policy. The DeletionGuard safebrake below is still honored.
+        should_delete = True
     else:
         should_delete = delete_policy.should_delete(item.platform, item.username)
     if not should_delete:
         return
-    # The guard re-checks the safebrake and skips (logging) if protected.
-    guard.delete(item.platform, item.username, item.file_path,
-                 reason="delete-after-upload")
+    # The guard re-checks the safebrake and returns False (logging) if protected.
+    removed = guard.delete(
+        item.platform, item.username, item.file_path,
+        reason="ship-and-delete (orphaned)" if is_orphaned else "delete-after-upload",
+    )
+    # Orphaned rows leave NO trace — but ONLY once the file is actually gone.
+    # Coupled to a confirmed-absent file, not just `removed`: if the safebrake
+    # KEPT the file (removed=False) or an unlink silently failed, we MUST keep
+    # the row, because it is the sole guard stopping the ingester from
+    # re-uploading that still-present file on its next scan (ingest's
+    # ALREADY_KNOWN / content_hash dedup both key off the row existing).
+    if is_orphaned and removed and not Path(item.file_path).exists():
+        store.delete(item_id)

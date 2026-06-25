@@ -750,8 +750,11 @@ def test_full_drain_seam(tmp: Path) -> None:
 
         counts = store.counts_by_status()
         ok(counts.get("pending", 0) == 0, "drain emptied the pending queue")
-        ok(counts.get("sent", 0) == 5,
-           "all 5 rows terminal as 'sent' (2 album + 2 single + 1 dedup-suppressed)")
+        ok(counts.get("sent", 0) == 4,
+           "4 rows terminal as 'sent' (2 album + recorder single + dedup-suppressed)")
+        ok(store.id_of(str(orph)) is None and not orph.exists(),
+           "orphaned chat_id-folder item left NO trace: row deleted AND file removed "
+           "(ship-and-delete)")
         ok(fake.sent_albums and sorted(Path(p).name for p in fake.sent_albums[0])
            == ["p1.jpg", "p2.jpg"],
            "the two photos went up as ONE album (homogeneous batch)")
@@ -1742,7 +1745,7 @@ def test_split_album_seam(tmp: Path) -> None:
 
 def test_banned_word_sanitizer_seam(tmp: Path) -> None:
     section("Seam 24: banned-word sanitizer strips caption at send")
-    from core import ItemStore, PolicyStore, Sanitizer
+    from core import ItemStore, PolicyStore, Sanitizer, ProtectionPolicy
     from core.hashing import full_hash
 
     db_file = str(tmp / "seam24.db")
@@ -1756,6 +1759,12 @@ def test_banned_word_sanitizer_seam(tmp: Path) -> None:
     store.close()
 
     ps = PolicyStore()
+    # Protect this orphaned scope so the orphaned ship-and-delete (file + row)
+    # is suppressed — this seam is about the sanitizer NOT mutating disk, which
+    # is orthogonal to the post-send cleanup. With the safebrake on, the file
+    # persists, so the `photo.exists()` check still genuinely catches a sanitizer
+    # that would rename or rewrite the source.
+    ps.set(ProtectionPolicy.KEY, True, platform="orphaned", username="-100777")
     fake = _FakeSend()
     _drain_once(db_file, ps, fake, default_chat_id="-100777",
                 sanitizer=Sanitizer(["badword"]))

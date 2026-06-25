@@ -125,8 +125,15 @@ CANCELLED_MARKER = "[cancelled]"
 # anything not listed, so a poison row (media Telegram rejects, oversized,
 # missing file, unroutable) is never resurrected into a retry storm. Grow this
 # list only for causes proven to recover unattended.
+# NOTE: "filepartsinvalid" is deliberately NOT listed. It looks transient (a bad
+# part can re-upload cleanly), but the dominant cause is an OVERSIZE file whose
+# 512 KiB part count exceeds Telegram's ~8000-part ceiling — which can NEVER
+# succeed on retry, so auto-re-arming it produced an endless re-upload storm
+# (re-pushing multi-GB every cycle). The real fix is upstream: media_prep's
+# upload ceiling now splits such files before they queue (see max_upload_bytes).
+# A residual FilePartsInvalid is thus a poison row — left for a deliberate
+# `reset failed` once its oversize source is split or removed.
 _TRANSIENT_FAILURE_SIGNATURES = (
-    "filepartsinvalid",   # upload corruption — Telegram retries cleanly
     "connection",         # ConnectionError / "Connection to Telegram failed N time(s)"
     "floodwait",          # residual flood surfacing as an error string
     "timed out", "timeout",
@@ -682,6 +689,19 @@ class ItemStore:
             )
         if n == 0:
             log.warning("mark_sent: id=%d not in 'sending' — no-op", item_id)
+
+    def delete(self, item_id: int) -> int:
+        """Hard-delete one row by id; returns rows deleted (0 or 1).
+
+        The orphaned ship-and-delete path uses this: once a chat_id-folder file
+        is uploaded AND removed from disk, the row is pure trace with no
+        re-ingest or dedup value, so it's dropped entirely. The CALLER must
+        ensure the file is gone first — a row deleted while its file remains
+        would be re-ingested (ingest's ALREADY_KNOWN / content_hash guards both
+        key off the row existing)."""
+        with self._immediate() as cur:
+            cur.execute("DELETE FROM items WHERE id=?", (item_id,))
+            return cur.rowcount
 
     def sent_twin(self, content_hash: str | None, exclude_id: int) -> Item | None:
         """A different row with the SAME bytes already delivered, or None.

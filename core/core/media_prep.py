@@ -55,7 +55,7 @@ log = logging.getLogger(__name__)
 # ── Tunables (env-overridable so a deployment can adjust without code edits) ──
 #
 # ARCHIVER_MEDIA_PREP=0            → disable the whole pre-flight (pure passthrough)
-# ARCHIVER_TG_MAX_UPLOAD_BYTES=N  → upload ceiling; over it we split (default 4 GiB, Premium)
+# ARCHIVER_TG_MAX_UPLOAD_BYTES=N  → upload ceiling; over it we split (default below)
 # ARCHIVER_SPLIT_CHUNK_BYTES=N    → target chunk size when splitting (default 1 GiB)
 # ARCHIVER_DELETE_AFTER_SPLIT=0   → keep the original after a successful transform
 # AUTOSPLITTER_HOME=/path         → where the AutoSplitter package lives, if not importable
@@ -65,8 +65,22 @@ def prep_enabled() -> bool:
     return env.opt_bool("ARCHIVER_MEDIA_PREP", True)
 
 
+# The real ceiling is NOT the account's 4 GiB file-size cap — it's the upload
+# PART-COUNT limit. The uploader (dispatcher.fast_upload) sends fixed 512 KiB
+# parts, and Telegram's SaveBigFilePart accepts at most ~8000 parts (the Premium
+# "4 GB" tier). 8000 × 512 KiB = 4,194,304,000 B ≈ 3.906 GiB is the largest a
+# single shot can carry; a file above it needs ≥8001 parts and Telegram rejects
+# the whole upload with FilePartsInvalidError. The old 4 GiB default sat ABOVE
+# this wall, so a file in the 3.906–4.0 GiB band converted fine, never tripped
+# the split, then died at upload. We default to 8000 parts minus a small margin
+# so such files split into ≤1 GiB chunks (which upload trivially) instead.
+_PART_SIZE = 512 * 1024          # must track dispatcher.fast_upload.PART_SIZE
+_SAFE_MAX_PARTS = 7936           # 8000 server cap − 64-part safety margin
+
+
 def max_upload_bytes() -> int:
-    return env.opt_int("ARCHIVER_TG_MAX_UPLOAD_BYTES", 4 * 1024 ** 3, min_value=1)
+    return env.opt_int(
+        "ARCHIVER_TG_MAX_UPLOAD_BYTES", _SAFE_MAX_PARTS * _PART_SIZE, min_value=1)
 
 
 def split_chunk_bytes() -> int:
