@@ -122,7 +122,13 @@ stuck `sending`→pending (startup + 15min watchdog + auth-loss revert) · globa
 dedup (never re-upload) · delete gate re-reads sent + safebrake · album MediaEmpty
 → per-item recover · FloodWait sleep outside budget · stall watchdog→reconnect ·
 circuit breaker (systemic) · **fail-fast SessionUnauthorized** (no spin-loop/no
-interactive hang) · **stale tiktok-lock self-heals** (pid liveness) · lenient env
+interactive hang) · **single reconnect authority** (Telethon `auto_reconnect=False`
++ client/fast_upload; `_force_reconnect` on stall AND network error — kills the
+dual-authority `'NoneType'.connect` race that hung the drain) · **TCP keepalive**
+(`dispatcher.keepalive`, 20/5/3) resets a half-open MTProto socket in ~35s →
+ConnectionError → `_force_reconnect`, instead of an infinite silent hang (dead
+VPN/Tailscale exit, sleep/wake; macOS default keepidle is 2h) · **stale
+tiktok-lock self-heals** (pid liveness) · lenient env
 (typo'd tunable won't crash) · is_stable skip · process-group kill · reconnect on
 premature exit · cookie-refresh + per-platform breaker · auto-ban gone accounts ·
 failed-queue prune-before-retry (no storm) · **transient failed-row auto-recover**

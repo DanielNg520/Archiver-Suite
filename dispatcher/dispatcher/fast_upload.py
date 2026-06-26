@@ -75,7 +75,12 @@ async def _connect_sender(client: Any) -> MTProtoSender:
     permits many concurrent connections sharing one auth key; that is exactly
     what makes the parallel fan-out possible. Caller disconnects it."""
     dc = await client._get_dc(client.session.dc_id)
-    sender = MTProtoSender(client.session.auth_key, loggers=client._log)
+    # auto_reconnect=False: a borrowed sender must NOT run Telethon's background
+    # reconnect. On a drop we WANT the part-send to raise so the parallel path
+    # fails fast and upload_file falls back to serial — and it removes the
+    # reconnect-vs-disconnect race (see send.py __aenter__) for these senders too.
+    sender = MTProtoSender(client.session.auth_key, loggers=client._log,
+                           auto_reconnect=False)
     await sender.connect(client._connection(
         dc.ip_address, dc.port, dc.id,
         loggers=client._log, proxy=client._proxy,

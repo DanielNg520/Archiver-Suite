@@ -1290,6 +1290,26 @@ def test_send_stall_watchdog_seam() -> None:
         strategy._send_with_retries(_flaky, what="stub", payload_bytes=0))
     ok(result.ok, "one stalled attempt then success → SendResult.ok")
 
+    # A NETWORK error must trigger an explicit reconnect. Telethon's own
+    # auto_reconnect is OFF (it raced our _force_reconnect → 'NoneType'.connect
+    # hangs), so the dispatcher is the SOLE reconnect authority: without this,
+    # every retry would hit the same dead socket. First attempt errors → reconnect
+    # → second succeeds.
+    stub2 = _StubClient()
+    strategy._client = stub2
+    netstate = {"n": 0}
+    async def _neterr():
+        netstate["n"] += 1
+        if netstate["n"] == 1:
+            raise ConnectionError("Connection to Telegram failed 5 time(s)")
+
+    result = asyncio.run(
+        strategy._send_with_retries(_neterr, what="stub", payload_bytes=0))
+    ok(result.ok, "network error then success → SendResult.ok")
+    ok(stub2.disconnects == 1 and stub2.connects == 1,
+       "ConnectionError triggers ONE explicit _force_reconnect before the retry "
+       "(sole reconnect authority; Telethon auto_reconnect is off)")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Seam 19 — upload-progress heartbeat. The drain's send strategy WRITES a JSON

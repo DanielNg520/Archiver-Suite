@@ -71,6 +71,7 @@ from core.files import media_bucket
 from core import media_prep, Sanitizer
 
 from . import fast_upload, image_fix
+from .keepalive import KeepAliveConnectionTcpFull
 from .media_meta import make_thumbnail, probe_video
 from .progress import ProgressReporter
 
@@ -268,10 +269,12 @@ class TelethonSendStrategy(SendStrategy):
         return total
 
     async def _force_reconnect(self) -> None:
-        """Tear down and re-establish the MTProto connection after a stall.
-        Both halves are themselves deadline-bound — a wedged socket can hang
-        disconnect() too — and best-effort: the retry's send will surface any
-        connection problem as a normal network error."""
+        """Tear down and re-establish the MTProto connection — the dispatcher's
+        SOLE reconnect path (Telethon's auto_reconnect is off; see __aenter__).
+        Called on both a stall and a network error. Both halves are deadline-
+        bound — a wedged socket can hang disconnect() too — and best-effort: the
+        retry's send surfaces any lingering connection problem as a normal error
+        that loops back here until it reconnects or the retry budget runs out."""
         assert self._client is not None
         try:
             await asyncio.wait_for(self._client.disconnect(), timeout=30)
@@ -284,8 +287,31 @@ class TelethonSendStrategy(SendStrategy):
             log.warning("telethon: reconnect after stall failed: %s", e)
 
     async def __aenter__(self) -> "TelethonSendStrategy":
+        # auto_reconnect=False is LOAD-BEARING. This dispatcher already owns
+        # reconnection (the stall watchdog + the ConnectionError arm both call
+        # _force_reconnect). Telethon's own background auto_reconnect is a SECOND
+        # reconnect authority, and the two race: one path's _disconnect nulls
+        # MTProtoSender._connection while the other's _try_connect calls
+        # .connect() on it → "'NoneType' object has no attribute 'connect'",
+        # which Telethon swallows in its background task, hanging the drain
+        # forever (no crash → launchd can't rescue it). With auto_reconnect off,
+        # Telethon's _reconnect runs 0 retries: it cleanly disconnects and fails
+        # the pending send with a ConnectionError that WE then handle. One
+        # reconnect authority, no race. (Same applies to fast_upload's senders —
+        # they're created auto_reconnect=False for the same reason.)
         self._client = TelegramClient(
             self._session_name, self._api_id, self._api_hash,
+            auto_reconnect=False,
+            # Arm TCP keepalive on every socket (incl. fast_upload's senders and
+            # _force_reconnect-rebuilt connections, which build from this class)
+            # so a half-open connection — dead VPN/Tailscale exit, sleep/wake,
+            # NAT timeout — is reset by the kernel in ~35s instead of hanging an
+            # await forever. The reset surfaces as a ConnectionError that
+            # _force_reconnect (above) self-heals. SAFE only because auto_reconnect
+            # is off: keepalive resets are what previously woke Telethon's
+            # background reconnect into a race with ours — with a single
+            # authority there is no race. See dispatcher.keepalive.
+            connection=KeepAliveConnectionTcpFull,
         )
         # Connect and verify authorization WITHOUT Telethon's interactive login.
         # A headless daemon (launchd) has no terminal: client.start() would block
@@ -935,10 +961,17 @@ class TelethonSendStrategy(SendStrategy):
                 last_error = f"{type(e).__name__}: {e}"
                 delay = self._retry_base_delay * (2 ** (attempts - 1))
                 log.warning(
-                    "telethon: network err attempt %d/%d (%s): %s — retry in %.1fs",
+                    "telethon: network err attempt %d/%d (%s): %s — "
+                    "reconnecting, retry in %.1fs",
                     attempts, self._max_retries, what, e, delay,
                 )
+                # With auto_reconnect=False, Telethon will NOT rebuild the socket
+                # on its own — WE are the sole reconnect authority, so a network
+                # error must trigger an explicit reconnect or every retry hits the
+                # same dead connection. _force_reconnect is deadline-bound and
+                # best-effort; a still-down link just re-raises here next attempt.
                 if attempts < self._max_retries:
+                    await self._force_reconnect()
                     await asyncio.sleep(delay)
 
             except Exception as e:
