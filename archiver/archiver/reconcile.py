@@ -181,6 +181,11 @@ def reconcile_recordings(
     if not root.exists():
         return reports
 
+    # Recorder "split mode" (config.toml): when on, every recording over the
+    # configured size (default 1 GiB) is cut into <=that-size parts, instead of
+    # only splitting above the ~3.9 GiB upload ceiling.
+    split_threshold = _recorder_split_threshold_bytes()
+
     root_files = [p for p in root.iterdir() if p.is_file()]
     if root_files:
         report = ReconcileReport(platform="tiktok", username="_root")
@@ -197,6 +202,7 @@ def reconcile_recordings(
             identifier_for_path=_recorder_identifier,
             priority=_RECORDER_PRIORITY,
             guard=guard,
+            split_threshold_bytes=split_threshold,
         ))
 
     for user_dir in sorted(p for p in root.iterdir() if p.is_dir()):
@@ -216,6 +222,7 @@ def reconcile_recordings(
             identifier_for_path=_recorder_identifier,
             priority=_RECORDER_PRIORITY,
             guard=guard,
+            split_threshold_bytes=split_threshold,
         ))
     return reports
 
@@ -234,6 +241,7 @@ def _reconcile_dir(
     identifier_for_path: Callable[[Path], str] | None = None,
     priority: int = 10,
     guard: "DeletionGuard | None" = None,
+    split_threshold_bytes: int | None = None,
 ) -> ReconcileReport:
     if not scan_dir.exists():
         return report
@@ -376,7 +384,9 @@ def _reconcile_dir(
         # oversize). Previously only the oddball extensions were converted, so
         # platform downloads with bad codecs uploaded non-streamable.
         # Images pass through prepare() untouched by construction.
-        prep = media_prep.prepare(f)
+        # split_threshold_bytes (recorder split mode) lowers the split trigger
+        # below the default ~3.9 GiB ceiling for this scan dir only.
+        prep = media_prep.prepare(f, split_threshold_bytes=split_threshold_bytes)
         if not prep.ok:
             # Couldn't make it streamable safely. Leave the original on disk
             # (never lose bytes); it is retried next pass.
@@ -445,22 +455,58 @@ def _retire_replaced_original(
         cleanup_sidecars(str(original))
 
 
-def _recorder_output_dir() -> Path:
+def _recorder_config() -> dict:
+    """The [recorder] table from the recorder's config.toml, or {} when the
+    file is missing/unreadable (warn-and-default, like the rest of reconcile)."""
     if not RECORDER_CONFIG_TOML.exists():
-        return RECORDER_DEFAULT_OUTPUT_DIR
+        return {}
     try:
         with RECORDER_CONFIG_TOML.open("rb") as f:
             data = tomllib.load(f)
     except (OSError, tomllib.TOMLDecodeError) as e:
-        log.warning(
-            "recordings reconcile: could not read %s: %s; using %s",
-            RECORDER_CONFIG_TOML,
-            e,
-            RECORDER_DEFAULT_OUTPUT_DIR,
-        )
-        return RECORDER_DEFAULT_OUTPUT_DIR
-    raw = data.get("recorder", {}).get("output_dir")
+        log.warning("recordings reconcile: could not read %s: %s",
+                    RECORDER_CONFIG_TOML, e)
+        return {}
+    rec = data.get("recorder", {})
+    return rec if isinstance(rec, dict) else {}
+
+
+def _recorder_output_dir() -> Path:
+    raw = _recorder_config().get("output_dir")
     return Path(raw).expanduser() if raw else RECORDER_DEFAULT_OUTPUT_DIR
+
+
+# Default part size / split trigger for the recorder "split mode" (GiB). Each
+# part is <= this and any recording above it is split.
+_RECORDER_SPLIT_DEFAULT_GIB = 1.0
+
+
+def _recorder_split_threshold_bytes() -> int | None:
+    """Recorder "split mode", from the recorder's config.toml [recorder] table:
+
+        [recorder]
+        split_at_chunk_size = true    # enable (default: false)
+        split_chunk_gib     = 1.0     # part size / split trigger (default: 1)
+
+    Returns the byte threshold when enabled, else None (the normal ~3.9 GiB
+    upload ceiling applies). A bad split_chunk_gib warns and falls back to the
+    1 GiB default rather than disabling — a wedged tunable mustn't lose the
+    feature silently."""
+    rec = _recorder_config()
+    if not rec.get("split_at_chunk_size", False):
+        return None
+    raw = rec.get("split_chunk_gib", _RECORDER_SPLIT_DEFAULT_GIB)
+    try:
+        gib = float(raw)
+    except (TypeError, ValueError):
+        log.warning("recordings reconcile: split_chunk_gib=%r is not a number "
+                    "— using %s", raw, _RECORDER_SPLIT_DEFAULT_GIB)
+        gib = _RECORDER_SPLIT_DEFAULT_GIB
+    if gib <= 0:
+        log.warning("recordings reconcile: split_chunk_gib=%s must be > 0 — "
+                    "using %s", gib, _RECORDER_SPLIT_DEFAULT_GIB)
+        gib = _RECORDER_SPLIT_DEFAULT_GIB
+    return int(gib * 1024 ** 3)
 
 
 def _recording_caption(username: str, path: Path) -> str:

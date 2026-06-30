@@ -29,6 +29,15 @@ CONFIG_TOML = Path.home() / ".config" / "recorder" / "config.toml"
 _opt = env.opt
 
 
+def _safe_float(raw: object, default: float) -> float:
+    """Parse a config float, falling back to `default` on garbage rather than
+    raising — a malformed tunable must never stop the recorder from starting."""
+    try:
+        return float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(frozen=True)
 class RecorderConfig:
     poll_interval_s:     float
@@ -48,6 +57,25 @@ class RecorderConfig:
     reconnect_backoff_base_s: float = 2.0   # backoff = base·2^streak, capped 30s
     max_zero_byte_reconnects: int   = 3     # consecutive no-data reconnects → stop
     max_session_minutes:      float = 0.0   # 0 = no cap on total session length
+    # ── Split mode (see register_media / archiver.reconcile) ──────────────────
+    # When on, every recording over `split_chunk_gib` is cut into <=that-size
+    # parts at enqueue, instead of only splitting above the ~3.9 GiB upload
+    # ceiling. Keeps an oversize recording off the FilePartsInvalid wall and
+    # ships it as a single ordered album. Mirrors archiver.reconcile's reading
+    # of the SAME config.toml keys (both producers stay self-contained).
+    split_at_chunk_size:      bool  = False
+    split_chunk_gib:          float = 1.0
+
+    @property
+    def split_threshold_bytes(self) -> int | None:
+        """Byte split trigger when split mode is on, else None (the normal
+        upload ceiling applies). A non-positive/garbage split_chunk_gib falls
+        back to 1 GiB rather than disabling — a wedged tunable mustn't silently
+        drop the protection."""
+        if not self.split_at_chunk_size:
+            return None
+        gib = self.split_chunk_gib if self.split_chunk_gib > 0 else 1.0
+        return int(gib * 1024 ** 3)
 
     @classmethod
     def load(cls) -> "RecorderConfig":
@@ -82,4 +110,6 @@ class RecorderConfig:
             reconnect_backoff_base_s = float(rec.get("reconnect_backoff_base_s", 2.0)),
             max_zero_byte_reconnects = int(rec.get("max_zero_byte_reconnects", 3)),
             max_session_minutes      = float(rec.get("max_session_minutes", 0.0)),
+            split_at_chunk_size      = bool(rec.get("split_at_chunk_size", False)),
+            split_chunk_gib          = _safe_float(rec.get("split_chunk_gib", 1.0), 1.0),
         )

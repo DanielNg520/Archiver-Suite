@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -146,6 +147,14 @@ class Archiver:
         self._tripped: set[str] = set()
         # Accounts retired (banned/deleted) DURING this run, reported at the end.
         self._banned_this_run: list[dict] = []
+        # Serializes DROP-FOLDER ingestion (record folder, orphaned chat_id
+        # dirs, local/non-fetching platforms) so the loop's fast in-process
+        # ingest sweeper and a concurrent heavy run() never media_prep the same
+        # file at once. Standalone runs get this private, uncontended lock; the
+        # loop injects ONE shared lock into both the heavy run and the sweeper
+        # (see cli.cmd_loop). Downloads run OUTSIDE it, so a sweep still fires
+        # mid-download.
+        self.ingest_lock: threading.Lock = threading.Lock()
 
     async def run(self,
                   platform_filter: str | None = None,
@@ -192,20 +201,25 @@ class Archiver:
         # enqueue handoff and no reconcile bridge — one table, one truth.
         await self._run_platforms(platforms, user_filter, run_time, results,
                                   on_user)
-        if self.config.reconcile_after_run:
-            # Post-run sweep reconciles+uploads EVERY enabled platform
-            # (download-disabled ones included), so they're covered here.
-            await self._reconcile_after_run(platforms, user_filter)
-        else:
-            # No global sweep — but non-fetching platforms (DOWNLOAD_ENABLED=
-            # false, or any LocalPlatform) must STILL be reconciled+uploaded
-            # (that's their whole point), so do just those. This path also
-            # sweeps files dropped directly in the platform folder, not only
-            # those under a user subfolder.
-            for platform in platforms:
-                if not self._fetches(platform):
-                    await self._reconcile_one_platform(platform, user_filter)
-        self._maybe_ingest_orphaned(known_platform_names)
+        # Drop-folder ingestion runs under ingest_lock so a concurrent fast
+        # sweeper (loop) can't prep the same file at the same time. Downloads
+        # above are already done, so holding it here blocks nothing but a
+        # sweep tick (brief, and only at the tail of an infrequent heavy run).
+        with self.ingest_lock:
+            if self.config.reconcile_after_run:
+                # Post-run sweep reconciles+uploads EVERY enabled platform
+                # (download-disabled ones included), so they're covered here.
+                await self._reconcile_after_run(platforms, user_filter)
+            else:
+                # No global sweep — but non-fetching platforms (DOWNLOAD_ENABLED=
+                # false, or any LocalPlatform) must STILL be reconciled+uploaded
+                # (that's their whole point), so do just those. This path also
+                # sweeps files dropped directly in the platform folder, not only
+                # those under a user subfolder.
+                for platform in platforms:
+                    if not self._fetches(platform):
+                        await self._reconcile_one_platform(platform, user_filter)
+            self._maybe_ingest_orphaned(known_platform_names)
         self._maybe_backfill_hashes()
         # NOTE: failed-queue maintenance (delete missing-file tombstones +
         # auto_retry_failed re-queue) lives in the DISPATCHER's housekeeping
@@ -213,6 +227,46 @@ class Archiver:
         # so that GC runs on its ~15-min cadence regardless of this loop.
         self._report_banned()
         return results
+
+    async def ingest_sweep(self) -> int:
+        """Fast, download-independent DROP-FOLDER ingestion — the record folder
+        (recordings), any local/non-fetching platform folders, and (policy-
+        gated) orphaned chat_id drop dirs. Enqueues stable files exactly as the
+        heavy run() would, but WITHOUT the multi-hour download pass in front of
+        it, so a hand-dropped file is queued within one sweep interval instead
+        of waiting for the next full cycle.
+
+        Run on a short cadence by the loop's sweeper thread (cli.cmd_loop) on
+        its OWN db connection. Holds self.ingest_lock for the whole sweep so it
+        never overlaps a concurrent heavy run()'s drop-folder reconcile (the
+        lock the loop shares between the two). Returns files enqueued. Never
+        raises for an expected problem — the caller keeps ticking.
+
+        NOTE: deliberately does NOT touch fetching platforms' per-user folders;
+        those are enqueued at download time and reconciled by the heavy run, so
+        sweeping them here every few minutes would be wasted dedup work."""
+        if not self._verify_output_dir():
+            return 0
+        platforms = build_platforms(self.config)
+        known_platform_names = {p.name for p in platforms}
+        inserted = 0
+        with self.ingest_lock:
+            recording_reports = await asyncio.to_thread(
+                reconcile_recordings, self.db, None, self.deletion_guard,
+            )
+            for report in recording_reports:
+                if report.scanned or report.inserted:
+                    log.info("ingest-sweep recordings: %s", report)
+                inserted += report.inserted
+
+            for platform in platforms:
+                if not self._fetches(platform):
+                    ins, _, _ = await self._reconcile_one_platform(platform, None)
+                    inserted += ins
+
+            await asyncio.to_thread(
+                self._maybe_ingest_orphaned, known_platform_names)
+        return inserted
 
     def _maybe_backfill_hashes(self) -> None:
         """Self-healing pass for the dedup guarantee: fill content_hash on any

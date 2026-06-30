@@ -102,14 +102,16 @@ def cmd_start(args: argparse.Namespace) -> int:
     # failed sweep must never stop the recorder from coming up.
     from .startup_sweep import sweep
     try:
-        report = sweep(config.output_dir, config.db_path)
+        report = sweep(config.output_dir, config.db_path,
+                       split_threshold_bytes=config.split_threshold_bytes)
         log.info("startup sweep — %s", report, extra={"ev": "sweep"})
     except Exception as e:
         log.warning("startup sweep skipped after error: %s", e)
 
     platform = TikTokLivePlatform(config.tiktok_cookies_file, config.state_dir)
     capture  = StreamCapture(config.output_dir, config.tiktok_cookies_file)
-    enqueue_client = EnqueueClient(config.db_path)
+    enqueue_client = EnqueueClient(
+        config.db_path, split_threshold_bytes=config.split_threshold_bytes)
     lock = TikTokLock(config.lock_path, os.getpid())
 
     def _enqueue(platform_name, username, file_path, caption):
@@ -190,7 +192,8 @@ def cmd_record(args: argparse.Namespace) -> int:
 
     platform = TikTokLivePlatform(config.tiktok_cookies_file, config.state_dir)
     capture  = StreamCapture(config.output_dir, config.tiktok_cookies_file)
-    enqueue_client = EnqueueClient(config.db_path)
+    enqueue_client = EnqueueClient(
+        config.db_path, split_threshold_bytes=config.split_threshold_bytes)
     lock = TikTokLock(config.lock_path, os.getpid())
 
     def _enqueue(platform_name, username, file_path, caption):

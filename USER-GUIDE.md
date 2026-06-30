@@ -115,6 +115,31 @@ dispatcher config set delete_after_upload_records true               # live reco
 ```
 Restart the dispatcher after changing delete/batch policies.
 
+## Recorder split mode (slice big recordings into ≤1 GiB parts)
+
+By default a file is only split when it exceeds the ~3.9 GiB Telegram upload
+ceiling. To split **every** recording over 1 GiB (after it's made
+Telegram-compatible) into ≤1 GiB parts — each shipped as one ordered album —
+turn on split mode in the recorder's config:
+
+```toml
+# ~/.config/recorder/config.toml
+[recorder]
+split_at_chunk_size = true   # split recordings over the chunk size
+split_chunk_gib     = 1.0    # part size / split trigger (default 1 GiB)
+```
+
+Applies only to the recorder output folder (reconciled by the archiver). Needs
+AutoSplitter installed; without it an oversize recording is left on disk and
+retried, never shipped broken.
+
+**When do dropped files get picked up?** `archiver loop` runs a background
+**ingest sweeper** every ~3 minutes (`--ingest-interval`) that walks the drop
+folders — the record folder, orphaned chat_id dirs, and local platforms —
+independent of the slow 2–4h download cycle. So a file you drop into the record
+folder is enqueued within minutes, then the dispatcher uploads it. (A *running*
+loop won't see this code or a changed `--ingest-interval` until it restarts.)
+
 ---
 
 ## Inspecting & fixing the queue

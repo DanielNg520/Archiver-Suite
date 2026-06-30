@@ -21,7 +21,7 @@ Three launchd user agents, each defined by a plist in
 |---------|-------|-------------------|
 | dispatcher | `com.duy.dispatcher` | starts at login, restarts on any exit (`KeepAlive=true`), drains the queue forever |
 | recorder | `com.duy.recorder` | starts at login, restarts on any exit, watches for lives forever |
-| archiver | `com.duy.archiver` | starts at login, runs `archiver loop` (cycle → sleep 2–4h → repeat); restarts only on *crash* (`KeepAlive{SuccessfulExit:false}`) |
+| archiver | `com.duy.archiver` | starts at login, runs `archiver loop` (download cycle → sleep 2–4h → repeat) PLUS a background ingest sweeper that enqueues drop-folder files every ~3 min; restarts only on *crash* (`KeepAlive{SuccessfulExit:false}`) |
 | logrotate | `com.duy.logrotate` | a calendar job (not a daemon), daily 04:05, gzip-rotates `~/.local/log/*.log` so launchd's captured output can't grow unbounded |
 
 `ops install` writes all four plists; `ops uninstall` removes them.
@@ -194,6 +194,16 @@ sleep 5 && ops health
    downloads new media and inserts pending `items` rows (priority 10). Then it
    sleeps 2–4h and repeats. If the recorder holds the TikTok lock, it skips
    TikTok downloads that cycle.
+   - **Ingest sweeper (background, every ~3 min).** The heavy download cycle
+     above only reconciles the *drop folders* (record folder, orphaned chat_id
+     dirs, local platforms) at its tail — hours apart, and never mid-download.
+     So `archiver loop` also runs a background thread that sweeps just those
+     folders every `--ingest-interval` seconds (default 180, min 30; `0`
+     disables) on its own DB connection, decoupled from downloads. A
+     hand-dropped file is enqueued within minutes instead of waiting for the
+     next full cycle. It shares a lock with the heavy run so the two never
+     prep/split the same file at once; the heavy run remains a backstop if the
+     thread ever dies.
 4. **Recorder** polls its TikTok user list every 60s. When someone's live, it
    acquires the lock, records with yt-dlp until the stream ends, releases the
    lock, enqueues the file (priority 5), and re-scans.

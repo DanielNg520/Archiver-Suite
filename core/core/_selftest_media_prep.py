@@ -155,6 +155,40 @@ def test_split(tmp: Path) -> None:
         media_prep._unlink(p)
 
 
+def test_split_threshold(tmp: Path) -> None:
+    """Recorder split mode: a streamable mp4 UNDER the default upload ceiling but
+    OVER an explicit split_threshold_bytes is split, with no env override — the
+    threshold both triggers the split and caps each part."""
+    print("\n── media_prep split_threshold (recorder split mode) ──")
+    if media_prep._load_run_split() is None:
+        print("  (AutoSplitter not found — skipping split-threshold test)")
+        return
+    big = tmp / "rec_long.mp4"
+    make_video(big, seconds=20, vcodec="libx264", acodec="aac",
+               bitrate="300k", gop=10)
+    size = big.stat().st_size
+    # No env tunables touched: the default ceiling (~3.9 GiB) leaves this tiny
+    # clip alone. Passing a sub-file-size threshold must force the split anyway.
+    threshold = size // 3
+    res = media_prep.prepare(big, split_threshold_bytes=threshold)
+    check(res.ok and res.transformed and res.individual,
+          "under-ceiling mp4 over split_threshold → split, individual=True")
+    check(len(res.outputs) >= 2,
+          f"threshold split produced {len(res.outputs)} parts (>=2)")
+    check(all(p.exists() and 0 < p.stat().st_size <= threshold + (1 << 20)
+              for p in res.outputs),
+          "all parts exist and respect the threshold cap")
+    # A threshold ABOVE the file size is a no-op: nothing to split.
+    big2 = tmp / "rec_small.mp4"
+    make_video(big2, seconds=3, vcodec="libx264", acodec="aac")
+    res2 = media_prep.prepare(big2, split_threshold_bytes=big2.stat().st_size * 4)
+    check(res2.ok and not res2.transformed and len(res2.outputs) == 1
+          and res2.outputs[0] == big2,
+          "streamable file under threshold → passthrough (no split)")
+    for p in res.outputs:
+        media_prep._unlink(p)
+
+
 def test_split_via_cli(tmp: Path) -> None:
     """Force the CLI path (how AutoSplitter is reached when installed stand-alone
     via pipx, i.e. not importable into this interpreter)."""
@@ -314,6 +348,7 @@ def main() -> None:
         tmp = Path(d)
         test_decisions(tmp)
         test_split(tmp)
+        test_split_threshold(tmp)
         test_split_via_cli(tmp)
         test_ingest_folder(tmp)
         test_delete_after_split_off(tmp)

@@ -149,7 +149,8 @@ Also ships the three launchd plists and `RUNBOOK.md` (failure recovery).
 
 ~/.config/recorder/
     .env                    TIKTOK_COOKIES_FILE, paths
-    config.toml             priority-ordered TikTok user list (recorder-owned)
+    config.toml             priority-ordered TikTok user list + output_dir;
+                            optional split mode (split_at_chunk_size/_chunk_gib)
 
 ~/.local/log/
     {dispatcher,recorder,archiver}.log          rotating app logs (if wired)

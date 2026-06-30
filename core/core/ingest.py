@@ -36,13 +36,15 @@ double row.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Callable
 
-from . import identity, stability
+from . import identity, media_prep, stability
 from .dedup import _pick_winner
 from .files import cleanup_sidecars
+from .grouping import split_group_key
 from .hashing import full_hash
 from .models import Status
 from .stores import ProducerStore
@@ -145,6 +147,127 @@ def register_file(
     return IngestResult(IngestOutcome.INSERTED,
                         item_id=store.id_of(str(path)),
                         content_hash=digest)
+
+
+# Outcomes that mean "this output is handled" — a row exists, was re-armed, or
+# its bytes were deduped away. UNSTABLE / HASH_FAILED mean "couldn't register,
+# retry next pass" and must NOT let us retire the original (its bytes would be
+# lost). Mirrors archiver.reconcile._register's accounted/not-accounted split.
+_ACCOUNTED = frozenset({
+    IngestOutcome.INSERTED, IngestOutcome.ALREADY_KNOWN,
+    IngestOutcome.DEDUP_DROPPED, IngestOutcome.DEDUP_ADOPTED,
+    IngestOutcome.REARMED,
+})
+
+
+@dataclass
+class PreparedResult:
+    """Aggregate outcome of register_media: Telegram-prep one source file, then
+    register every output it produced (one for a passthrough/convert, several
+    for an oversize split). `outcomes` is per-output, in output order."""
+    outcomes:    list[IngestOutcome] = field(default_factory=list)
+    prep_ok:     bool                = True
+    transformed: bool                = False   # prep replaced the original
+    error:       str | None          = None
+
+    @property
+    def inserted(self) -> int:
+        return sum(1 for o in self.outcomes if o == IngestOutcome.INSERTED)
+
+    @property
+    def any_inserted(self) -> bool:
+        """True when this call made content newly claimable (a fresh row or a
+        re-armed failed twin) — the register_file.inserted contract, lifted to
+        the multi-output case so callers keep a single 'did anything queue?'."""
+        return any(o in (IngestOutcome.INSERTED, IngestOutcome.REARMED)
+                   for o in self.outcomes)
+
+    @property
+    def all_accounted(self) -> bool:
+        return bool(self.outcomes) and all(o in _ACCOUNTED for o in self.outcomes)
+
+
+def register_media(
+    store:    ProducerStore,
+    path:     Path,
+    *,
+    source:    str,
+    platform:  str,
+    username:  str,
+    chat_id:    str | None = None,
+    caption:    str | None = None,
+    priority:   int = 100,
+    topic_id:   int | None = None,
+    split_threshold_bytes: int | None = None,
+    identifier_for: Callable[[Path], str] | None = None,
+    caption_for:    Callable[[Path], str | None] | None = None,
+    album_split_parts: bool = True,
+    retire_original:   Callable[[Path], None] | None = None,
+) -> PreparedResult:
+    """Telegram-prep a file, then register every output as a pending upload.
+
+    This is the media-prep layer ABOVE register_file — the same prepare →
+    register-each-output → retire-original skeleton core.orphaned and
+    archiver.reconcile run, lifted into core so the recorder's live enqueue and
+    startup sweep share one Telegram-readiness guarantee. A producer that goes
+    through here can never enqueue a file Telegram rejects at upload
+    (FilePartsInvalid): a non-streamable video is converted, one over the upload
+    ceiling (or `split_threshold_bytes`, recorder split mode) is split into
+    parts, and EACH output is registered. Images and already-streamable
+    in-ceiling files pass straight through (one cheap ffprobe), so the common
+    case behaves exactly as a bare register_file.
+
+    `split_threshold_bytes` lowers the split trigger below the ~3.9 GiB ceiling
+    (recorder split mode); None keeps the ceiling. `identifier_for(out)` /
+    `caption_for(out)` override identity/caption per output (the recorder's
+    recorder_<stem> scheme); a None from caption_for falls back to `caption`.
+    Split parts share one album group_key minted from the ORIGINAL stem when
+    `album_split_parts`, so the dispatcher ships them as one ordered batch.
+    `retire_original(path)` is invoked once prep replaced the original AND every
+    output is accounted for — the caller owns the delete policy / safebrake; it
+    is skipped if any output failed to register, so source bytes are never lost.
+
+    Never raises for an expected condition — a prep or register failure is
+    reported, the original is left on disk, and the caller keeps going."""
+    path = Path(path)
+    try:
+        prep = media_prep.prepare(path, split_threshold_bytes=split_threshold_bytes)
+    except Exception as e:                       # pragma: no cover — defensive
+        log.exception("register_media: prepare raised on %s", path)
+        return PreparedResult(prep_ok=False, error=str(e))
+    if not prep.ok:
+        return PreparedResult(prep_ok=False, error=prep.error)
+
+    # Split parts of one original share a synthetic album key, minted from the
+    # ORIGINAL stem so every part — whatever its per-part name — lands in the
+    # same ordered album rather than going out as separate messages.
+    album_gk = (split_group_key(platform, username, path.stem)
+                if prep.individual and album_split_parts else None)
+
+    outcomes: list[IngestOutcome] = []
+    for out in prep.outputs:
+        ident = identifier_for(out) if identifier_for else None
+        cap = caption_for(out) if caption_for else None
+        res = register_file(
+            store, out,
+            source     = source,
+            platform   = platform,
+            username   = username,
+            chat_id    = chat_id,
+            group_key  = album_gk,
+            caption    = cap if cap is not None else caption,
+            priority   = priority,
+            identifier = ident,
+            topic_id   = topic_id,
+        )
+        outcomes.append(res.outcome)
+
+    result = PreparedResult(outcomes=outcomes, prep_ok=True,
+                            transformed=prep.transformed)
+    if (prep.transformed and retire_original is not None
+            and result.all_accounted):
+        retire_original(path)
+    return result
 
 
 def _collapse(

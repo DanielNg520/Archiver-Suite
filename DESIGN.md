@@ -38,7 +38,7 @@ other. ops imports no *worker* (core is fine). Installs are pipx venvs with an
 | `orphaned.py` | chat_id-folder ingest + subfolder→album routing | `ingest_chat_id_dirs`, `ORPHANED_SOURCE`, `subfolder_of` |
 | `routing.py` | canonicalize chat_id/`.t<topic>` token (dash-free→`-100…`) | `parse_route`, `Route`, `is_chat_id` |
 | `grouping.py` | split-part album group keys | `split_group_key`, `is_split_group` |
-| `media_prep.py` | make file Telegram-compatible pre-enqueue: remux/re-encode video, split >ceiling; `streamable_temp` (send-time net), `is_nonstreamable_video` (doc decision). Gated to `PREP_VIDEO_EXTS` (photos never become video) | `prepare`, `streamable_temp`, `is_nonstreamable_video` |
+| `media_prep.py` | make file Telegram-compatible pre-enqueue: remux/re-encode video, split >ceiling (or a caller-supplied `split_threshold_bytes` — recorder split mode); `streamable_temp` (send-time net), `is_nonstreamable_video` (doc decision). Gated to `PREP_VIDEO_EXTS` (photos never become video) | `prepare`, `streamable_temp`, `is_nonstreamable_video` |
 | **`ffprobe.py`** | shared ffprobe: subprocess+json+timeout | `probe_json` |
 | **`ffmpeg.py`** | shared ffmpeg runner (bool, never raises) | `run_ffmpeg` |
 | **`heartbeat.py`** | cross-proc status files: atomic write + liveness/staleness read + **`pid_alive`** (the one liveness primitive) | `write_atomic`, `read_live`, `clear`, `pid_alive` |

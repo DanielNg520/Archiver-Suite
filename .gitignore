@@ -51,3 +51,9 @@ recorder-output/
 
 # ── The path-collision artifacts you already deleted ──
 mnt/
+
+# ── Librarian is its OWN repo (github.com/DanielNg520/Librarian); never track it here ──
+librarian/
+
+# ── Streamer is its OWN repo (independent worker; archiver suite is reference only); never track it here ──
+Streamer/

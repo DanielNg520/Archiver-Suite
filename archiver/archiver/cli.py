@@ -308,6 +308,12 @@ def build_parser() -> argparse.ArgumentParser:
     s_loop.add_argument("--max-fails", type=int, default=5)
     s_loop.add_argument("--platform", choices=PLATFORM_CHOICES)
     s_loop.add_argument("--user", metavar="USERNAME")
+    s_loop.add_argument(
+        "--ingest-interval", dest="ingest_interval", type=float, default=180.0,
+        metavar="SEC",
+        help="How often (seconds) the background ingest sweeper walks the "
+             "record/orphaned/local drop folders, independent of the download "
+             "cycle (default 180; min 30). 0 disables the sweeper.")
 
     # ── cookies ───
     s_ck = sub.add_parser("cookies", help="Cookie management")
@@ -726,7 +732,8 @@ def cmd_backfill(args, config: Config, db: ItemStore) -> int:
     return 0
 
 
-def cmd_run(args, config: Config, db: ItemStore, *, phase_cb=None) -> int:
+def cmd_run(args, config: Config, db: ItemStore, *, phase_cb=None,
+            ingest_lock=None) -> int:
     user_filter = args.user.lstrip("@") if args.user else None
 
     if getattr(args, "full_history", False):
@@ -748,6 +755,10 @@ def cmd_run(args, config: Config, db: ItemStore, *, phase_cb=None) -> int:
                  rearmed)
 
     arch = Archiver(config, db)
+    # Loop mode passes a shared lock so this heavy run's drop-folder reconcile
+    # is mutually exclusive with the background ingest sweeper (same process).
+    if ingest_lock is not None:
+        arch.ingest_lock = ingest_lock
     results = asyncio.run(arch.run(
         platform_filter = args.platform,
         user_filter     = user_filter,
@@ -1648,6 +1659,7 @@ def cmd_migrate(args, config: Config, db: ItemStore) -> int:
 def cmd_loop(args, config: Config, db: ItemStore) -> int:
     import random
     import signal
+    import threading
     import time
     from datetime import datetime, timezone, timedelta
 
@@ -1699,6 +1711,65 @@ def cmd_loop(args, config: Config, db: ItemStore) -> int:
         loop_logger.info("  filter: platform=%s user=%s",
                          args.platform or "*", args.user or "*")
     loop_logger.info("  loop log: %s", loop_log_path)
+
+    # ── Background ingest sweeper ────────────────────────────────────────────
+    # Drop-folder ingestion (record folder, orphaned chat_id dirs, local
+    # platforms) otherwise runs only at the TAIL of a full download cycle —
+    # hours apart, and never while a long download pass is mid-flight. This
+    # daemon thread sweeps those folders every `ingest_interval` seconds on its
+    # OWN db connection, decoupled from the download pass, so a dropped file is
+    # enqueued within minutes. `ingest_lock` is shared with the heavy in-loop
+    # run() (see cmd_run) so the two never media_prep the same file at once.
+    ingest_lock = threading.Lock()
+    sweeper_stop = threading.Event()
+    sweeper_thread = None
+    ingest_interval = getattr(args, "ingest_interval", 180.0)
+    if ingest_interval and ingest_interval > 0:
+        ingest_interval = max(30.0, ingest_interval)
+
+        def _ingest_sweeper():
+            try:
+                sweep_db = ItemStore.open(config.db_path)
+            except Exception as e:
+                loop_logger.error("ingest-sweeper: cannot open DB (%s) — "
+                                  "disabled; drop folders fall back to the "
+                                  "per-cycle reconcile", e)
+                return
+            sweep_arch = Archiver(config, sweep_db)
+            sweep_arch.ingest_lock = ingest_lock
+            loop_logger.info("ingest-sweeper started — every %.0fs "
+                             "(record folder + orphaned + local platforms)",
+                             ingest_interval)
+            first = True
+            try:
+                while not sweeper_stop.is_set():
+                    # Short first delay so startup contends less with run #1;
+                    # then settle to the configured interval.
+                    if sweeper_stop.wait(5.0 if first else ingest_interval):
+                        break
+                    first = False
+                    try:
+                        n = asyncio.run(sweep_arch.ingest_sweep())
+                        if n:
+                            loop_logger.info(
+                                "ingest-sweeper: enqueued %d new file(s)", n)
+                    except Exception as e:
+                        loop_logger.warning(
+                            "ingest-sweeper: sweep failed (%s) — continuing",
+                            e, exc_info=True)
+            finally:
+                try:
+                    sweep_db.close()
+                except Exception:
+                    pass
+                loop_logger.info("ingest-sweeper stopped")
+
+        sweeper_thread = threading.Thread(
+            target=_ingest_sweeper, name="ingest-sweeper", daemon=True)
+        sweeper_thread.start()
+    else:
+        loop_logger.info("ingest-sweeper disabled (--ingest-interval 0) — "
+                         "drop folders ingested only at each cycle's reconcile")
     loop_logger.info("════════════════════════════════════════════════════════════")
 
     exit_code = 0
@@ -1711,7 +1782,7 @@ def cmd_loop(args, config: Config, db: ItemStore) -> int:
             loop_state.write_running(run_n)
 
             try:
-                rc = cmd_run(args, config, db, phase_cb=(
+                rc = cmd_run(args, config, db, ingest_lock=ingest_lock, phase_cb=(
                     lambda p, u, _n=run_n:
                         loop_state.write_running(_n, platform=p, user=u)))
             except KeyboardInterrupt:
@@ -1763,6 +1834,9 @@ def cmd_loop(args, config: Config, db: ItemStore) -> int:
 
     finally:
         signal.signal(signal.SIGINT, prev_handler)
+        sweeper_stop.set()                    # tell the sweeper to exit
+        if sweeper_thread is not None:
+            sweeper_thread.join(timeout=15)   # let an in-flight sweep finish
         loop_state.clear()   # a stopped loop must not read back as 'sleeping'
         ended_at = datetime.now(timezone.utc)
         uptime = ended_at - started_at

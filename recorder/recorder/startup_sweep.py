@@ -36,7 +36,7 @@ from pathlib import Path
 
 from core import (
     DeletionGuard, ItemStore, PolicyStore, RecorderDeletePolicy, Status,
-    cleanup_sidecars, register_file,
+    cleanup_sidecars, register_media,
 )
 from core.ingest import IngestOutcome
 
@@ -136,10 +136,16 @@ def _delete_policy_and_guard(
 
 def sweep(output_dir: str, db_path: str | None = None,
           *, priority: int = RECORDER_PRIORITY,
-          policy_store: "PolicyStore | None" = None) -> SweepReport:
+          policy_store: "PolicyStore | None" = None,
+          split_threshold_bytes: int | None = None) -> SweepReport:
     """Run the startup reconciliation over `output_dir`. Never raises for an
     expected condition — a single bad file logs and the sweep continues — so a
-    cluttered tree can never stop the recorder from starting."""
+    cluttered tree can never stop the recorder from starting.
+
+    `split_threshold_bytes` (recorder split mode) lowers the size at which a
+    recording is split into parts below the ~3.9 GiB upload ceiling; None keeps
+    the ceiling. Either way an oversize recording is split rather than enqueued
+    whole onto Telegram's FilePartsInvalid wall (see core.register_media)."""
     report = SweepReport()
     root = Path(output_dir).expanduser()
     if not root.exists():
@@ -151,6 +157,22 @@ def sweep(output_dir: str, db_path: str | None = None,
     delete_policy, guard = _delete_policy_and_guard(policy_store)
     may_delete_sent = (delete_policy is not None
                        and delete_policy.should_delete_recording())
+
+    def _retire_after_split(original: Path) -> None:
+        """Delete a recording media_prep replaced with streamable/split output.
+        Gated by delete-after-split (default on) and the safebrake (guard); the
+        bytes survive in the registered outputs. Distinct from the sent-leftover
+        cleanup above (delete-after-UPLOAD): a split original was never uploaded,
+        it was superseded pre-queue."""
+        if not media_prep.delete_after_split():
+            return
+        username = _username_for(original, root)
+        if guard is not None:
+            guard.delete("tiktok", username, str(original),
+                         reason="startup-sweep media-prep replaced original "
+                                "with streamable copy")
+        else:
+            cleanup_sidecars(str(original))
 
     # 1. delete every per-recording log.
     for f in root.rglob("*.log"):
@@ -193,24 +215,38 @@ def sweep(output_dir: str, db_path: str | None = None,
                     report.requeued += 1
                 continue
 
-            # No row → register it (content-hash dedup happens inside).
+            # No row → media-prep + register it (content-hash dedup happens
+            # inside register_file). A big recording is converted/split here so
+            # it can never be enqueued whole onto the FilePartsInvalid wall; the
+            # replaced original is retired (gated) once its parts are accounted.
             username = _username_for(f, root)
-            result = register_file(
+            result = register_media(
                 store, f,
                 source="recorder", platform="tiktok",
                 username=username,
-                caption=_caption(username, f),
                 priority=priority,
+                split_threshold_bytes=split_threshold_bytes,
+                identifier_for=lambda out: f"recorder_{out.stem or 'item'}",
+                caption_for=lambda out: _caption(username, out),
+                retire_original=_retire_after_split,
             )
-            if result.inserted:
-                report.requeued += 1
-            elif result.outcome == IngestOutcome.DEDUP_DROPPED:
-                report.dedup_dropped += 1
-            elif result.outcome in (IngestOutcome.DEDUP_ADOPTED,
-                                    IngestOutcome.ALREADY_KNOWN):
-                report.already_queued += 1
-            else:  # UNSTABLE / HASH_FAILED
+            if not result.prep_ok:
+                # Couldn't prepare safely (bad/oversize file ffmpeg/AutoSplitter
+                # refused). Leave the original on disk; retried next start.
                 report.skipped += 1
+                log.warning("startup-sweep: media_prep failed for %s: %s",
+                            f.name, result.error)
+                continue
+            for outcome in result.outcomes:
+                if outcome in (IngestOutcome.INSERTED, IngestOutcome.REARMED):
+                    report.requeued += 1
+                elif outcome == IngestOutcome.DEDUP_DROPPED:
+                    report.dedup_dropped += 1
+                elif outcome in (IngestOutcome.DEDUP_ADOPTED,
+                                 IngestOutcome.ALREADY_KNOWN):
+                    report.already_queued += 1
+                else:  # UNSTABLE / HASH_FAILED
+                    report.skipped += 1
     finally:
         store.close()
 

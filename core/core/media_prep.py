@@ -17,7 +17,10 @@ it is enqueued. Two concerns, applied only to video:
   2. SIZE — a single Telegram upload is capped (4 GiB on a Premium account).
      A file over the ceiling is split into <=1 GiB chunks by the AutoSplitter
      project (lossless stream-copy segmenting with its own integrity check),
-     and each verified chunk is enqueued as its own message.
+     and each verified chunk is enqueued as its own message. A caller may pass
+     prepare(split_threshold_bytes=N) to LOWER that trigger below the ~3.9 GiB
+     ceiling — e.g. the recorder-output "split mode" cuts every recording over
+     1 GiB into <=1 GiB parts (see archiver.reconcile).
 
 ORDER: convert FIRST, then split. Re-encoding an incompatible file often drops
 it under the ceiling on its own (no split needed), and splitting on the final
@@ -462,10 +465,14 @@ def _cleanup_split_debris(src: Path) -> None:
     _unlink(src.parent / f"{src.stem}_segments.txt")
 
 
-def _split(src: Path) -> list[Path] | None:
+def _split(src: Path, chunk_bytes: int | None = None) -> list[Path] | None:
     """Split `src` into <=chunk-size parts beside it via AutoSplitter. Returns
-    the verified part paths, or None on any failure (no parts trusted)."""
-    target_gib = split_chunk_bytes() / (1024 ** 3)
+    the verified part paths, or None on any failure (no parts trusted).
+
+    `chunk_bytes` overrides the default target part size (split_chunk_bytes);
+    used when a caller drives a smaller split trigger (recorder split mode)."""
+    target_gib = (chunk_bytes if chunk_bytes is not None
+                  else split_chunk_bytes()) / (1024 ** 3)
 
     run_split = _load_run_split()
     if run_split is not None:
@@ -537,8 +544,14 @@ def _split_via_cli(cli: str, src: Path, target_gib: float) -> list[Path] | None:
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
-def prepare(path: Path) -> PrepResult:
+def prepare(path: Path, *, split_threshold_bytes: int | None = None) -> PrepResult:
     """Prepare one file for Telegram. See module docstring for the contract.
+
+    `split_threshold_bytes` (optional) lowers the size at which we split below
+    the default ~3.9 GiB upload ceiling AND caps each part to that size — so a
+    caller can force every file over, say, 1 GiB into <=1 GiB parts (recorder
+    split mode). Clamped to the hard ceiling: it can only make the trigger
+    SMALLER, never larger (a single upload above the ceiling would be rejected).
 
     Never raises. Cleans up its own intermediate files before returning; the
     caller is responsible only for deleting the ORIGINAL when .transformed."""
@@ -555,6 +568,14 @@ def prepare(path: Path) -> PrepResult:
 
     streamable = _is_streamable(probe)
     ceiling = max_upload_bytes()
+    chunk_target = split_chunk_bytes()
+    # Optional lower split trigger: split at the caller's threshold instead of
+    # the upload ceiling, and never produce a part larger than it. Only ever
+    # tightens the limits (min), so a misconfigured huge value can't raise the
+    # trigger above the hard ceiling.
+    if split_threshold_bytes is not None and split_threshold_bytes > 0:
+        ceiling = min(ceiling, split_threshold_bytes)
+        chunk_target = min(chunk_target, split_threshold_bytes)
     oversize = probe.size > ceiling if probe.size > 0 else False
 
     if streamable and not oversize:
@@ -579,7 +600,7 @@ def prepare(path: Path) -> PrepResult:
 
     # 2. Split if still oversized.
     if oversize:
-        parts = _split(to_split)
+        parts = _split(to_split, chunk_target)
         if parts is None:
             _unlink(converted)                     # clean the intermediate
             return PrepResult.failed(f"split failed: {path.name}")
