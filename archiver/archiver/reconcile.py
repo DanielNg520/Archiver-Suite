@@ -182,7 +182,7 @@ def reconcile_recordings(
         return reports
 
     # Recorder "split mode" (config.toml): when on, every recording over the
-    # configured size (default 1 GiB) is cut into <=that-size parts, instead of
+    # configured size (default 2 GiB) is cut into <=that-size parts, instead of
     # only splitting above the ~3.9 GiB upload ceiling.
     split_threshold = _recorder_split_threshold_bytes()
 
@@ -478,7 +478,7 @@ def _recorder_output_dir() -> Path:
 
 # Default part size / split trigger for the recorder "split mode" (GiB). Each
 # part is <= this and any recording above it is split.
-_RECORDER_SPLIT_DEFAULT_GIB = 1.0
+_RECORDER_SPLIT_DEFAULT_GIB = 2.0
 
 
 def _recorder_split_threshold_bytes() -> int | None:
@@ -486,11 +486,11 @@ def _recorder_split_threshold_bytes() -> int | None:
 
         [recorder]
         split_at_chunk_size = true    # enable (default: false)
-        split_chunk_gib     = 1.0     # part size / split trigger (default: 1)
+        split_chunk_gib     = 2.0     # part size / split trigger (default: 2)
 
     Returns the byte threshold when enabled, else None (the normal ~3.9 GiB
     upload ceiling applies). A bad split_chunk_gib warns and falls back to the
-    1 GiB default rather than disabling — a wedged tunable mustn't lose the
+    2 GiB default rather than disabling — a wedged tunable mustn't lose the
     feature silently."""
     rec = _recorder_config()
     if not rec.get("split_at_chunk_size", False):

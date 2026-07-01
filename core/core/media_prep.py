@@ -20,7 +20,7 @@ it is enqueued. Two concerns, applied only to video:
      and each verified chunk is enqueued as its own message. A caller may pass
      prepare(split_threshold_bytes=N) to LOWER that trigger below the ~3.9 GiB
      ceiling — e.g. the recorder-output "split mode" cuts every recording over
-     1 GiB into <=1 GiB parts (see archiver.reconcile).
+     2 GiB into <=2 GiB parts (see archiver.reconcile).
 
 ORDER: convert FIRST, then split. Re-encoding an incompatible file often drops
 it under the ceiling on its own (no split needed), and splitting on the final
@@ -549,7 +549,7 @@ def prepare(path: Path, *, split_threshold_bytes: int | None = None) -> PrepResu
 
     `split_threshold_bytes` (optional) lowers the size at which we split below
     the default ~3.9 GiB upload ceiling AND caps each part to that size — so a
-    caller can force every file over, say, 1 GiB into <=1 GiB parts (recorder
+    caller can force every file over, say, 2 GiB into <=2 GiB parts (recorder
     split mode). Clamped to the hard ceiling: it can only make the trigger
     SMALLER, never larger (a single upload above the ceiling would be rejected).
 

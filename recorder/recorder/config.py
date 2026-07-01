@@ -64,17 +64,17 @@ class RecorderConfig:
     # ships it as a single ordered album. Mirrors archiver.reconcile's reading
     # of the SAME config.toml keys (both producers stay self-contained).
     split_at_chunk_size:      bool  = False
-    split_chunk_gib:          float = 1.0
+    split_chunk_gib:          float = 2.0
 
     @property
     def split_threshold_bytes(self) -> int | None:
         """Byte split trigger when split mode is on, else None (the normal
         upload ceiling applies). A non-positive/garbage split_chunk_gib falls
-        back to 1 GiB rather than disabling — a wedged tunable mustn't silently
+        back to 2 GiB rather than disabling — a wedged tunable mustn't silently
         drop the protection."""
         if not self.split_at_chunk_size:
             return None
-        gib = self.split_chunk_gib if self.split_chunk_gib > 0 else 1.0
+        gib = self.split_chunk_gib if self.split_chunk_gib > 0 else 2.0
         return int(gib * 1024 ** 3)
 
     @classmethod
@@ -111,5 +111,5 @@ class RecorderConfig:
             max_zero_byte_reconnects = int(rec.get("max_zero_byte_reconnects", 3)),
             max_session_minutes      = float(rec.get("max_session_minutes", 0.0)),
             split_at_chunk_size      = bool(rec.get("split_at_chunk_size", False)),
-            split_chunk_gib          = _safe_float(rec.get("split_chunk_gib", 1.0), 1.0),
+            split_chunk_gib          = _safe_float(rec.get("split_chunk_gib", 2.0), 2.0),
         )
