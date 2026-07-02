@@ -371,17 +371,24 @@ def _route_for(
     folder: Path, chat_id: str, out: Path,
 ) -> tuple[str | None, str | None]:
     """(group_key, caption) for a non-split output file. A file in a subfolder
-    albums by subfolder; a top-level file sends alone. (Split parts are keyed by
-    the caller via split_group_key — they never reach here.)"""
+    albums by subfolder; a file directly in a ROOT sends alone. (Split parts are
+    keyed by the caller via split_group_key — they never reach here.)
+
+    A `#hashtag` folder is a VIRTUAL ROOT: a file sitting directly inside one
+    (`chat_id/#tag/file`) uploads INDIVIDUALLY just like a file in the chat_id
+    folder itself, while a deeper subfolder under it (`chat_id/#tag/sub/file`)
+    is still an album keyed by its full subpath. Detected by the file's
+    IMMEDIATE parent name starting with '#'."""
     try:
-        rel = out.relative_to(folder)
-        subpath = rel.parent.as_posix()
+        parent = out.relative_to(folder).parent
     except ValueError:
-        subpath = "."
-    subpath = "" if subpath == "." else subpath
-    if subpath:
+        return None, out.name
+    subpath = "" if parent == Path(".") else parent.as_posix()
+    # Album unless the file sits directly in a root: the chat_id folder (empty
+    # subpath) or a `#hashtag` folder (immediate parent starts with '#').
+    if subpath and not parent.name.startswith("#"):
         return f"{chat_id}/{subpath}", None
-    # Top-level loose file → its own message (see drain.orphaned_caption).
+    # Directly in a root → its own message (see drain.orphaned_caption).
     return None, out.name
 
 

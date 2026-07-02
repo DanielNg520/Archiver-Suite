@@ -2136,6 +2136,59 @@ def test_video_metadata_backend_seam(tmp: Path) -> None:
 
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Seam 28 — `#hashtag` folders are VIRTUAL ROOTS: a file directly inside a
+# `chat_id/#tag/` folder uploads INDIVIDUALLY (like a file in the chat_id root),
+# captioned `#tag file_name`; a deeper subfolder `chat_id/#tag/sub/` is still an
+# album (`#tag sub` header). A non-hashtag subfolder is unchanged (albums).
+# Guards the contract between core.orphaned._route_for and drain.orphaned_caption.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_hashtag_root_seam(tmp: Path) -> None:
+    section("Seam 28: #hashtag folders are virtual roots (individual vs album)")
+    from core import ItemStore, PolicyStore, BatchPolicy
+    from core.orphaned import ingest_chat_id_dirs
+
+    # Directly under #JAV → individual; under #Asian/Eli Shaw → album; under a
+    # plain (non-hashtag) Nainoi folder → album (existing behavior, unchanged).
+    _write_media(tmp / "-100333" / "#JAV" / "one.jpg", b"J1")
+    _write_media(tmp / "-100333" / "#JAV" / "two.jpg", b"J2")
+    _write_media(tmp / "-100333" / "#Asian" / "Eli Shaw" / "a.jpg", b"AA")
+    _write_media(tmp / "-100333" / "#Asian" / "Eli Shaw" / "b.jpg", b"BB")
+    _write_media(tmp / "-100333" / "Nainoi" / "x.jpg", b"XX")
+    _write_media(tmp / "-100333" / "Nainoi" / "y.jpg", b"YY")
+
+    db_file = str(tmp / "seam28.db")
+    store = ItemStore.open(db_file)
+    ingest_chat_id_dirs(store, tmp, known_platforms=set())
+    jav = [store.get(store.id_of(str(tmp / "-100333" / "#JAV" / n)))
+           for n in ("one.jpg", "two.jpg")]
+    ok(all(r.group_key is None for r in jav),
+       "files directly in #JAV have NO group_key (upload individually)")
+    eli = store.get(store.id_of(str(tmp / "-100333" / "#Asian" / "Eli Shaw" / "a.jpg")))
+    ok(eli.group_key == "-100333/#Asian/Eli Shaw",
+       "a file under #Asian/Eli Shaw albums by its full subpath")
+    nai = store.get(store.id_of(str(tmp / "-100333" / "Nainoi" / "x.jpg")))
+    ok(nai.group_key == "-100333/Nainoi",
+       "a plain (non-hashtag) subfolder still albums — behavior unchanged")
+    store.close()
+
+    ps = PolicyStore()
+    ps.set(BatchPolicy.SIZE_KEY, 1)
+    fake = _FakeSend()
+    _drain_once(db_file, ps, fake, default_chat_id="-100999")
+
+    ok(sorted(Path(p).name for p in fake.sent_singles) == ["one.jpg", "two.jpg"],
+       "the two #JAV files were sent as individual singles, not an album")
+    ok(sorted(fake.single_captions) == ["#JAV one", "#JAV two"],
+       "each individual caption is '#JAV <file>' (hashtag stays clickable)")
+    album_caps = sorted(fake.album_captions)
+    ok(any(c.startswith("#Asian Eli Shaw") for c in album_caps),
+       "#Asian/Eli Shaw album header is space-joined '#Asian Eli Shaw'")
+    ok(any(c.startswith("Nainoi") for c in album_caps),
+       "the plain Nainoi album header is just 'Nainoi'")
+
+
 def main() -> int:
     print("cross-worker seam integration tests")
     # Each test gets an isolated temp config.toml so the real user config is
@@ -2181,6 +2234,7 @@ def main() -> int:
         test_failed_housekeeping_seam(tmp / "s25")
         test_send_order_clustering_seam(tmp / "s26")
         test_video_metadata_backend_seam(tmp / "s27")
+        test_hashtag_root_seam(tmp / "s28")
 
     print(f"\nALL PASS ({_checks} checks)")
     return 0

@@ -102,9 +102,17 @@ def orphaned_caption(batch: list[Item]) -> str:
     # real (clickable) Telegram hashtag: `#Asian/Eli Shaw` → `#Asian Eli Shaw`.
     # A `/` in the header would break the hashtag link (`#Asian/Eli` isn't one).
     sub = subfolder_of(head.chat_id, head.group_key).replace("/", " ")
-    lines = ([sub] if sub else []) + [
-        media_prep.clean_upload_stem(it.file_path) for it in batch]
-    return "\n".join(lines)
+    stems = [media_prep.clean_upload_stem(it.file_path) for it in batch]
+    if not sub:
+        # Individual file (no album group_key). A file sitting directly in a
+        # `#hashtag` root carries no group_key, so recover the tag from its
+        # parent dir → `#tag file_name` (one line, tag stays clickable). A plain
+        # top-level loose file (numeric/@ chat_id parent) → just its stem.
+        parent = Path(head.file_path).parent.name
+        if parent.startswith("#"):
+            return f"{parent} {stems[0]}"
+        return "\n".join(stems)
+    return "\n".join([sub] + stems)
 
 
 def caption_for(item: Item) -> str:
