@@ -198,6 +198,7 @@ def register_media(
     caption:    str | None = None,
     priority:   int = 100,
     topic_id:   int | None = None,
+    group_key:  str | None = None,
     split_threshold_bytes: int | None = None,
     identifier_for: Callable[[Path], str] | None = None,
     caption_for:    Callable[[Path], str | None] | None = None,
@@ -222,7 +223,10 @@ def register_media(
     `caption_for(out)` override identity/caption per output (the recorder's
     recorder_<stem> scheme); a None from caption_for falls back to `caption`.
     Split parts share one album group_key minted from the ORIGINAL stem when
-    `album_split_parts`, so the dispatcher ships them as one ordered batch.
+    `album_split_parts`, so the dispatcher ships them as one ordered batch. An
+    explicit `group_key` overrides that mint and is applied to EVERY output — a
+    producer stamps it to album a set of files spanning separate register_media
+    calls (the recorder's reconnect-stitched broadcast segments).
     `retire_original(path)` is invoked once prep replaced the original AND every
     output is accounted for — the caller owns the delete policy / safebrake; it
     is skipped if any output failed to register, so source bytes are never lost.
@@ -241,8 +245,16 @@ def register_media(
     # Split parts of one original share a synthetic album key, minted from the
     # ORIGINAL stem so every part — whatever its per-part name — lands in the
     # same ordered album rather than going out as separate messages.
-    album_gk = (split_group_key(platform, username, path.stem)
-                if prep.individual and album_split_parts else None)
+    #
+    # An explicit caller `group_key` overrides the per-file split mint: it lets a
+    # producer album a SET of files that arrive through separate register_media
+    # calls (the recorder stamps every segment of one reconnect-stitched
+    # broadcast with one key). It also wins when a segment is itself oversize and
+    # split — those sub-parts then join the broadcast album rather than forming
+    # their own, so the whole broadcast still ships as one ordered batch.
+    album_gk = group_key if group_key is not None else (
+        split_group_key(platform, username, path.stem)
+        if prep.individual and album_split_parts else None)
 
     outcomes: list[IngestOutcome] = []
     for out in prep.outputs:

@@ -41,6 +41,8 @@ from enum import Enum, auto
 from pathlib import Path
 from typing import Callable
 
+from core import split_group_key
+
 from . import ui
 from .capture import StreamCapture
 from .config import RecorderConfig
@@ -147,13 +149,16 @@ class RecorderState(Enum):
 
 @dataclass
 class _Job:
-    """A finished file awaiting enqueue."""
+    """A finished file awaiting enqueue. `group_key`, when set, albums this file
+    with the other segments of the same broadcast (a reconnect-stitched session
+    that produced more than one file); None → the file sends on its own."""
     username: str
     file_path: Path
+    group_key: str | None = None
 
 
-# enqueue_fn signature: (platform, username, file_path, caption) -> None
-EnqueueFn = Callable[[str, str, str, str], None]
+# enqueue_fn signature: (platform, username, file_path, caption, group_key) -> None
+EnqueueFn = Callable[[str, str, str, str, str | None], None]
 
 
 class StateMachine:
@@ -424,6 +429,14 @@ class StateMachine:
         elapsed = time.monotonic() - session_start
         files = list(session_files)
         user = self.current_user or "?"
+        # A broadcast that dropped and reconnected leaves >1 segment file. Stamp
+        # them all with ONE album key so the dispatcher ships them as a single
+        # ordered batch instead of scattered clips — the disk-level counterpart
+        # to Fix 1 (which keeps a single broadcast in one ffmpeg file when it
+        # can; this covers the genuine URL-rotation reconnects that still split).
+        # A single-file session gets no key: it sends on its own as before.
+        session_gk = (split_group_key("tiktok", user, files[0].stem)
+                      if len(files) > 1 else None)
         if files:
             total = sum(_safe_size(f) for f in files)
             extra_seg = "" if reconnects == 0 else f" · {reconnects} reconnect(s)"
@@ -436,7 +449,8 @@ class StateMachine:
             log.info("@%s ended — %s · no data (dead stream)",
                      user, ui.human_duration(elapsed), extra={"ev": "rec_end"})
         for f in files:
-            self._upload_q.put(_Job(username=self.current_user or "", file_path=f))
+            self._upload_q.put(_Job(username=self.current_user or "",
+                                    file_path=f, group_key=session_gk))
 
         if self._stop.is_set():
             return
@@ -494,7 +508,8 @@ class StateMachine:
             upload_path = _remux_for_telegram(job.file_path)
             caption = (f"@{job.username} · tiktok · live · "
                        f"{upload_path.stem}")
-            self.enqueue("tiktok", job.username, str(upload_path), caption)
+            self.enqueue("tiktok", job.username, str(upload_path), caption,
+                         job.group_key)
         except Exception as e:
             # Keep the file on disk; ops can re-enqueue via the dispatcher
             # CLI. Losing the recording is the only unacceptable outcome,

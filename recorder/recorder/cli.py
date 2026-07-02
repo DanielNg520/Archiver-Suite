@@ -114,10 +114,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         config.db_path, split_threshold_bytes=config.split_threshold_bytes)
     lock = TikTokLock(config.lock_path, os.getpid())
 
-    def _enqueue(platform_name, username, file_path, caption):
+    def _enqueue(platform_name, username, file_path, caption, group_key=None):
         enqueue_client.enqueue(
             platform=platform_name, username=username,
-            file_path=file_path, caption=caption,
+            file_path=file_path, caption=caption, group_key=group_key,
         )
 
     machine = StateMachine(config, platform, capture, _enqueue, lock)
@@ -196,10 +196,10 @@ def cmd_record(args: argparse.Namespace) -> int:
         config.db_path, split_threshold_bytes=config.split_threshold_bytes)
     lock = TikTokLock(config.lock_path, os.getpid())
 
-    def _enqueue(platform_name, username, file_path, caption):
+    def _enqueue(platform_name, username, file_path, caption, group_key=None):
         enqueue_client.enqueue(
             platform=platform_name, username=username,
-            file_path=file_path, caption=caption,
+            file_path=file_path, caption=caption, group_key=group_key,
         )
 
     machine = StateMachine(config, platform, capture, _enqueue, lock)

@@ -89,10 +89,17 @@ class EnqueueClient:
         username:  str,
         file_path: str,
         caption:   str | None,
+        group_key: str | None = None,
         priority:  int = RECORDER_PRIORITY,
     ) -> bool:
         """Register one finished recording. Returns True if it became newly
         claimable (inserted, or a failed twin was re-armed).
+
+        `group_key` (optional) albums this recording with others sharing the key
+        — the state machine passes one broadcast's reconnect-stitched segments a
+        shared key so they ship as a single ordered batch instead of scattered
+        clips. None → the recording sends on its own (or, if oversize, its split
+        parts get their own album).
 
         Goes through core.register_media — the media-prep layer over the SAME
         register_file primitive the startup sweep and every other producer use.
@@ -119,6 +126,7 @@ class EnqueueClient:
                 platform   = platform,
                 username   = username,
                 priority   = priority,
+                group_key  = group_key,
                 split_threshold_bytes = self._split_threshold_bytes,
                 identifier_for = lambda out: _recorder_identifier(str(out)),
                 caption_for    = lambda out: (

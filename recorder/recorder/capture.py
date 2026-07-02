@@ -9,6 +9,15 @@ FLAG CHOICES (corrected vs the guide — verified against yt-dlp 2026):
                         HLS. Without this you get a few seconds then a
                         "Live HLS not supported by native downloader"
                         bail.
+  --downloader-args ffmpeg:-reconnect …
+                        ffmpeg does the actual live-HLS download and, unlike
+                        yt-dlp's own --retries, does NOT reconnect the HTTP
+                        transport by default. A socket stall / rotated m3u8 /
+                        mid-stream EOF then kills ffmpeg, ends the recording
+                        file, and the state machine relaunches into a NEW file —
+                        one broadcast becomes many short clips. These reconnect
+                        flags keep one ffmpeg process alive across blips so the
+                        broadcast stays in a single file.
   --hls-use-mpegts      MPEG-TS container survives mid-stream disconnects
                         (TikTok lives drop often). NOTE: yt-dlp already
                         enables this by default for live, but we set it
@@ -85,6 +94,19 @@ class StreamCapture:
         cmd = [
             "yt-dlp",
             "--downloader", "ffmpeg",
+            # ffmpeg (our live-HLS downloader) does NOT retry the HTTP transport
+            # on its own — any socket stall, rotated m3u8, or mid-stream EOF ends
+            # the ffmpeg process, yt-dlp exits, and that output file is closed. On
+            # TikTok live those blips happen constantly, so without this the state
+            # machine relaunches yt-dlp on every drop and one broadcast lands as a
+            # pile of short clips. These flags keep a SINGLE ffmpeg process alive
+            # across blips by re-opening the connection internally, so a whole
+            # broadcast stays in one file. yt-dlp's --retries/--fragment-retries
+            # are its own knobs and don't reach the child ffmpeg — hence this.
+            # (reconnect_* apply to http/https inputs, exactly the HLS case.)
+            "--downloader-args",
+            "ffmpeg:-reconnect 1 -reconnect_streamed 1 "
+            "-reconnect_at_eof 1 -reconnect_delay_max 30",
             "--hls-use-mpegts",
             "--no-part",
             "--retries", "infinite",
