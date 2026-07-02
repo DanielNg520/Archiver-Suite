@@ -43,7 +43,7 @@ from .reconcile import (
 
 from core import (
     ItemStore, DeletePolicy, DedupPolicy, DownloadPolicy, DeletionGuard,
-    dedup_user, cleanup_sidecars, is_chat_id,
+    dedup_user, cleanup_sidecars, parse_route,
     validate_overrides as _validate_policies,
 )
 
@@ -111,7 +111,12 @@ def _local_platform_names(config: Config) -> list[str]:
             nm = d.name
             if nm.startswith(".") or nm in seen:
                 continue
-            if nm in _RESERVED_OUTPUT_DIR_NAMES or is_chat_id(nm):
+            # parse_route (not is_chat_id) so a topic-suffixed route folder
+            # `<chat_id>.t<topic>` is recognized too — is_chat_id validates a
+            # BARE chat_id and would miss the `.t…` suffix, letting the folder
+            # be auto-adopted as a local platform and uploaded to the DEFAULT
+            # chat instead of the intended forum topic.
+            if nm in _RESERVED_OUTPUT_DIR_NAMES or parse_route(nm) is not None:
                 continue
             seen.add(nm)
             discovered.append(nm)

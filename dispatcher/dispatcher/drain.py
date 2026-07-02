@@ -98,7 +98,10 @@ def orphaned_caption(batch: list[Item]) -> str:
     requested 'Beach day / John / Jess' shape (newline-separated). A top-level
     loose file (no subfolder) → just its stem."""
     head = batch[0]
-    sub = subfolder_of(head.chat_id, head.group_key)
+    # Space-join the subpath components so a leading `#tag` folder renders as a
+    # real (clickable) Telegram hashtag: `#Asian/Eli Shaw` → `#Asian Eli Shaw`.
+    # A `/` in the header would break the hashtag link (`#Asian/Eli` isn't one).
+    sub = subfolder_of(head.chat_id, head.group_key).replace("/", " ")
     lines = ([sub] if sub else []) + [
         media_prep.clean_upload_stem(it.file_path) for it in batch]
     return "\n".join(lines)

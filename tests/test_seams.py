@@ -175,13 +175,18 @@ def test_local_platform_discovery_seam(tmp: Path) -> None:
     from types import SimpleNamespace
     from archiver.orchestrator import _local_platform_names
 
-    for name in ("x", "tiktok", "instagram", "unsorted", "-100123", "library"):
+    # '-100123.t42' is a TOPIC-suffixed route: it must be excluded too. Using
+    # is_chat_id here (bare-only) instead of parse_route would MISS the `.t`
+    # suffix, auto-adopt it as a platform, and upload to the default chat.
+    for name in ("x", "tiktok", "instagram", "unsorted",
+                 "-100123", "-100123.t42", "1003547920321.t41478", "library"):
         (tmp / name).mkdir(parents=True, exist_ok=True)
     config = SimpleNamespace(output_dir=str(tmp), local_platforms=())
 
     names = _local_platform_names(config)
     ok(names == ["library"],
-       "only a genuine local platform is auto-discovered")
+       "only a genuine local platform is auto-discovered "
+       "(bare AND topic-suffixed routes excluded)")
 
 
 def test_dispatcher_instance_lock_seam(tmp: Path) -> None:
