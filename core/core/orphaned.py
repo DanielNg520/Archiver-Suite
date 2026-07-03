@@ -262,6 +262,12 @@ def ingest_folder(
             rep.errors.append(f"{f.name}: prep {e}")
             log.exception("orphaned: media_prep raised on %s", f)
             continue
+        if prep.busy:
+            # Another worker's sweep (recorder/archiver) is already preparing this
+            # exact file — skip it this pass and let that holder register it.
+            # NOT memoized: we WANT to reconsider it next sweep, once it's free.
+            rep.unstable += 1
+            continue
         if not prep.ok:
             # Couldn't prepare safely (bad/oversize file ffmpeg or AutoSplitter
             # refused). Leave the original in place and memoize so we don't keep

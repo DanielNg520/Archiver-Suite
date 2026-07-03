@@ -43,6 +43,9 @@ split_group_key so the dispatcher ships them as a single ordered album.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
+import hashlib
 import logging
 import os
 import shutil
@@ -51,7 +54,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import env, ffmpeg, ffprobe
+from . import env, ffmpeg, ffprobe, paths
 from .files import VIDEO_EXTS
 
 log = logging.getLogger(__name__)
@@ -141,6 +144,13 @@ class PrepResult:
                   streamable copy. False for passthroughs and split-only outputs.
     ok / error  — ok=False means "could not prepare safely"; the original is
                   left on disk and outputs is empty. Caller quarantines.
+    busy        — True when ANOTHER worker is already converting/splitting this
+                  same source (the per-file prep lock is held). NOT a failure:
+                  outputs is empty, ok stays True, the original is untouched, and
+                  the caller must simply SKIP the file this cycle and retry next
+                  sweep — never quarantine it, never register it raw. This is what
+                  stops two workers (recorder sweep + archiver sweep) from
+                  re-encoding the same file into the same output at once.
     """
     outputs:     list[Path]
     transformed: bool       = False
@@ -148,6 +158,7 @@ class PrepResult:
     converted:   bool       = False
     ok:          bool       = True
     error:       str | None = None
+    busy:        bool       = False
     temps:       list[Path] = field(default_factory=list)  # intermediates to clean
 
     @classmethod
@@ -157,6 +168,10 @@ class PrepResult:
     @classmethod
     def failed(cls, error: str) -> "PrepResult":
         return cls(outputs=[], ok=False, error=error)
+
+    @classmethod
+    def busy_(cls) -> "PrepResult":
+        return cls(outputs=[], busy=True)
 
 
 # ── Probe ───────────────────────────────────────────────────────────────────
@@ -549,6 +564,52 @@ def _split_via_cli(cli: str, src: Path, target_gib: float) -> list[Path] | None:
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
+@contextlib.contextmanager
+def _prep_lock(src: Path):
+    """Cross-process exclusive lock for preparing ONE source file. Yields True if
+    we acquired it, False if another worker already holds it (is converting the
+    same file right now).
+
+    Why this exists: recorder and archiver BOTH run an ingest sweep over the same
+    record folder, and a large HEVC re-encode takes far longer than the 180s
+    sweep interval — so without serialization the next sweep (in either worker)
+    launches a SECOND ffmpeg on the same source, writing the SAME deterministic
+    '<stem>.mp4'/'.tgprep.mp4' output. They clobber each other, neither ever
+    produces an acceptable file, the source is never registered, and the loop
+    repeats forever at 2×CPU. The per-worker InstanceLock can't help: recorder
+    and archiver are DIFFERENT named singletons. The contended resource is the
+    FILE, so the lock is keyed on the file.
+
+    flock (not a PID file) so the kernel frees it if the holder crashes/SIGKILLs —
+    no stale-lock wedge. Non-blocking: a busy file is skipped this cycle and
+    retried next sweep, never queued behind a multi-minute encode.
+    The lock file name is a hash of the resolved source path (paths can contain
+    spaces / arbitrary chars; a hash is a safe fixed-width filename)."""
+    key = hashlib.sha1(str(src.resolve()).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    lock_path = paths.locks_dir() / f"prep-{key}.lock"
+    handle = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            yield False
+            return
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"{os.getpid()} {src.name}\n")
+        handle.flush()
+        yield True
+    finally:
+        if handle is not None and not handle.closed:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
+
+
 def prepare(path: Path, *, split_threshold_bytes: int | None = None) -> PrepResult:
     """Prepare one file for Telegram. See module docstring for the contract.
 
@@ -594,38 +655,47 @@ def prepare(path: Path, *, split_threshold_bytes: int | None = None) -> PrepResu
     if streamable and not oversize:
         return PrepResult.passthrough(path)        # already perfect
 
-    temps: list[Path] = []
+    # Real work (convert and/or split) needed. Serialize it per source file
+    # across ALL workers: if another sweep is already preparing this exact file,
+    # skip it this cycle rather than launch a second clobbering encode. The lock
+    # spans convert AND split so the whole deterministic-output section is
+    # single-writer; it releases the instant we return.
+    with _prep_lock(path) as acquired:
+        if not acquired:
+            log.info("media_prep: %s already being prepared by another worker "
+                     "— skipping this cycle", path.name)
+            return PrepResult.busy_()
 
-    # 1. Convert first (only when needed). The to-split source becomes the
-    #    converted file so we split final, streamable bytes.
-    to_split = path
-    converted: Path | None = None
-    if not streamable:
-        converted = _convert(path, probe)
-        if converted is None:
-            return PrepResult.failed(f"conversion failed: {path.name}")
-        to_split = converted
-        # Re-encoding may have brought it under the ceiling.
-        try:
-            oversize = converted.stat().st_size > ceiling
-        except OSError:
-            oversize = False
+        # 1. Convert first (only when needed). The to-split source becomes the
+        #    converted file so we split final, streamable bytes.
+        to_split = path
+        converted: Path | None = None
+        if not streamable:
+            converted = _convert(path, probe)
+            if converted is None:
+                return PrepResult.failed(f"conversion failed: {path.name}")
+            to_split = converted
+            # Re-encoding may have brought it under the ceiling.
+            try:
+                oversize = converted.stat().st_size > ceiling
+            except OSError:
+                oversize = False
 
-    # 2. Split if still oversized.
-    if oversize:
-        parts = _split(to_split, chunk_target)
-        if parts is None:
-            _unlink(converted)                     # clean the intermediate
-            return PrepResult.failed(f"split failed: {path.name}")
-        if converted is not None:
-            _unlink(converted)                     # intermediate consumed by split
-        return PrepResult(outputs=parts, transformed=True, individual=True,
-                          converted=converted is not None)
+        # 2. Split if still oversized.
+        if oversize:
+            parts = _split(to_split, chunk_target)
+            if parts is None:
+                _unlink(converted)                 # clean the intermediate
+                return PrepResult.failed(f"split failed: {path.name}")
+            if converted is not None:
+                _unlink(converted)                 # intermediate consumed by split
+            return PrepResult(outputs=parts, transformed=True, individual=True,
+                              converted=converted is not None)
 
-    # Converted but within size → single streamable output.
-    assert converted is not None
-    return PrepResult(outputs=[converted], transformed=True, individual=False,
-                      converted=True)
+        # Converted but within size → single streamable output.
+        assert converted is not None
+        return PrepResult(outputs=[converted], transformed=True, individual=False,
+                          converted=True)
 
 
 def _unlink(path: Path | None) -> None:

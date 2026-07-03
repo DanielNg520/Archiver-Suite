@@ -387,6 +387,12 @@ def _reconcile_dir(
         # split_threshold_bytes (recorder split mode) lowers the split trigger
         # below the default ~3.9 GiB ceiling for this scan dir only.
         prep = media_prep.prepare(f, split_threshold_bytes=split_threshold_bytes)
+        if prep.busy:
+            # Another worker's sweep (recorder/orphaned) is already converting or
+            # splitting this same file — skip this pass, retry next, so we don't
+            # launch a second clobbering encode onto the same output.
+            report.skipped_unstable += 1
+            continue
         if not prep.ok:
             # Couldn't make it streamable safely. Leave the original on disk
             # (never lose bytes); it is retried next pass.

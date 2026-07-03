@@ -169,6 +169,8 @@ class PreparedResult:
     prep_ok:     bool                = True
     transformed: bool                = False   # prep replaced the original
     error:       str | None          = None
+    busy:        bool                = False   # another worker is preparing this
+                                               # same source now; skip, retry next
 
     @property
     def inserted(self) -> int:
@@ -251,6 +253,11 @@ def register_media(
     except Exception as e:                       # pragma: no cover — defensive
         log.exception("register_media: prepare raised on %s", path)
         return PreparedResult(prep_ok=False, error=str(e))
+    if prep.busy:
+        # Another worker's sweep is already converting/splitting this exact file.
+        # Not a failure and not raw-registerable — leave it for the next sweep,
+        # by which time the holder will have registered it and retired the source.
+        return PreparedResult(prep_ok=True, busy=True)
     if not prep.ok:
         return PreparedResult(prep_ok=False, error=prep.error)
 

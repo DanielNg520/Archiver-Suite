@@ -342,6 +342,29 @@ def test_flv_not_kept_as_document(tmp: Path) -> None:
     store.close()
 
 
+def test_prep_lock_busy(tmp: Path) -> None:
+    print("\n── concurrent prepare() of one file: second is 'busy', not a "
+          "second encode ──")
+    # A file that needs real work (mkv → remux). While one worker holds the
+    # per-file prep lock, a second prepare() of the SAME file must return busy
+    # (skip this cycle) instead of launching a clobbering parallel encode.
+    mkv = tmp / "contended.mkv"
+    make_video(mkv, seconds=2, vcodec="libx264", acodec="aac")
+
+    with media_prep._prep_lock(mkv) as acquired:
+        check(acquired, "first holder acquires the per-file prep lock")
+        res = media_prep.prepare(mkv)
+        check(res.busy and res.ok and not res.transformed and res.outputs == [],
+              "prepare() while the lock is held → busy (no output, original kept)")
+        check(mkv.exists(), "the contended source is left untouched while busy")
+
+    # Lock released → prepare() now does the real work.
+    res = media_prep.prepare(mkv)
+    check(res.ok and res.transformed and not res.busy and len(res.outputs) == 1,
+          "once the lock is free, prepare() converts normally")
+    media_prep._unlink(res.outputs[0])
+
+
 def main() -> None:
     print("media_prep self-test")
     with tempfile.TemporaryDirectory() as d:
@@ -353,6 +376,7 @@ def main() -> None:
         test_ingest_folder(tmp)
         test_delete_after_split_off(tmp)
         test_flv_not_kept_as_document(tmp)
+        test_prep_lock_busy(tmp)
     test_clean_upload_name()
     print(f"\nALL PASS ({_checks} checks)")
 
