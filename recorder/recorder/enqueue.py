@@ -137,6 +137,17 @@ class EnqueueClient:
         finally:
             store.close()
 
+        if result.busy:
+            # Another worker (an archiver/recorder sweep) is already preparing
+            # this exact recording — NOT a failure. Leave it on disk untouched;
+            # the holder registers it, or the next startup sweep retries. Never
+            # launch a second clobbering encode of the same file.
+            log.info(
+                "enqueue: %s @%s %s already being prepared by another worker — "
+                "left on disk, will be picked up by whichever holds it",
+                platform, username, path.name,
+            )
+            return False
         if not result.prep_ok:
             log.warning(
                 "enqueue: %s @%s %s prep failed (%s) — file kept on disk; the "

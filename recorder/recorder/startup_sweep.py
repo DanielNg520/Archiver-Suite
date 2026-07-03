@@ -230,6 +230,14 @@ def sweep(output_dir: str, db_path: str | None = None,
                 caption_for=lambda out: _caption(username, out),
                 retire_original=_retire_after_split,
             )
+            if result.busy:
+                # Another worker's sweep is already preparing this exact file —
+                # NOT a failure. Skip it this pass (retried next start); never
+                # launch a second clobbering encode of the same source.
+                report.skipped += 1
+                log.info("startup-sweep: %s already being prepared by another "
+                         "worker — skipped this pass", f.name)
+                continue
             if not result.prep_ok:
                 # Couldn't prepare safely (bad/oversize file ffmpeg/AutoSplitter
                 # refused). Leave the original on disk; retried next start.
