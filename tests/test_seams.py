@@ -1518,6 +1518,21 @@ def test_send_streamable_net_seam(tmp: Path) -> None:
     ok(media_name(cap5.sent[0]) == "show.mp4",
        "but Telegram is told the clean name 'show.mp4' (no .tgprep leak)")
 
+    # (f) ALBUM path: _send_video_album_fast uploads each item with
+    # attributes=None (an explicit DocumentAttributeFilename would break Telegram
+    # grouping), so the ".tgprep" strip must happen on the DERIVED filename attr
+    # inside _upload_document — otherwise a split album's ".tgprep" part leaks its
+    # on-disk name to the chat. Drive _upload_document directly with attributes=
+    # None (exactly how the album path calls it) and confirm the wire name is clean.
+    cap6 = _CaptureClient()
+    strategy._client = cap6
+    album_item = asyncio.run(strategy._upload_document(
+        str(tagged), attributes=None, thumb_path=None,
+        supports_streaming=True, force_document=False,
+        progress_cb=None))
+    ok(media_name(album_item) == "show.mp4",
+       "album item (attributes=None) also gets the clean name — no .tgprep leak")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Seam 21 — keep-original documents end-to-end: orphaned.ingest_folder (core)

@@ -839,8 +839,21 @@ class TelethonSendStrategy(SendStrategy):
         DocumentAttributeFilename there wins over the derived basename); the
         thumb is uploaded and baked in when present."""
         assert self._client is not None
+        # The ONE place every big-file send is named for Telegram — single
+        # videos, kept-original documents, and each album item all funnel through
+        # here — so the display name is derived ONCE, from the same _display_name
+        # the single/document paths use (strip the internal ".tgprep" marker AND
+        # any banned word). Doing it here makes the album items clean too: they
+        # pass attributes=None because an explicit DocumentAttributeFilename would
+        # break Telegram's grouping, so the ".tgprep.mp4"/banned on-disk name used
+        # to reach the chat as the item's name. We name the uploaded handle AND
+        # correct the filename attr get_attributes derives (same attr type, just a
+        # cleaned string), so the attribute shape grouping depends on is unchanged.
+        # For the single/document paths this is idempotent: `attributes` already
+        # carries this exact display name, so we just re-assert it.
+        display = self._display_name(send_path)
         handle = await fast_upload.upload_file(
-            self._client, send_path,
+            self._client, send_path, file_name=display,
             connections=self._upload_connections, progress_callback=progress_cb,
         )
         thumb_handle = (
@@ -852,6 +865,10 @@ class TelethonSendStrategy(SendStrategy):
             supports_streaming=supports_streaming,
             force_document=force_document,
         )
+        if display != Path(send_path).name:
+            for a in attrs:
+                if isinstance(a, tg_types.DocumentAttributeFilename):
+                    a.file_name = display
         return tg_types.InputMediaUploadedDocument(
             file=handle, mime_type=mime, attributes=attrs, thumb=thumb_handle,
         )

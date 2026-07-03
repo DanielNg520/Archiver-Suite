@@ -234,6 +234,18 @@ def register_media(
     Never raises for an expected condition — a prep or register failure is
     reported, the original is left on disk, and the caller keeps going."""
     path = Path(path)
+    # Stabilize BEFORE prep — the same "a half-written file must never get a row"
+    # guard register_file runs, lifted ABOVE prepare(). prepare() probes the file
+    # (ffprobe) to decide convert/split/passthrough; probing a file that is still
+    # being written reads an incomplete stream, and a passthrough of that raw file
+    # would enqueue bytes that only look like a valid video once the write
+    # finishes — exactly the wedge that had a raw HEVC re-encoded on every send.
+    # is_stable's stat-sleep-stat catches an in-flight copy; register_file re-checks
+    # each output, so this is the outer of two guards, not a replacement.
+    if not stability.is_stable(path):
+        return PreparedResult(
+            prep_ok=False,
+            error=f"not yet stable (still being written): {path.name}")
     try:
         prep = media_prep.prepare(path, split_threshold_bytes=split_threshold_bytes)
     except Exception as e:                       # pragma: no cover — defensive

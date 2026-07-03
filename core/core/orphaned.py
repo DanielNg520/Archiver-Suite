@@ -33,7 +33,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import media_prep
+from . import media_prep, stability
 from .dedup import MEDIA_EXTENSIONS
 from .deletion import DeletionGuard
 from .files import cleanup_sidecars
@@ -243,6 +243,16 @@ def ingest_folder(
         # what keeps repeated sweeps from re-probing every file.
         if store.has_file_path(key):
             rep.known += 1
+            continue
+
+        # Stabilize BEFORE prep — the same guard reconcile and register_media run.
+        # A loose drop is where mid-copy is MOST common, and prepare() probes/
+        # converts the file: probing a half-written file reads an incomplete
+        # stream (a passthrough would enqueue not-yet-final bytes; a convert would
+        # transcode a partial source). register_file re-checks each OUTPUT, but by
+        # then prep has already acted — so the check must also gate prep's input.
+        if not stability.is_stable(f):
+            rep.unstable += 1
             continue
 
         # ── Media-prep: convert non-streamable formats, split oversize files ──

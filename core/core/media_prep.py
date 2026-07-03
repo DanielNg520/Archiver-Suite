@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -440,7 +441,6 @@ def _find_cli() -> str | None:
     global _cli_cache
     if _cli_cache is not None:
         return None if _cli_cache is False else _cli_cache
-    import shutil
     cli = os.environ.get("AUTOSPLITTER_BIN") or shutil.which("autosplitter")
     _cli_cache = cli or False
     return cli
@@ -513,10 +513,15 @@ def _split_via_cli(cli: str, src: Path, target_gib: float) -> list[Path] | None:
     """Run the AutoSplitter CLI in single-file mode. Exit 0 means it both split
     and passed its own integrity check; exit 2 is an integrity failure. We learn
     the parts from the segment-list it writes, then verify they exist."""
+    # AutoSplitter's CLI auto-classifies the positional arg as file-vs-folder and
+    # always writes parts NEXT TO the source (no --output flag); for a file that
+    # is src.parent, exactly where _segment_parts() looks. (The in-process
+    # run_split still takes an explicit output_dir; only the CLI dropped it.)
+    # We deliberately do NOT pass --remove-original: media_prep owns retiring the
+    # source after its outputs are registered, so the split must leave it in place.
     cmd = [
         cli, str(src),
         "--size", repr(target_gib), "--size-unit", "GiB",
-        "--output", str(src.parent),
     ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
@@ -563,7 +568,15 @@ def prepare(path: Path, *, split_threshold_bytes: int | None = None) -> PrepResu
     probe = _probe(path)
     if probe is None:
         # Unreadable or not actually a video. Leave it to the normal ingest path
-        # (it will hash/skip as today). Not our failure to own.
+        # (it will hash/skip as today). Not our failure to own — and crucially the
+        # recorder's raw-fallback contract DEPENDS on this: a non-streamable or
+        # not-yet-probeable recording is enqueued RAW and the dispatcher's
+        # send-time streamable net converts it at upload, so a recording is never
+        # lost. Refusing here would strand legitimate raw recordings. The
+        # incomplete-file case that wedged the queue is caught upstream by the
+        # ingest layer's stabilize-before-prep gate (register_media, orphaned, and
+        # reconcile all is_stable() first), so a half-written file never reaches
+        # prep to be passthrough-registered raw.
         return PrepResult.passthrough(path)
 
     streamable = _is_streamable(probe)
