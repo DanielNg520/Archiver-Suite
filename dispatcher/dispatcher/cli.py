@@ -6,6 +6,9 @@ Argparse-based CLI. Subcommands:
   dispatcher start                      Run the drain loop in foreground.
   dispatcher status                     Queue counts + top pending rows.
   dispatcher check-routes [token …]     Verify chat_id/.t<topic> dests exist.
+  dispatcher burner login               Register the optional burner account.
+  dispatcher burner chats add <id…>     Route chats via the burner. remove/list.
+  dispatcher burner status              Show burner config without connecting.
   dispatcher banned-words add <word…>   Add words stripped from names/captions.
   dispatcher banned-words remove <w…>   Remove banned words.  list  Show them.
   dispatcher queue list [--status S]    List rows; default newest 50.
@@ -27,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from pathlib import Path
@@ -113,6 +117,7 @@ async def _run_drain(config: DispatcherConfig) -> None:
         fast_album           = config.fast_album,
         progress         = ProgressReporter(),
         sanitizer        = config.sanitizer,
+        burner           = config.burner,
     ) as send_strategy:
         try:
             await drain_forever(
@@ -142,13 +147,18 @@ def cmd_start(args: argparse.Namespace) -> int:
     assert config.telegram is not None
     _assert_video_metadata_backend()
     conns = config.upload_connections
-    termui.banner("dispatcher", [
+    rows = [
         ("upload", f"{conns} connection{'' if conns == 1 else 's'} per file"
                    f"{' (serial)' if conns <= 1 else ''}"),
         ("session", config.telegram.session_name),
         ("chat", str(config.default_chat_id)),
         ("queue", config.db_path),
-    ], subtitle="telegram uploader")
+    ]
+    if config.burner is not None:
+        rows.append(("burner", f"{len(config.burner.chat_ids)} chat"
+                     f"{'' if len(config.burner.chat_ids) == 1 else 's'} → "
+                     f"{config.burner.session_name}"))
+    termui.banner("dispatcher", rows, subtitle="telegram uploader")
     try:
         with DispatcherInstanceLock(config.telegram.session_name):
             asyncio.run(_run_drain(config))
@@ -175,6 +185,7 @@ async def _run_check_routes(
         api_hash     = config.telegram.api_hash,
         phone        = config.telegram.phone,
         session_name = config.telegram.session_name,
+        burner       = config.burner,
     ) as strat:
         for chat_id, topic_id in dests:
             # Same peer construction the sender uses, so a green check means the
@@ -284,6 +295,156 @@ def cmd_banned_words(args: argparse.Namespace) -> int:
                      accent="green" if removed else "yellow")
         return 0
     return 2
+
+
+# ── Subcommand: burner ────────────────────────────────────────────────────
+
+async def _burner_login(session: str, api_id: int, api_hash: str,
+                        phone: str) -> str:
+    """Interactively authorize the burner session (Telethon prompts for the code
+    on this TTY) and return the logged-in account's display name. Kept separate
+    from the send strategy: registration is a one-off manual step, not a drain."""
+    from telethon import TelegramClient  # local: only the login path needs it
+    client = TelegramClient(session, api_id, api_hash)
+    await client.start(phone=phone)
+    me = await client.get_me()
+    await client.disconnect()
+    name = " ".join(filter(None, [getattr(me, "first_name", None),
+                                  getattr(me, "last_name", None)])) \
+        or getattr(me, "username", None) or str(getattr(me, "id", "?"))
+    return name
+
+
+def cmd_burner_login(args: argparse.Namespace) -> int:
+    """Register (log in) the optional burner account — the ONLY way to create its
+    session. api_id/api_hash default to the primary's TELEGRAM_API_* when not
+    given; phone/session are persisted to the dispatcher .env so `start` picks
+    the burner up automatically. Requires a TTY for the login code."""
+    import os as _os
+    from .config import (
+        dispatcher_env_path, burner_session_name_or_default, upsert_env_vars,
+    )
+    from core.env import MissingEnvVar
+
+    api_id_raw = args.api_id or _os.environ.get("TELEGRAM_BURNER_API_ID") \
+        or _os.environ.get("TELEGRAM_API_ID")
+    api_hash = args.api_hash or _os.environ.get("TELEGRAM_BURNER_API_HASH") \
+        or _os.environ.get("TELEGRAM_API_HASH")
+    phone = args.phone or _os.environ.get("TELEGRAM_BURNER_PHONE")
+    if not api_id_raw or not api_hash:
+        raise MissingEnvVar(
+            "burner login needs api_id/api_hash — pass --api-id/--api-hash or "
+            "set TELEGRAM_API_ID/TELEGRAM_API_HASH in the dispatcher .env")
+    if not phone:
+        raise RuntimeError("burner login needs a phone — pass --phone")
+    try:
+        api_id = int(api_id_raw)
+    except ValueError:
+        raise RuntimeError(f"api_id {api_id_raw!r} is not an integer")
+
+    session = args.session or burner_session_name_or_default()
+    _os.makedirs(_os.path.dirname(session) or ".", exist_ok=True)
+    if not sys.stdin.isatty():
+        raise RuntimeError(
+            "burner login is interactive (Telegram sends a code) — run it from "
+            "a terminal, not a headless/service context")
+
+    name = asyncio.run(_burner_login(session, api_id, api_hash, phone))
+
+    # Persist so config.BurnerCreds.from_env resolves the burner on next start.
+    values = {"TELEGRAM_BURNER_SESSION": session, "TELEGRAM_BURNER_PHONE": phone}
+    if args.api_id:
+        values["TELEGRAM_BURNER_API_ID"] = str(api_id)
+    if args.api_hash:
+        values["TELEGRAM_BURNER_API_HASH"] = api_hash
+    upsert_env_vars(dispatcher_env_path(), values)
+
+    print()
+    termui.field("burner", f"logged in as {name}", accent="green")
+    termui.field("session", session, accent="dim")
+    if not _os.environ.get("BURNER_CHAT_IDS", "").strip():
+        termui.field("next", "add dedicated chats: dispatcher burner chats add "
+                     "<chat_id …>", accent="yellow")
+    return 0
+
+
+def _burner_chat_ids() -> list[str]:
+    """Current normalized burner chat set from the env, order-stable."""
+    raw = os.environ.get("BURNER_CHAT_IDS", "")
+    out: list[str] = []
+    for tok in raw.replace(",", " ").split():
+        r = parse_route(tok)
+        if r is not None and r.chat_id not in out:
+            out.append(r.chat_id)
+    return out
+
+
+def cmd_burner_chats(args: argparse.Namespace) -> int:
+    """Manage the burner's dedicated chats (BURNER_CHAT_IDS) via the .env — the
+    chats routed through the burner instead of the primary. CLI-only, so the
+    routing set is never hand-edited."""
+    from .config import dispatcher_env_path, upsert_env_vars
+    action = args.chats_command
+    current = _burner_chat_ids()
+
+    if action == "list":
+        if not current:
+            termui.field("burner chats", "none set", accent="yellow")
+        else:
+            print()
+            for c in current:
+                termui.field("•", c, accent="cyan")
+        return 0
+
+    targets: list[str] = []
+    for tok in args.chat_ids:
+        r = parse_route(tok)
+        if r is None:
+            termui.field(tok, "invalid chat_id / route token", accent="red")
+            continue
+        targets.append(r.chat_id)
+
+    if action == "add":
+        new = current + [c for c in targets if c not in current]
+        changed = [c for c in targets if c not in current]
+    else:  # remove
+        drop = set(targets)
+        new = [c for c in current if c not in drop]
+        changed = [c for c in targets if c in current]
+
+    upsert_env_vars(dispatcher_env_path(), {"BURNER_CHAT_IDS": ",".join(new)})
+    verb = "added" if action == "add" else "removed"
+    termui.field(verb, ", ".join(changed) if changed else "(no change)",
+                 accent="green" if changed else "yellow")
+    termui.field("burner chats", ", ".join(new) if new else "(none)", accent="dim")
+    return 0
+
+
+def cmd_burner_status(args: argparse.Namespace) -> int:
+    """Show the burner's configuration WITHOUT connecting: whether it's active,
+    its session, and its dedicated chats. `require_telegram=False` so it works
+    even when the primary creds aren't loadable."""
+    from .config import burner_session_name_or_default
+    config = DispatcherConfig.load(require_telegram=False)
+    print()
+    chats = _burner_chat_ids()
+    session = burner_session_name_or_default()
+    session_exists = Path(session + ".session").exists()
+    phone = os.environ.get("TELEGRAM_BURNER_PHONE", "").strip()
+
+    active = bool(chats) and bool(phone or session_exists)
+    termui.field("burner", "active" if active else "inactive (feature off)",
+                 accent="green" if active else "yellow")
+    termui.field("session", f"{session}"
+                 f"{'  ✓ authorized' if session_exists else '  (not logged in)'}",
+                 accent="dim")
+    termui.field("phone", phone or "(unset)", accent="dim")
+    termui.field("chats", ", ".join(chats) if chats else "(none)",
+                 accent="cyan" if chats else "yellow")
+    if not active:
+        termui.field("hint", "register with `dispatcher burner login` then "
+                     "`dispatcher burner chats add <chat_id …>`", accent="dim")
+    return 0
 
 
 # ── Subcommand: status ────────────────────────────────────────────────────
@@ -453,6 +614,28 @@ def _build_parser() -> argparse.ArgumentParser:
     b_rm.add_argument("words", nargs="+")
     banned_sub.add_parser("list", help="list the current banned words")
 
+    p_burner = sub.add_parser(
+        "burner", help="register/manage the optional burner account (CLI-only)")
+    burner_sub = p_burner.add_subparsers(dest="burner_command", required=True)
+    b_login = burner_sub.add_parser(
+        "login", help="interactively log in the burner account + persist its creds")
+    b_login.add_argument("--phone", help="burner phone (else TELEGRAM_BURNER_PHONE)")
+    b_login.add_argument("--api-id", dest="api_id",
+                         help="burner api_id (else the primary's TELEGRAM_API_ID)")
+    b_login.add_argument("--api-hash", dest="api_hash",
+                         help="burner api_hash (else the primary's TELEGRAM_API_HASH)")
+    b_login.add_argument("--session",
+                         help="session file path (else <primary>-burner)")
+    b_chats = burner_sub.add_parser(
+        "chats", help="manage the burner's dedicated chats (BURNER_CHAT_IDS)")
+    chats_sub = b_chats.add_subparsers(dest="chats_command", required=True)
+    bc_add = chats_sub.add_parser("add", help="route one or more chats via the burner")
+    bc_add.add_argument("chat_ids", nargs="+")
+    bc_rm = chats_sub.add_parser("remove", help="stop routing chats via the burner")
+    bc_rm.add_argument("chat_ids", nargs="+")
+    chats_sub.add_parser("list", help="list the burner's dedicated chats")
+    burner_sub.add_parser("status", help="show burner config without connecting")
+
     p_queue = sub.add_parser("queue", help="queue operations")
     queue_sub = p_queue.add_subparsers(dest="queue_command", required=True)
 
@@ -496,6 +679,9 @@ _DISPATCHERS = {
     ("start", None):                cmd_start,
     ("status", None):               cmd_status,
     ("check-routes", None):         cmd_check_routes,
+    ("burner", "login"):            cmd_burner_login,
+    ("burner", "chats"):            cmd_burner_chats,
+    ("burner", "status"):           cmd_burner_status,
     ("banned-words", "add"):        cmd_banned_words,
     ("banned-words", "remove"):     cmd_banned_words,
     ("banned-words", "list"):       cmd_banned_words,
@@ -517,7 +703,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sub = getattr(args, "queue_command", None) \
           or getattr(args, "config_command", None) \
-          or getattr(args, "banned_command", None)
+          or getattr(args, "banned_command", None) \
+          or getattr(args, "burner_command", None)
     handler = _DISPATCHERS.get((args.command, sub))
     if handler is None:
         log.error("cli: no handler for %s/%s", args.command, sub)

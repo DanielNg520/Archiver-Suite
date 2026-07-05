@@ -60,6 +60,23 @@ def _resolve_peer(chat_id: str) -> Any:
     return PeerUser(n)
 
 
+def peer_chat_id(peer: Any) -> str | None:
+    """Inverse of _resolve_peer: a Telethon peer (or raw @username string) → the
+    canonical chat_id string that produced it, so a caller holding only the peer
+    can compare it against parse_route-normalized chat_ids (e.g. the burner set).
+    Returns None for a peer shape we don't recognize — the caller treats that as
+    'not a burner chat' and stays on the primary."""
+    if isinstance(peer, str):
+        return peer.strip()
+    if isinstance(peer, PeerChannel):
+        return f"-100{peer.channel_id}"
+    if isinstance(peer, PeerChat):
+        return f"-{peer.chat_id}"
+    if isinstance(peer, PeerUser):
+        return str(peer.user_id)
+    return None
+
+
 def _user_key(platform: str, username: str) -> str:
     return f"TELEGRAM_CHAT_ID_{platform.upper()}_{username.upper()}"
 

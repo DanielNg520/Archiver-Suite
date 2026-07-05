@@ -70,7 +70,8 @@ from telethon.tl import functions, types as tg_types
 from core.files import media_bucket
 from core import media_prep, Sanitizer
 
-from . import fast_upload, image_fix
+from . import fast_upload, image_fix, tg_router
+from .config import BurnerCreds
 from .keepalive import KeepAliveConnectionTcpFull
 from .media_meta import make_thumbnail, probe_video
 from .progress import ProgressReporter
@@ -211,11 +212,24 @@ class TelethonSendStrategy(SendStrategy):
         fast_album: bool = True,        # parallel video-album path (see config)
         progress: ProgressReporter | None = None,
         sanitizer: Sanitizer | None = None,
+        burner: BurnerCreds | None = None,
     ):
         self._api_id           = api_id
         self._api_hash         = api_hash
         self._phone            = phone
         self._session_name     = session_name
+        # Optional second account (None ⇒ feature off). Its client is built
+        # LAZILY on first burner-routed send so a dead/absent burner never
+        # blocks startup or any primary-only send. See _client_for (Phase 3).
+        self._burner           = burner
+        self._burner_client: TelegramClient | None = None
+        # The client the CURRENT send uses. Set at the top of each public entry
+        # point (send / send_album / check_destination) via _client_for; every
+        # send-time helper reads it through the _sender property. None ⇒ primary,
+        # so with no burner configured _sender is always the primary and the whole
+        # path is byte-for-byte what it was before this feature. Safe as a single
+        # field because the drain is SERIAL — one send in flight at a time.
+        self._active_client: TelegramClient | None = None
         self._max_retries      = max_retries
         self._retry_base_delay = retry_base_delay
         self._max_flood_wait_s = max_flood_wait_s
@@ -226,6 +240,13 @@ class TelethonSendStrategy(SendStrategy):
         self._progress = progress
         self._sanitizer = sanitizer or Sanitizer([])
         self._client: TelegramClient | None = None
+
+    @property
+    def _sender(self) -> TelegramClient:
+        """The client the in-flight send talks to: the account _client_for chose,
+        or the primary when nothing set it (no burner / read-only path)."""
+        assert self._client is not None, "use as async context manager"
+        return self._active_client or self._client
 
     def _display_name(self, path: str) -> str:
         """The filename Telegram should show: strip the internal ".tgprep"
@@ -274,19 +295,22 @@ class TelethonSendStrategy(SendStrategy):
         Called on both a stall and a network error. Both halves are deadline-
         bound — a wedged socket can hang disconnect() too — and best-effort: the
         retry's send surfaces any lingering connection problem as a normal error
-        that loops back here until it reconnects or the retry budget runs out."""
-        assert self._client is not None
+        that loops back here until it reconnects or the retry budget runs out.
+
+        Operates on _sender so a reconnect during a burner-routed send re-homes
+        the burner's socket, not the primary's."""
+        client = self._sender
         try:
-            await asyncio.wait_for(self._client.disconnect(), timeout=30)
+            await asyncio.wait_for(client.disconnect(), timeout=30)
         except Exception as e:
             log.warning("telethon: disconnect after stall failed: %s", e)
         try:
-            await asyncio.wait_for(self._client.connect(), timeout=30)
+            await asyncio.wait_for(client.connect(), timeout=30)
             log.info("telethon: reconnected after stall")
         except Exception as e:
             log.warning("telethon: reconnect after stall failed: %s", e)
 
-    async def __aenter__(self) -> "TelethonSendStrategy":
+    def _build_client(self, session_name: str, api_id: int, api_hash: str) -> TelegramClient:
         # auto_reconnect=False is LOAD-BEARING. This dispatcher already owns
         # reconnection (the stall watchdog + the ConnectionError arm both call
         # _force_reconnect). Telethon's own background auto_reconnect is a SECOND
@@ -299,8 +323,8 @@ class TelethonSendStrategy(SendStrategy):
         # the pending send with a ConnectionError that WE then handle. One
         # reconnect authority, no race. (Same applies to fast_upload's senders —
         # they're created auto_reconnect=False for the same reason.)
-        self._client = TelegramClient(
-            self._session_name, self._api_id, self._api_hash,
+        return TelegramClient(
+            session_name, api_id, api_hash,
             auto_reconnect=False,
             # Arm TCP keepalive on every socket (incl. fast_upload's senders and
             # _force_reconnect-rebuilt connections, which build from this class)
@@ -313,33 +337,89 @@ class TelethonSendStrategy(SendStrategy):
             # authority there is no race. See dispatcher.keepalive.
             connection=KeepAliveConnectionTcpFull,
         )
+
+    async def _connect_authorized(
+        self, client: TelegramClient, session_name: str, phone: str,
+    ) -> None:
         # Connect and verify authorization WITHOUT Telethon's interactive login.
         # A headless daemon (launchd) has no terminal: client.start() would block
         # forever on the code prompt, or EOF into a restart crash-loop, on a dead
         # session. Fail fast with a clear, actionable message instead. Only when
         # a human is at a TTY (manual first-run) do we allow the interactive
         # login flow so the session can be created in the first place.
-        await self._client.connect()
-        if not await self._client.is_user_authorized():
+        await client.connect()
+        if not await client.is_user_authorized():
             if sys.stdin.isatty():
-                await self._client.start(phone=self._phone)
+                await client.start(phone=phone)
             else:
-                await self._client.disconnect()
+                await client.disconnect()
                 raise SessionUnauthorized(
-                    f"Telegram session {self._session_name!r} is not authorized "
+                    f"Telegram session {session_name!r} is not authorized "
                     "(never logged in, revoked, expired, or the account was "
                     "deactivated). Run `dispatcher start` once from an "
                     "interactive terminal to log in; refusing to block a "
                     "headless daemon on a login prompt."
                 )
-        log.info("telethon: connected (session=%s)", self._session_name)
+        log.info("telethon: connected (session=%s)", session_name)
+
+    async def __aenter__(self) -> "TelethonSendStrategy":
+        self._client = self._build_client(
+            self._session_name, self._api_id, self._api_hash)
+        await self._connect_authorized(
+            self._client, self._session_name, self._phone)
         return self
+
+    async def _client_for(self, peer: Any) -> TelegramClient:
+        """Pick the account that sends to `peer`. THE additive-burner seam.
+
+        When no burner is configured this returns the primary immediately —
+        before inspecting `peer` at all — so an install without a burner runs
+        the exact same single-client path as before this feature existed.
+
+        With a burner configured, a destination in its dedicated chat set is
+        sent from the burner (lazily connected+authorized on first use). If the
+        burner can't come up — unauthorized, connect failure — we log once and
+        FALL BACK to the primary rather than fail the send: the burner is the
+        expendable, optional account, so its absence must never block delivery."""
+        assert self._client is not None, "use as async context manager"
+        if self._burner is None:
+            return self._client
+        chat_id = tg_router.peer_chat_id(peer)
+        if chat_id is None or not self._burner.routes(chat_id):
+            return self._client
+        # Dedicated to the burner — bring it up lazily, once.
+        if self._burner_client is None:
+            client = self._build_client(
+                self._burner.session_name,
+                self._burner.api_id, self._burner.api_hash)
+            try:
+                await self._connect_authorized(
+                    client, self._burner.session_name, self._burner.phone)
+            except Exception as e:
+                # Best-effort teardown of the half-open client, then fall back.
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                log.warning(
+                    "telethon: burner unavailable (%s) — routing %s via the "
+                    "primary account", e, chat_id)
+                return self._client
+            self._burner_client = client
+        return self._burner_client
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self._progress_done()
         if self._client is not None:
             await self._client.disconnect()
             log.info("telethon: disconnected")
+        # Disconnect the burner only if it was ever lazily built (Phase 3).
+        if self._burner_client is not None:
+            try:
+                await self._burner_client.disconnect()
+                log.info("telethon: burner disconnected")
+            except Exception as e:  # best-effort; primary already down
+                log.warning("telethon: burner disconnect failed: %s", e)
 
     async def check_destination(
         self, *, peer: Any, topic_id: int | None = None,
@@ -349,9 +429,9 @@ class TelethonSendStrategy(SendStrategy):
         confirms the forum topic by fetching its root message — a forum topic's
         thread id IS the id of that creation message, so a None result means the
         topic doesn't exist (or the chat isn't a forum). Powers `check-routes`."""
-        assert self._client is not None, "use as async context manager"
+        self._active_client = await self._client_for(peer)
         try:
-            ent = await self._client.get_entity(peer)
+            ent = await self._sender.get_entity(peer)
         except Exception as e:
             return False, f"chat NOT found ({type(e).__name__})"
         name = (getattr(ent, "title", None) or getattr(ent, "username", None)
@@ -359,7 +439,7 @@ class TelethonSendStrategy(SendStrategy):
         if topic_id is None:
             return True, str(name)
         try:
-            msg = await self._client.get_messages(ent, ids=topic_id)
+            msg = await self._sender.get_messages(ent, ids=topic_id)
         except Exception as e:
             return False, f"chat OK ({name}) — topic {topic_id} check errored ({type(e).__name__})"
         if msg is None:
@@ -397,7 +477,7 @@ class TelethonSendStrategy(SendStrategy):
         Returns SendResult; never raises (caller logic is simpler if it
         can branch on .ok / .flood_wait_s instead of try/except).
         """
-        assert self._client is not None, "use as async context manager"
+        self._active_client = await self._client_for(peer)
 
         if not Path(file_path).exists():
             return SendResult(ok=False, error=f"file missing on disk: {file_path}")
@@ -474,7 +554,7 @@ class TelethonSendStrategy(SendStrategy):
                         send_path, attributes=doc_attrs, thumb_path=None,
                         supports_streaming=False, force_document=True,
                         progress_cb=self._progress_cb(file_path))
-                    await self._client.send_file(peer, media, caption=doc_caption,
+                    await self._sender.send_file(peer, media, caption=doc_caption,
                                                  reply_to=topic_id)
                 return await self._send_with_retries(
                     _do_doc, what=f"{Path(file_path).name} (document)",
@@ -514,11 +594,11 @@ class TelethonSendStrategy(SendStrategy):
                         send_path, attributes=attributes, thumb_path=thumb,
                         supports_streaming=True, force_document=False,
                         progress_cb=self._progress_cb(file_path))
-                    await self._client.send_file(peer, media, caption=caption,
+                    await self._sender.send_file(peer, media, caption=caption,
                                                  reply_to=topic_id)
             else:
                 async def _do():
-                    await self._client.send_file(
+                    await self._sender.send_file(
                         peer, send_path, caption=caption, supports_streaming=True,
                         attributes=attributes, thumb=thumb, reply_to=topic_id,
                         progress_callback=self._progress_cb(file_path),
@@ -546,7 +626,7 @@ class TelethonSendStrategy(SendStrategy):
             return result
         try:
             async def _do_retry():
-                await self._client.send_file(
+                await self._sender.send_file(
                     peer, safe, caption=caption, supports_streaming=True,
                     reply_to=topic_id,
                     progress_callback=self._progress_cb(file_path),
@@ -585,7 +665,7 @@ class TelethonSendStrategy(SendStrategy):
         responsible for pre-filtering missing files (drain does this so it
         can mark the missing ones failed individually).
         """
-        assert self._client is not None, "use as async context manager"
+        self._active_client = await self._client_for(peer)
         if not file_paths:
             return SendResult(ok=False, error="send_album: empty file list")
 
@@ -623,12 +703,12 @@ class TelethonSendStrategy(SendStrategy):
         # cleanly (verified live). Either path leaves the converter alone:
         # a per-item Telegram rejection surfaces as media_empty and the drain's
         # recover_media_empty re-sends that item with the streamable net ON.
-        if self._fast_album and fast_upload._internals_present(self._client):
+        if self._fast_album and fast_upload._internals_present(self._sender):
             return await self._send_video_album_fast(
                 peer, file_paths, captions, topic_id=topic_id)
 
         async def _do():
-            await self._client.send_file(
+            await self._sender.send_file(
                 peer, file_paths, caption=captions, supports_streaming=True,
                 reply_to=topic_id,
                 progress_callback=self._progress_cb(
@@ -679,9 +759,8 @@ class TelethonSendStrategy(SendStrategy):
         once, which the home DC would throttle. A retry re-uploads from scratch
         (fresh file_ids): correct, if not free — efficiency is the lowest build
         priority and album retries are rare."""
-        assert self._client is not None
         n = len(file_paths)
-        client = self._client
+        client = self._sender
 
         async def _parsed_caption(text: str | None):
             """Match the native list send's caption handling (markdown parse via
@@ -776,7 +855,7 @@ class TelethonSendStrategy(SendStrategy):
             # attribution isn't knowable here — the heartbeat still shows
             # name, album size, and live byte counts.
             async def _do():
-                await self._client.send_file(
+                await self._sender.send_file(
                     peer, prepared, caption=captions, supports_streaming=True,
                     reply_to=topic_id,
                     progress_callback=self._progress_cb(
@@ -807,7 +886,7 @@ class TelethonSendStrategy(SendStrategy):
                     retry_paths.append(orig)
 
             async def _do_retry():
-                await self._client.send_file(
+                await self._sender.send_file(
                     peer, retry_paths, caption=captions, supports_streaming=True,
                     reply_to=topic_id,
                     progress_callback=self._progress_cb(
@@ -838,7 +917,6 @@ class TelethonSendStrategy(SendStrategy):
         place. `attributes` is passed straight to get_attributes (an explicit
         DocumentAttributeFilename there wins over the derived basename); the
         thumb is uploaded and baked in when present."""
-        assert self._client is not None
         # The ONE place every big-file send is named for Telegram — single
         # videos, kept-original documents, and each album item all funnel through
         # here — so the display name is derived ONCE, from the same _display_name
@@ -853,11 +931,11 @@ class TelethonSendStrategy(SendStrategy):
         # carries this exact display name, so we just re-assert it.
         display = self._display_name(send_path)
         handle = await fast_upload.upload_file(
-            self._client, send_path, file_name=display,
+            self._sender, send_path, file_name=display,
             connections=self._upload_connections, progress_callback=progress_cb,
         )
         thumb_handle = (
-            await self._client.upload_file(thumb_path) if thumb_path else None
+            await self._sender.upload_file(thumb_path) if thumb_path else None
         )
         attrs, mime = tg_utils.get_attributes(
             send_path,

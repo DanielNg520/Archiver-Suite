@@ -69,7 +69,35 @@ dispatcher config get  <key> [--platform P] [--user U]
 dispatcher config set  <key> <value> [--platform P] [--user U]
 dispatcher config unset <key> [--platform P] [--user U]
 dispatcher config list           # all scoped overrides
+dispatcher burner login          # register the optional 2nd (burner) account
+dispatcher burner chats add <id…># route those chats via the burner
+dispatcher burner chats list     # (remove <id…> also)
+dispatcher burner status         # show burner config without connecting
 ```
+
+### Optional burner account
+
+A second, **entirely optional** Telegram account that becomes the sender for a
+dedicated set of chats; the primary account stays the sender for everything else
+and is the **fallback** for the burner's chats if the burner can't come up. When
+no burner is registered nothing changes — the pipeline is byte-for-byte the
+single-account path.
+
+Set it up through the CLI only (no hand-editing `.env`):
+
+```
+dispatcher burner login --phone +49…          # interactive; creates the session
+dispatcher burner chats add -100123 100456    # dash-free numeric ok → -100456
+dispatcher burner status                       # verify active + authorized
+```
+
+`login` reuses the primary's `TELEGRAM_API_ID`/`TELEGRAM_API_HASH` unless you
+pass `--api-id`/`--api-hash`, and persists `TELEGRAM_BURNER_SESSION` /
+`TELEGRAM_BURNER_PHONE` / `BURNER_CHAT_IDS` to the dispatcher `.env`. The burner
+client is built **lazily** on the first send to one of its chats, so a
+misconfigured or logged-out burner never blocks startup or any primary send —
+it just logs a warning and the send goes out on the primary. **Restart the
+dispatcher** after registering, so `start` picks the burner up.
 
 ### Queue-shaping behaviors (in the drain loop)
 

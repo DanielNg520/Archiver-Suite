@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 
 from core import PolicyStore, DEFAULT_DB_PATH, Sanitizer, ReloadingSanitizer
 from core import env
+from core.routing import parse_route
 
 # Load dispatcher's own .env BEFORE any os.environ reads. This is a side
 # effect on import; matches archiver's pattern. Test code that needs a
@@ -51,6 +52,45 @@ def session_name_or_default() -> str:
                 os.path.expanduser("~/.config/dispatcher/session"))
 
 
+def dispatcher_env_path() -> Path:
+    """The dispatcher's own .env file — the single store the `burner` CLI writes.
+    Kept as a function (not a constant) so tests can point HOME elsewhere."""
+    return Path.home() / ".config" / "dispatcher" / ".env"
+
+
+def burner_session_name_or_default() -> str:
+    """Where the burner session file lives: TELEGRAM_BURNER_SESSION if set, else
+    a sibling of the primary session. Available without full creds so the
+    `burner` CLI and `burner status` can locate/report it."""
+    explicit = _opt("TELEGRAM_BURNER_SESSION")
+    if explicit:
+        return explicit
+    return session_name_or_default() + "-burner"
+
+
+def upsert_env_vars(path: Path, values: dict[str, str]) -> None:
+    """Idempotently set KEY=VALUE lines in a dotenv file, preserving unrelated
+    lines, comments, and ordering. A key already present is rewritten in place;
+    a new key is appended. This is how the `burner` CLI persists registration —
+    the ONLY writer of the burner env vars, so users never hand-edit .env.
+    Also updates os.environ so the running process sees the change immediately."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    remaining = dict(values)
+    out: list[str] = []
+    for ln in lines:
+        stripped = ln.strip()
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped else None
+        if key in remaining and not stripped.startswith("#"):
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(ln)
+    for key, val in remaining.items():
+        out.append(f"{key}={val}")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    os.environ.update(values)
+
+
 # ── Telegram credentials ──────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -73,6 +113,59 @@ class TelegramCreds:
         )
 
 
+# ── Optional burner account ────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class BurnerCreds:
+    """A second, optional Telegram account. The burner is the SENDER for its
+    dedicated chats (`chat_ids`); the primary account is the fallback for those
+    chats and the default sender for everything else.
+
+    Credentials mirror TelegramCreds. api_id/api_hash default to the primary's
+    when their own vars are unset (the common case: one Telegram app, two
+    logins) — only session_name and phone must differ. The feature is OFF (this
+    returns None) unless BURNER_CHAT_IDS is non-empty AND a distinct burner
+    session or phone is configured; an inert burner would just be a dead client.
+    """
+    api_id:       int
+    api_hash:     str
+    phone:        str
+    session_name: str
+    # Canonical (parse_route-normalized) chat_ids routed through the burner.
+    chat_ids:     frozenset[str]
+
+    def routes(self, chat_id: str) -> bool:
+        """True iff `chat_id` (as it appears in items.chat_id) is dedicated to
+        the burner. Compared against the normalized set, so dash-free/@handle
+        input forms match the canonical value the dispatcher routes on."""
+        return chat_id in self.chat_ids
+
+    @classmethod
+    def from_env(cls, primary: "TelegramCreds") -> "BurnerCreds | None":
+        raw_chats = _opt("BURNER_CHAT_IDS")
+        chat_ids = frozenset(
+            r.chat_id
+            for tok in raw_chats.replace(",", " ").split()
+            if (r := parse_route(tok)) is not None
+        )
+        session = _opt("TELEGRAM_BURNER_SESSION")
+        phone   = _opt("TELEGRAM_BURNER_PHONE")
+        # Inert unless there is both something to route AND a distinct login.
+        if not chat_ids or not (session or phone):
+            return None
+        if session:
+            os.makedirs(os.path.dirname(session) or ".", exist_ok=True)
+        else:
+            session = primary.session_name + "-burner"
+        return cls(
+            api_id       = env.opt_int("TELEGRAM_BURNER_API_ID", primary.api_id),
+            api_hash     = _opt("TELEGRAM_BURNER_API_HASH") or primary.api_hash,
+            phone        = phone or primary.phone,
+            session_name = session,
+            chat_ids     = chat_ids,
+        )
+
+
 # ── Top-level config ──────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -86,6 +179,8 @@ class DispatcherConfig:
     # (default ~/.config/dispatcher/banned_words.txt): one word per line, '#'
     # comments allowed.
     sanitizer:          Sanitizer = field(default_factory=lambda: Sanitizer([]))
+    # Optional second account. None ⇒ feature off (current behavior byte-for-byte).
+    burner:             BurnerCreds | None = None
     poll_interval_s:    float = 2.0
     max_retries:        int   = 4
     retry_base_delay:   float = 2.0
@@ -140,10 +235,12 @@ class DispatcherConfig:
         store = PolicyStore()
         default_db = os.path.expanduser(DEFAULT_DB_PATH)
         telegram = TelegramCreds.from_env() if require_telegram else None
+        burner = BurnerCreds.from_env(telegram) if telegram is not None else None
         default_chat_id = _req("TELEGRAM_CHAT_ID") if require_telegram else None
         banned_words_file = banned_words_file_path()
         return cls(
             telegram          = telegram,
+            burner            = burner,
             default_chat_id   = default_chat_id,
             db_path           = _opt("ARCHIVER_DB", _opt("DISPATCHER_DB", default_db)),
             policy_store      = store,

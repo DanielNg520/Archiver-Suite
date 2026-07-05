@@ -2204,6 +2204,97 @@ def test_hashtag_root_seam(tmp: Path) -> None:
        "the plain Nainoi album header is just 'Nainoi'")
 
 
+def test_burner_account_seam() -> None:
+    section("Seam 29: optional burner account (config → routing → send seam)")
+    from dispatcher.config import BurnerCreds, TelegramCreds
+    from dispatcher.send import TelethonSendStrategy
+    from dispatcher import tg_router
+
+    # ── config seam: env round-trip through BurnerCreds.from_env ───────────
+    primary = TelegramCreds(api_id=111, api_hash="ph", phone="+1",
+                            session_name="/tmp/claude-seam-primary")
+    for k in ("BURNER_CHAT_IDS", "TELEGRAM_BURNER_SESSION",
+              "TELEGRAM_BURNER_PHONE", "TELEGRAM_BURNER_API_ID",
+              "TELEGRAM_BURNER_API_HASH"):
+        os.environ.pop(k, None)
+    ok(BurnerCreds.from_env(primary) is None,
+       "no burner env → None (pipeline untouched when unconfigured)")
+
+    os.environ["BURNER_CHAT_IDS"] = "-100555, 777"     # dash-free 777 → -777
+    os.environ["TELEGRAM_BURNER_SESSION"] = "/tmp/claude-seam-burner"
+    os.environ["TELEGRAM_BURNER_PHONE"] = "+2"
+    burner = BurnerCreds.from_env(primary)
+    ok(burner is not None and burner.chat_ids == frozenset({"-100555", "-777"}),
+       "configured burner normalizes its dedicated chat set")
+    ok(burner.api_id == 111 and burner.api_hash == "ph",
+       "burner inherits the primary's api creds when its own are unset")
+
+    # ── routing seam: send()/check_destination pick the right client ──────
+    class _FakeClient:
+        def __init__(self, tag):
+            self.tag = tag
+            self.entities = 0
+            self.disconnects = 0
+            self.connects = 0
+        async def get_entity(self, peer):
+            self.entities += 1
+            return type("E", (), {"title": self.tag, "id": 1})()
+        async def disconnect(self):
+            self.disconnects += 1
+        async def connect(self):
+            self.connects += 1
+
+    primary_client = _FakeClient("primary")
+    burner_client = _FakeClient("burner")
+
+    strat = TelethonSendStrategy(
+        api_id=111, api_hash="ph", phone="+1",
+        session_name="/tmp/claude-seam-primary", burner=burner)
+    strat._client = primary_client
+    # stub the burner build+connect so no real Telethon/network is touched
+    strat._build_client = lambda *a, **k: burner_client
+    async def _noconnect(client, session, phone):
+        await client.connect()
+    strat._connect_authorized = _noconnect
+
+    # dedicated chat → burner comes up lazily and answers
+    res_ok, _ = asyncio.run(
+        strat.check_destination(peer=tg_router.Destination("-100555").peer))
+    ok(res_ok and burner_client.entities == 1 and primary_client.entities == 0,
+       "dedicated chat routes through the burner client")
+    ok(strat._burner_client is burner_client and burner_client.connects == 1,
+       "burner built + connected lazily on first dedicated use")
+
+    # non-dedicated chat → primary, burner untouched by the new call
+    res_ok, _ = asyncio.run(
+        strat.check_destination(peer=tg_router.Destination("-100999").peer))
+    ok(res_ok and primary_client.entities == 1 and burner_client.entities == 1,
+       "non-dedicated chat stays on the primary client")
+
+    # _force_reconnect re-homes whichever account the in-flight send uses
+    strat._active_client = burner_client
+    asyncio.run(strat._force_reconnect())
+    ok(burner_client.disconnects == 1 and primary_client.disconnects == 0,
+       "reconnect during a burner-routed send recycles the burner socket")
+
+    # ── fallback seam: a burner that can't authorize falls back to primary ─
+    strat2 = TelethonSendStrategy(
+        api_id=111, api_hash="ph", phone="+1",
+        session_name="/tmp/claude-seam-primary", burner=burner)
+    strat2._client = primary_client
+    strat2._build_client = lambda *a, **k: _FakeClient("deadburner")
+    async def _fail(client, session, phone):
+        raise RuntimeError("unauthorized")
+    strat2._connect_authorized = _fail
+    chosen = asyncio.run(strat2._client_for(tg_router.Destination("-100555").peer))
+    ok(chosen is primary_client and strat2._burner_client is None,
+       "unauthorized burner falls back to the primary (delivery never blocked)")
+
+    for k in ("BURNER_CHAT_IDS", "TELEGRAM_BURNER_SESSION",
+              "TELEGRAM_BURNER_PHONE"):
+        os.environ.pop(k, None)
+
+
 def main() -> int:
     print("cross-worker seam integration tests")
     # Each test gets an isolated temp config.toml so the real user config is
@@ -2250,6 +2341,8 @@ def main() -> int:
         test_send_order_clustering_seam(tmp / "s26")
         test_video_metadata_backend_seam(tmp / "s27")
         test_hashtag_root_seam(tmp / "s28")
+        _reset_config()
+        test_burner_account_seam()
 
     print(f"\nALL PASS ({_checks} checks)")
     return 0
