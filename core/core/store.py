@@ -33,7 +33,7 @@ from typing import Callable, Iterator
 
 from . import schema
 from .models import Item, Status
-from .files import media_bucket, ALBUM_MAX
+from .files import media_bucket, album_bucket, ORPHANED_SOURCE_NAME, ALBUM_MAX
 
 log = logging.getLogger(__name__)
 
@@ -623,8 +623,12 @@ class ItemStore:
         (platform, username, source, group_disc, chat_id, topic_id), capped at
         max_items. A 'single'-bucket anchor yields just itself (gifs/other never
         album). chat_id/topic_id are in the key so an album is homogeneous in
-        DESTINATION — never two chats, never two forum topics."""
-        bucket = media_bucket(anchor["file_path"])
+        DESTINATION — never two chats, never two forum topics.
+
+        BUCKET is source-aware (album_bucket): chat_id folders (orphaned) group
+        by 'media' (mixed photo+video) vs 'document' (.mkv/.gif grouped with each
+        other); every other producer keeps the photo/video/single split."""
+        bucket = album_bucket(anchor["source"], anchor["file_path"])
         if bucket == "single":
             return [anchor]
         candidates = cur.execute(
@@ -639,7 +643,7 @@ class ItemStore:
         ).fetchall()
         chosen = []
         for row in candidates:
-            if media_bucket(row["file_path"]) == bucket:
+            if album_bucket(row["source"], row["file_path"]) == bucket:
                 chosen.append(row)
             if len(chosen) >= max_items:
                 break
@@ -655,15 +659,24 @@ class ItemStore:
         A non-'single' group is eligible when it has >= min_batch(anchor)
         in-bucket items, OR its oldest item has aged past flush_age_s(anchor)
         (the anti-starvation flush). Under-threshold groups are deferred and
-        skipped so a lower-priority ready group can still drain."""
+        skipped so a lower-priority ready group can still drain.
+
+        ORDERING (chat_id folders): within one subfolder, a 'document' group
+        (grouped .mkv/.gif) is held back while ANY 'media' sibling is still
+        pending, so every inline photo/video album of the subfolder ships before
+        its documents. Once the media has drained (no longer pending), the
+        document group becomes eligible on a later claim."""
         deferred: set = set()
         for anchor in pending:
-            bucket = media_bucket(anchor["file_path"])
+            bucket = album_bucket(anchor["source"], anchor["file_path"])
             gkey = (anchor["platform"], anchor["username"], anchor["source"],
                     anchor["group_disc"], anchor["chat_disc"],
                     anchor["topic_disc"], bucket)
             if gkey in deferred:
                 continue
+            if (anchor["source"] == ORPHANED_SOURCE_NAME and bucket == "document"
+                    and self._has_pending_media_sibling(pending, anchor)):
+                continue                 # media of this subfolder must go first
             if bucket == "single":
                 return [anchor]          # singles bypass the gate
             group = self._gather_group(cur, anchor, group_disc_sql, max_items)
@@ -677,6 +690,24 @@ class ItemStore:
                     return group
             deferred.add(gkey)
         return []
+
+    @staticmethod
+    def _has_pending_media_sibling(pending, doc_anchor) -> bool:
+        """True iff another pending row in the SAME chat_id subfolder (matching
+        platform/username/source/group_disc/chat/topic) is 'media'-kind — i.e.
+        an inline photo/video still waiting to ship. Drives the media-before-
+        documents ordering for chat_id folders. Cheap: `pending` is already in
+        memory (the gated scan loaded it once)."""
+        for r in pending:
+            if (r["source"] == doc_anchor["source"]
+                    and r["platform"] == doc_anchor["platform"]
+                    and r["username"] == doc_anchor["username"]
+                    and r["group_disc"] == doc_anchor["group_disc"]
+                    and r["chat_disc"] == doc_anchor["chat_disc"]
+                    and r["topic_disc"] == doc_anchor["topic_disc"]
+                    and album_bucket(r["source"], r["file_path"]) == "media"):
+                return True
+        return False
 
     def mark_sent(self, item_id: int, *, tg_message_id: int | None = None) -> None:
         """sending → sent. Guarded on 'sending': a row that isn't in flight

@@ -649,11 +649,18 @@ class TelethonSendStrategy(SendStrategy):
         file_paths: list[str],
         caption: str | None,
         topic_id: int | None = None,
+        as_documents: bool = False,
     ) -> SendResult:
         """Send up to 10 files as ONE Telegram album (SendMultiMedia).
 
         topic_id (forum message_thread_id) → Telethon `reply_to`, posting the
         whole album into that topic; None → General.
+
+        as_documents (chat_id folders only) groups the files as DOWNLOADABLE
+        documents — e.g. several .mkv full-quality originals of one subfolder —
+        rather than inline media. Telegram allows a document media-group, but a
+        document can't share a group with inline photo/video, so the drain sends
+        the inline-media album(s) first and this document album after.
 
         Atomic at the API level: the single send_file([..]) call either
         returns (all items posted) or raises (none posted) — there is no
@@ -672,14 +679,24 @@ class TelethonSendStrategy(SendStrategy):
         # caption only on the first item; rest None.
         captions: list[str | None] = [caption] + [None] * (len(file_paths) - 1)
 
-        # Photo albums go through their own normalize-and-send path; video albums
-        # are handled below. Both ultimately use Telethon's native list send.
-        # Albums are homogeneous (drain groups by media bucket), so the anchor's
-        # bucket decides which path we take.
-        is_video_album = media_bucket(file_paths[0]) == "video"
-        if not is_video_album:
+        # A grouped document send (chat_id-folder .mkv/.gif originals).
+        if as_documents:
+            return await self._send_document_album(
+                peer, file_paths, captions, topic_id=topic_id)
+
+        # A chat_id-folder MEDIA album can be MIXED (photos + inline videos in one
+        # group — Telegram allows it). Route by the batch's composition: pure
+        # photo / pure video keep their existing dedicated paths (non-orphaned
+        # producers only ever hit these, byte-for-byte unchanged); a mix takes the
+        # combined path below.
+        buckets = {media_bucket(fp) for fp in file_paths}
+        if buckets <= {"photo"}:
             return await self._send_photo_album(
                 peer, file_paths, captions, topic_id=topic_id)
+        if buckets != {"video"}:
+            return await self._send_mixed_album(
+                peer, file_paths, captions, topic_id=topic_id)
+        # pure-video album falls through to the fast/native paths below.
 
         # HOW a video album is built. Two paths, same delivery contract:
         #
@@ -903,6 +920,95 @@ class TelethonSendStrategy(SendStrategy):
                     os.unlink(t)
                 except OSError:
                     pass
+
+    async def _send_mixed_album(
+        self,
+        peer: Any,
+        file_paths: list[str],
+        captions: list[str | None],
+        *,
+        topic_id: int | None = None,
+    ) -> SendResult:
+        """Send a MIXED photo+video album (chat_id-folder subfolders). Telegram
+        groups photos and inline videos in one media-group; Telethon's native
+        list send builds the right InputMedia per file, so a heterogeneous list
+        ships as one album.
+
+        Photos get the same proactive normalization the photo-album path uses
+        (image_fix preflight) so a Telegram-incompatible image doesn't reject the
+        whole group; videos ride as-is with supports_streaming. Any temp files
+        from photo conversion are cleaned up. A per-item Telegram rejection still
+        surfaces as media_empty and the drain's recover_media_empty re-sends that
+        item individually."""
+        temps: list[str] = []
+        try:
+            prepared: list[str] = []
+            for fp in file_paths:
+                if media_bucket(fp) != "photo":
+                    prepared.append(fp)
+                    continue
+                verdict = await asyncio.to_thread(image_fix.photo_needs_fix, fp)
+                if verdict is True:
+                    safe = await asyncio.to_thread(image_fix.make_safe_photo, fp)
+                    if safe:
+                        temps.append(safe)
+                        prepared.append(safe)
+                    else:
+                        prepared.append(fp)   # conversion failed → best effort
+                else:
+                    prepared.append(fp)       # False (safe) or None (unfixable AR)
+
+            what = f"album[{len(prepared)}] {Path(file_paths[0]).name}… (mixed)"
+
+            async def _do():
+                await self._sender.send_file(
+                    peer, prepared, caption=captions, supports_streaming=True,
+                    reply_to=topic_id,
+                    progress_callback=self._progress_cb(
+                        file_paths[0], batch_total=len(prepared)),
+                )
+            return await self._send_with_retries(
+                _do, what=what, payload_bytes=self._payload_bytes(prepared),
+            )
+        finally:
+            self._progress_done()
+            for t in temps:
+                try:
+                    os.unlink(t)
+                except OSError:
+                    pass
+
+    async def _send_document_album(
+        self,
+        peer: Any,
+        file_paths: list[str],
+        captions: list[str | None],
+        *,
+        topic_id: int | None = None,
+    ) -> SendResult:
+        """Send a grouped DOCUMENT album (chat_id-folder .mkv/.gif originals).
+
+        force_document + no streaming flag → Telegram stores each file verbatim
+        for download and groups them as one media-group (documents group with
+        documents, never with inline media). Telethon's native list send handles
+        the grouping. Each document keeps its on-disk filename (these are kept
+        originals — .mkv/.gif — never renamed with the internal `.tgprep` marker,
+        so no display-name override is needed here as it is on single sends)."""
+        what = f"album[{len(file_paths)}] {Path(file_paths[0]).name}… (documents)"
+
+        async def _do():
+            await self._sender.send_file(
+                peer, file_paths, caption=captions, force_document=True,
+                supports_streaming=False, reply_to=topic_id,
+                progress_callback=self._progress_cb(
+                    file_paths[0], batch_total=len(file_paths)),
+            )
+        try:
+            return await self._send_with_retries(
+                _do, what=what, payload_bytes=self._payload_bytes(file_paths),
+            )
+        finally:
+            self._progress_done()
 
     async def _upload_document(
         self, send_path: str, *, attributes, thumb_path: str | None,

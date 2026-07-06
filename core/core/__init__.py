@@ -20,7 +20,7 @@ from .policies import (
     BatchPolicy, AutoIngestPolicy, DownloadPolicy, ProtectionPolicy,
     SortPolicy, FailedRetryPolicy, validate_overrides,
 )
-from .files import cleanup_sidecars
+from .files import cleanup_sidecars, orphaned_kind, album_bucket
 from .deletion import DeletionGuard
 from .dedup import dedup_user, DedupReport, DupGroup
 from .ingest import (
@@ -46,7 +46,7 @@ __all__ = [
     "PolicyStore", "DeletePolicy", "RecorderDeletePolicy", "DedupPolicy",
     "BooleanPolicy", "BatchPolicy", "AutoIngestPolicy", "DownloadPolicy",
     "ProtectionPolicy", "SortPolicy", "FailedRetryPolicy",
-    "validate_overrides", "cleanup_sidecars",
+    "validate_overrides", "cleanup_sidecars", "orphaned_kind", "album_bucket",
     "DeletionGuard",
     "dedup_user", "DedupReport", "DupGroup",
     "register_file", "register_media", "IngestResult", "IngestOutcome",

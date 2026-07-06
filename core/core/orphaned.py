@@ -36,7 +36,7 @@ from pathlib import Path
 from . import media_prep, stability
 from .dedup import MEDIA_EXTENSIONS
 from .deletion import DeletionGuard
-from .files import cleanup_sidecars
+from .files import cleanup_sidecars, ORPHANED_SOURCE_NAME
 from .ingest import register_file, IngestOutcome
 from .routing import parse_route
 from .grouping import split_group_key
@@ -62,7 +62,12 @@ _PREPPED_META_KEY = "orphaned_prepped"
 # containers media_prep can rescue by converting them to a streamable .mp4.
 _INGESTABLE_EXTS = MEDIA_EXTENSIONS | media_prep.PREP_VIDEO_EXTS
 
-ORPHANED_SOURCE = "orphaned"
+# THE definition lives in core.files (ORPHANED_SOURCE_NAME): files.py is the
+# low-level leaf this module already imports, and album_bucket needs the value
+# there without importing back up (which WOULD be circular). Re-exported here
+# under its canonical name so every existing `from core.orphaned import
+# ORPHANED_SOURCE` (and core.__init__) keeps working unchanged.
+ORPHANED_SOURCE = ORPHANED_SOURCE_NAME
 # Synthetic platform value for orphaned rows. Keeps them out of every
 # platform/recorder album (source + platform are both in the claim key) and
 # out of the archiver's per-platform reconcile loop.

@@ -661,6 +661,7 @@ class _FakeSend:
         self.album_captions: list[str] = []
         self.single_topics: list[int | None] = []
         self.album_topics: list[int | None] = []
+        self.album_as_documents: list[bool] = []
 
     async def send(self, *, peer, file_path, caption, ensure_streamable=True,
                    filetype_tag=False, topic_id=None):
@@ -671,11 +672,12 @@ class _FakeSend:
         self.single_topics.append(topic_id)
         return SendResult(ok=True)
 
-    async def send_album(self, *, peer, file_paths, caption, topic_id=None):
+    async def send_album(self, *, peer, file_paths, caption, topic_id=None, as_documents=False):
         from dispatcher.send import SendResult
         self.sent_albums.append(list(file_paths))
         self.album_captions.append(caption)
         self.album_topics.append(topic_id)
+        self.album_as_documents.append(as_documents)
         return SendResult(ok=True)
 
 
@@ -818,7 +820,7 @@ class _MediaEmptySend:
                               media_empty=True)
         return SendResult(ok=True)
 
-    async def send_album(self, *, peer, file_paths, caption, topic_id=None):
+    async def send_album(self, *, peer, file_paths, caption, topic_id=None, as_documents=False):
         from dispatcher.send import SendResult
         self.album_attempts += 1
         return SendResult(ok=False, error="MediaEmptyError: rejected",
@@ -907,7 +909,7 @@ class _AlwaysFailSend:
         self.calls += 1
         return SendResult(ok=False, error="network down")
 
-    async def send_album(self, *, peer, file_paths, caption, topic_id=None):
+    async def send_album(self, *, peer, file_paths, caption, topic_id=None, as_documents=False):
         from dispatcher.send import SendResult
         self.calls += 1
         return SendResult(ok=False, error="network down")
@@ -1073,7 +1075,7 @@ class _FlakySend(_FakeSend):
             ensure_streamable=ensure_streamable, filetype_tag=filetype_tag,
             topic_id=topic_id)
 
-    async def send_album(self, *, peer, file_paths, caption, topic_id=None):
+    async def send_album(self, *, peer, file_paths, caption, topic_id=None, as_documents=False):
         return self._maybe_fail() or await super().send_album(
             peer=peer, file_paths=file_paths, caption=caption, topic_id=topic_id)
 
@@ -2204,6 +2206,51 @@ def test_hashtag_root_seam(tmp: Path) -> None:
        "the plain Nainoi album header is just 'Nainoi'")
 
 
+def test_orphaned_mixed_album_seam(tmp: Path) -> None:
+    section("Seam 30: chat_id folders — mixed photo+video album, grouped docs, media-first")
+    from core import ItemStore, PolicyStore, BatchPolicy
+
+    db_file = str(tmp / "seam30.db")
+    db = ItemStore.open(db_file)
+    gk = "-100777/trip"
+
+    def _add(name: str, payload: bytes) -> None:
+        f = _write_media(tmp / "-100777" / "trip" / name, payload)
+        stem = Path(name).stem
+        db.add_item(source="orphaned", platform="orphaned", username="orphaned",
+                    identifier=f"trip_{stem}", file_path=str(f),
+                    chat_id="-100777", group_key=gk, priority=50)
+
+    # Documents (.mkv) enqueued FIRST → earlier discovered_at. The media-first
+    # ordering must still hold them behind the subfolder's inline media.
+    _add("orig0.mkv", b"MKV0")
+    _add("orig1.mkv", b"MKV1")
+    # Inline media: 3 photos + 2 videos → must collapse into ONE mixed album
+    # (NOT split into a photo album + a video album).
+    for i in range(3):
+        _add(f"p{i}.jpg", f"PH{i}".encode())
+    for i in range(2):
+        _add(f"v{i}.mp4", f"VID{i}".encode())
+
+    ps = PolicyStore()
+    ps.set(BatchPolicy.SIZE_KEY, 1)
+    fake = _FakeSend()
+    _drain_once(db_file, ps, fake, default_chat_id="-100999")
+    db.close()
+
+    ok(len(fake.sent_albums) == 2,
+       "exactly two albums: one mixed media album + one document album (not 3)")
+    media_suffixes = {Path(p).suffix for p in fake.sent_albums[0]}
+    ok(len(fake.sent_albums[0]) == 5 and media_suffixes == {".jpg", ".mp4"},
+       "media album mixes 3 photos + 2 videos in ONE group of 5")
+    ok(all(Path(p).suffix == ".mkv" for p in fake.sent_albums[1])
+       and len(fake.sent_albums[1]) == 2,
+       "the two .mkv documents are grouped into one document album")
+    ok(fake.album_as_documents == [False, True],
+       "media shipped inline FIRST, documents shipped as_documents SECOND "
+       "(even though the .mkv were enqueued earlier)")
+
+
 def test_burner_account_seam() -> None:
     section("Seam 29: optional burner account (config → routing → send seam)")
     from dispatcher.config import BurnerCreds, TelegramCreds
@@ -2341,6 +2388,7 @@ def main() -> int:
         test_send_order_clustering_seam(tmp / "s26")
         test_video_metadata_backend_seam(tmp / "s27")
         test_hashtag_root_seam(tmp / "s28")
+        test_orphaned_mixed_album_seam(tmp / "s30")
         _reset_config()
         test_burner_account_seam()
 

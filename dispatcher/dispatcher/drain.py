@@ -30,7 +30,7 @@ from core import (
     BatchPolicy, FailedRetryPolicy, ORPHANED_SOURCE, subfolder_of,
     DeletionGuard, is_split_group,
 )
-from core.files import media_bucket
+from core.files import media_bucket, orphaned_kind
 from core import media_prep
 from .tg_router import TelegramRouter, RouteError
 
@@ -84,6 +84,14 @@ _CIRCUIT_COOLDOWN_S = 60.0
 
 def is_tiktok_live(item: Item) -> bool:
     return item.platform.lower() == "tiktok" and item.source.lower() == "recorder"
+
+
+def _is_document_batch(head: Item) -> bool:
+    """True iff this claimed batch is a chat_id-folder DOCUMENT album (grouped
+    .mkv/.gif originals). The batch is homogeneous in kind — claim_batch groups
+    orphaned rows by orphaned_kind — so the head decides for the whole album."""
+    return (head.source == ORPHANED_SOURCE
+            and orphaned_kind(head.file_path) == "document")
 
 
 def with_live_tag(caption: str) -> str:
@@ -228,10 +236,17 @@ async def recover_media_empty(
     (delivered, quarantined). Extracted for direct testing (Seam 11)."""
     delivered = quarantined = 0
     for it in present:
+        # A chat_id-folder DOCUMENT (.mkv/.gif) is deliberately kept as a
+        # downloadable original — never re-encode it into a streaming video on
+        # recovery; send() ships it as a document when ensure_streamable is off.
+        # Every other item forces the streamable net so a convertible clip
+        # (VP9 → H.264) is re-encoded and delivered.
+        keep_as_document = (it.source == ORPHANED_SOURCE
+                            and orphaned_kind(it.file_path) == "document")
         r = await send_strategy.send(
             peer=peer, file_path=it.file_path,
             caption=config.sanitizer.sanitize(caption_for(it)),
-            ensure_streamable=True,          # force re-encode of non-H.264 video
+            ensure_streamable=not keep_as_document,
             filetype_tag=it.source == ORPHANED_SOURCE,
             topic_id=topic_id,
         )
@@ -453,16 +468,23 @@ async def drain_forever(
                 topic_id=topic_id,
             )
         else:
-            # album send (homogeneous photo/video batch, all same producer)
-            log.info("@%s uploading album of %d [%s]", head.username,
+            # album send. Homogeneous by claim: a same-producer photo/video
+            # batch, a MIXED photo+video chat_id-folder album, or a grouped
+            # chat_id-folder DOCUMENT album (.mkv/.gif) — the last flagged so
+            # send_album ships it as documents, never inline.
+            as_docs = _is_document_batch(head)
+            log.info("@%s uploading %s of %d [%s]", head.username,
+                     "documents" if as_docs else "album",
                      len(present), head.platform, extra={"ev": "album"})
-            log.debug("drain: album src=%s prio=%d ids=%s",
-                      head.source, head.priority, [it.id for it in present])
+            log.debug("drain: album src=%s prio=%d docs=%s ids=%s",
+                      head.source, head.priority, as_docs,
+                      [it.id for it in present])
             result = await send_strategy.send_album(
                 peer=peer,
                 file_paths=[it.file_path for it in present],
                 caption=config.sanitizer.sanitize(album_caption_for(present)),
                 topic_id=topic_id,
+                as_documents=as_docs,
             )
 
         if result.ok:
