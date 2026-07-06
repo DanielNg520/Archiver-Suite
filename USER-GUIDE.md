@@ -164,6 +164,21 @@ Common keys: `min_batch_size`, `min_batch_max_wait_h`, `delete_after_upload`,
 `delete_after_upload_records`, `dedup_after_download`, `auto_ingest_orphaned`,
 `download_enabled`, `local_platforms`.
 
+## Second (burner) account — optional
+
+Route a dedicated set of chats through a second Telegram account; the primary
+sends everything else and is the fallback if the burner can't log in. Nothing
+changes until you register it — set up via the CLI only (no `.env` editing):
+
+```bash
+dispatcher burner login --phone +49…        # interactive; creates the session
+dispatcher burner chats add -100123 100456  # dash-free numeric ok → -100456
+dispatcher burner chats list                 # (remove <id…> also)
+dispatcher burner status                     # active? authorized? which chats?
+```
+
+Restart the dispatcher after registering. Full details: **dispatcher/README.md**.
+
 ---
 
 ## "Why isn't my file uploading?"

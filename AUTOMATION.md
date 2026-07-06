@@ -83,6 +83,19 @@ ls ~/.config/dispatcher/session.session
 The archiver has no Telegram session after the single-source migration. The
 dispatcher owns Telegram credentials and routing.
 
+**Optional burner account.** If you route some chats through a second (burner)
+account, register it now too — its login is also interactive and launchd can't
+type the code, so it must be done BEFORE the daemon runs headless:
+
+```
+dispatcher burner login --phone +49…     # interactive, one time
+dispatcher burner chats add -100123      # chats the burner should send
+dispatcher burner status                 # confirm authorized + chats
+```
+
+A burner that isn't logged in never blocks the daemon — those chats just fall
+back to the primary. See **dispatcher/README.md**.
+
 ---
 
 ## Step 2 — Install the plists (log rotation is automatic)

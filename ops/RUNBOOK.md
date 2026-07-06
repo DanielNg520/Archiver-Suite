@@ -169,8 +169,8 @@ field exists precisely so you can verify it's stale before removing.)
 ## Drain the queue manually (dispatcher won't start at all)
 
 If the dispatcher is broken but you need files sent, there is no manual
-send path by design (the dispatcher owns the only Telegram session). The
-correct move is to fix the dispatcher, not bypass it. To inspect what's
+send path by design (the dispatcher is the only process that talks to Telegram).
+The correct move is to fix the dispatcher, not bypass it. To inspect what's
 stuck while you debug:
 
 ```
@@ -181,9 +181,11 @@ dispatcher queue cancel <id>                 # give up on a row
 ```
 
 There is no direct-upload fallback after the single-source migration. The
-dispatcher owns the only Telegram session and routing. If it is down, keep
+dispatcher owns the Telegram session(s) and routing. If it is down, keep
 the durable rows in `pending`, fix or re-authenticate the dispatcher, then
-let it drain normally.
+let it drain normally. (If a burner account is registered, the primary is
+already the fallback for its chats — a logged-out burner never wedges the
+queue; see dispatcher/README.md.)
 
 ---
 

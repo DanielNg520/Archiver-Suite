@@ -1,6 +1,7 @@
 # dispatcher
 
-Telegram upload dispatcher. Owns the single Telegram session. Drains
+Telegram upload dispatcher. The only process that talks to Telegram; owns the
+primary session and an optional second *burner* account (see below). Drains
 pending rows from the shared `suite.db` / `items` table populated by
 `recorder` (priority 5), chat_id folders (priority 6), and `archiver`
 (priority 10). One file at a time;

@@ -29,12 +29,14 @@ TikTok live streams to Telegram, losslessly and unattended.
 The original archiver did everything in one process: download, then upload
 to Telegram inline. That coupling caused three problems this redesign fixes:
 
-1. **One Telegram session, many producers.** Telegram allows only sane use
+1. **One Telegram sender, many producers.** Telegram allows only sane use
    of one user session at a time. With a single archiver that was fine, but
    adding a live recorder meant two things wanting to send at once. The
-   **dispatcher** is now the *sole* owner of the Telegram session; everything
+   **dispatcher** is now the *sole* process that talks to Telegram; everything
    else writes jobs to a queue and the dispatcher drains it serially. No
-   session contention, ever.
+   session contention, ever. (The dispatcher may hold a second, optional
+   *burner* account for a dedicated set of chats — still one serial sender,
+   still the only talker; see **dispatcher/README.md**.)
 
 2. **Downloads shouldn't block on uploads.** A slow Telegram upload (or a
    FloodWait) used to stall the whole archive cycle. Now the archiver
@@ -70,9 +72,10 @@ Install: the **Install** section below. Day-to-day usage of every feature:
 
 ### dispatcher — the only thing that talks to Telegram
 
-Owns the Telegram session. Polls the shared `items` table for `pending`
+Owns the Telegram session(s). Polls the shared `items` table for `pending`
 rows, claims one atomically, sends it, marks it `sent` (or `failed` after
-retries).
+retries). Optionally routes a dedicated set of chats through a second *burner*
+account, with the primary as the fallback (**dispatcher/README.md**).
 Handles FloodWait, retries with backoff, and an optional delete-after-upload
 policy. A startup watchdog reverts rows stuck in `sending` (from a previous
 crash) back to `pending`.

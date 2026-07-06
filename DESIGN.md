@@ -30,7 +30,7 @@ other. ops imports no *worker* (core is fine). Installs are pipx venvs with an
 |---|---|---|
 | `schema.py` | DDL + connection factory; WAL+busy_timeout; `SCHEMA_VERSION=4`, keyed migrations via `user_version` | `connect`, `db_path`, `DEFAULT_DB_PATH`, `SchemaVersionError` |
 | `models.py` | Item dataclass + status state machine | `Item`, `Status{PENDING,SENDING,SENT,FAILED}`, `TERMINAL` |
-| `store.py` / `stores.py` | concrete `ItemStore` + role views (`ProducerStore`/`QueueStore`/`AdminStore`); `claim_batch` (homogeneous album claim), `add_pending`, `reset_stuck_sending`, dedup queries | `ItemStore`, `claim_batch`, `sent_twin`, `mark_*` |
+| `store.py` / `stores.py` | concrete `ItemStore` + role views (`ProducerStore`/`QueueStore`/`AdminStore`); `claim_batch` (homogeneous album claim; bucket is **source-aware** via `album_bucket` — orphaned rows group mixed `media` vs `document`, and a document group is held while a same-subfolder media sibling is still pending = media-before-documents), `add_pending`, `reset_stuck_sending`, dedup queries | `ItemStore`, `claim_batch`, `sent_twin`, `mark_*` |
 | `ingest.py` | THE enqueue primitive: stabilize→hash→dedup-collapse→insert (every producer) | `register_file`, `IngestResult`, `IngestOutcome` |
 | `dedup.py`/`hashing.py`/`backfill.py` | content-hash dedup; backfill hashes for legacy rows | `dedup_user`, `backfill_content_hashes` |
 | `identity.py` | resolve (identifier,date,title) from sidecar/filename/hash | `resolve` |
@@ -38,6 +38,7 @@ other. ops imports no *worker* (core is fine). Installs are pipx venvs with an
 | `orphaned.py` | chat_id-folder ingest + subfolder→album routing | `ingest_chat_id_dirs`, `ORPHANED_SOURCE`, `subfolder_of` |
 | `routing.py` | canonicalize chat_id/`.t<topic>` token (dash-free→`-100…`) | `parse_route`, `Route`, `is_chat_id` |
 | `grouping.py` | split-part album group keys | `split_group_key`, `is_split_group` |
+| `files.py` | media-type sets (`PHOTO_EXTS`/`VIDEO_EXTS`/`MEDIA_EXTENSIONS`, `ALBUM_MAX`) + album buckets: `media_bucket` (photo/video/single, all producers) and `orphaned_kind` (`media` = photos+inline video, `document` = `.mkv`/`.gif`/other — chat_id folders), unified by source-aware `album_bucket`; sidecar-aware delete. Leaf module — also THE home of `ORPHANED_SOURCE_NAME` (re-exported by `orphaned.py` as `ORPHANED_SOURCE`) | `media_bucket`, `orphaned_kind`, `album_bucket`, `cleanup_sidecars` |
 | `media_prep.py` | make file Telegram-compatible pre-enqueue: remux/re-encode video, split >ceiling (or a caller-supplied `split_threshold_bytes` — recorder split mode); `streamable_temp` (send-time net), `is_nonstreamable_video` (doc decision). Gated to `PREP_VIDEO_EXTS` (photos never become video) | `prepare`, `streamable_temp`, `is_nonstreamable_video` |
 | **`ffprobe.py`** | shared ffprobe: subprocess+json+timeout | `probe_json` |
 | **`ffmpeg.py`** | shared ffmpeg runner (bool, never raises) | `run_ffmpeg` |
@@ -87,21 +88,21 @@ State machine: `pending →claim→ sending →ok→ sent` / `→fail→ pending
 | module | purpose |
 |---|---|
 | `drain.py` | `drain_forever`: serial claim→send→mark; circuit breaker (`_CIRCUIT_TRIP_AT=8`/60s); `run_housekeeping` (failed-missing GC→prune→**transient auto-recover** (`reset_failed_transient`, default on)→opt-in blanket `auto_retry_failed`→stuck watchdog, every 15min); missing-file+dedup pre-filter; `recover_media_empty` (atomic-album per-item fallback) |
-| `send.py` | `TelethonSendStrategy`: FloodWait+backoff+stall-watchdog+reconnect; video/photo/doc paths; **proactive photo compat** (single+album); **fail-fast `SessionUnauthorized`** (startup `is_user_authorized`, mid-send `UnauthorizedError`/`AuthKeyError`). Single video sends attach explicit ffprobe attrs; native video **albums** rely on Telethon's own per-item geometry → **`hachoir` is a hard dep** (without it album videos ship as 1×1 images; `cli._assert_video_metadata_backend` fails fast) |
+| `send.py` | `TelethonSendStrategy`: FloodWait+backoff+stall-watchdog+reconnect; video/photo/doc paths; **proactive photo compat** (single+album); **fail-fast `SessionUnauthorized`** (startup `is_user_authorized`, mid-send `UnauthorizedError`/`AuthKeyError`). Single video sends attach explicit ffprobe attrs; native video **albums** rely on Telethon's own per-item geometry → **`hachoir` is a hard dep** (without it album videos ship as 1×1 images; `cli._assert_video_metadata_backend` fails fast). Chat_id-folder albums: MIXED photo+video in one group (`_send_mixed_album`, photo preflight kept) and grouped `.mkv`/`.gif` originals as a **document album** (`send_album(as_documents=True)` → `force_document`), shipped after the subfolder's media. **Optional burner**: `_client_for(peer)` picks primary vs burner per destination (`_sender`/`_active_client`; serial drain ⇒ single field safe); burner built lazily, unauthorized→log+primary fallback; `None` burner short-circuits to primary (inert) |
 | `fast_upload.py` | FastTelethon parallel multi-conn upload (home DC, shared auth key); always falls back to serial |
-| `tg_router.py` | (platform,user)→`Destination(chat_id,topic_id)` env chain; row chat_id overrides | 
+| `tg_router.py` | (platform,user)→`Destination(chat_id,topic_id)` env chain; row chat_id overrides; `peer_chat_id` = inverse of `_resolve_peer` (match a peer against the burner chat set) | 
 | `media_meta.py` | ffprobe geometry→`DocumentAttributeVideo` + poster thumbnail (via core.ff*) |
 | `image_fix.py` | normalize photos Telegram rejects → baseline JPEG (via core.ff*) |
 | `delete.py` | `maybe_delete`: re-read status='sent' gate → DeletionGuard |
 | `progress.py` | upload heartbeat (via core.heartbeat + core.paths) |
 | `instance_lock.py` | session-keyed singleton = thin `core.InstanceLock` subclass |
-| `config.py` | env (core.env) + creds + tunables (lenient parse) |
-| CLI: `start`, `status`, `stats`, `check-routes`, `banned-words`, `queue{list,retry,cancel}`, `config` |
+| `config.py` | env (core.env) + creds + tunables (lenient parse); `BurnerCreds` (optional 2nd account, `parse_route`-normalized chat set, primary-inherited api creds); `upsert_env_vars` (idempotent dotenv writer, the burner CLI's only persistence) |
+| CLI: `start`, `status`, `stats`, `check-routes`, `banned-words`, `queue{list,retry,cancel}`, `config`, `burner{login,chats,status}` |
 
 ## ops/ops/
 `health.py` (reads suite.db RO + core.paths artifacts + launchd; liveness via core.heartbeat), `logrotate.py` (copytruncate), `cli.py` (`install/uninstall/health/watch/load/unload/restart/logrotate`). launchd labels `com.duy.{dispatcher,recorder,archiver}`.
 
-## Seams (cross-process contracts; tests/test_seams.py, 187 checks, 27 seams)
+## Seams (cross-process contracts; tests/test_seams.py, 210 checks, 30 seams)
 1. **DB handoff** — producer writes `pending`, dispatcher claims. One table.
 2. **TikTok soft-lock** — recorder writes `paths.tiktok_lock()`; archiver/ops read **liveness-gated** (stale = self-heal). recorder owns write/remove.
 3. **content_hash** — all producers via `register_file` → global dedup.
